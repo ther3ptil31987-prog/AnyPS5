@@ -23,10 +23,9 @@ struct VectorOpcodeInfo {
 
 enum class Vop2SdwaProfile {
     None,
-    Float32,
-    Float16,
-    PackedFloat16,
+    Float,
     Integer,
+    Float16,
 };
 
 struct Vop2OpcodeInfo {
@@ -44,17 +43,17 @@ struct VopcOpcodeInfo {
 constexpr Vop2OpcodeInfo vop2Opcodes[] = {
     {0x01u, RdnaOpcode::VCndmaskB32, Vop2SdwaProfile::Integer},
     {0x02u, RdnaOpcode::VDot2cF32F16},
-    {0x03u, RdnaOpcode::VAddF32, Vop2SdwaProfile::Float32},
-    {0x04u, RdnaOpcode::VSubF32, Vop2SdwaProfile::Float32},
-    {0x05u, RdnaOpcode::VSubrevF32},
-    {0x08u, RdnaOpcode::VMulF32, Vop2SdwaProfile::Float32},
+    {0x03u, RdnaOpcode::VAddF32, Vop2SdwaProfile::Float},
+    {0x04u, RdnaOpcode::VSubF32, Vop2SdwaProfile::Float},
+    {0x05u, RdnaOpcode::VSubrevF32, Vop2SdwaProfile::Float},
+    {0x08u, RdnaOpcode::VMulF32, Vop2SdwaProfile::Float},
     {0x09u, RdnaOpcode::VMulI32I24, Vop2SdwaProfile::Integer},
     {0x0au, RdnaOpcode::VMulHiI32I24, Vop2SdwaProfile::Integer},
     {0x0bu, RdnaOpcode::VMulU32U24, Vop2SdwaProfile::Integer},
     {0x0cu, RdnaOpcode::VMulHiU32U24, Vop2SdwaProfile::Integer},
     {0x0du, RdnaOpcode::VDot4cI32I8},
-    {0x0fu, RdnaOpcode::VMinF32},
-    {0x10u, RdnaOpcode::VMaxF32},
+    {0x0fu, RdnaOpcode::VMinF32, Vop2SdwaProfile::Float},
+    {0x10u, RdnaOpcode::VMaxF32, Vop2SdwaProfile::Float},
     {0x11u, RdnaOpcode::VMinI32, Vop2SdwaProfile::Integer},
     {0x12u, RdnaOpcode::VMaxI32, Vop2SdwaProfile::Integer},
     {0x13u, RdnaOpcode::VMinU32, Vop2SdwaProfile::Integer},
@@ -84,7 +83,7 @@ constexpr Vop2OpcodeInfo vop2Opcodes[] = {
     {0x2bu, RdnaOpcode::VMacF32},
     {0x2cu, RdnaOpcode::VMadmkF32},
     {0x2du, RdnaOpcode::VMadakF32},
-    {0x2fu, RdnaOpcode::VCvtPkrtzF16F32, Vop2SdwaProfile::PackedFloat16},
+    {0x2fu, RdnaOpcode::VCvtPkrtzF16F32, Vop2SdwaProfile::Float},
     {0x32u, RdnaOpcode::VAddF16, Vop2SdwaProfile::Float16},
     {0x33u, RdnaOpcode::VSubF16, Vop2SdwaProfile::Float16},
     {0x34u, RdnaOpcode::VSubrevF16, Vop2SdwaProfile::Float16},
@@ -96,7 +95,7 @@ constexpr Vop2OpcodeInfo vop2Opcodes[] = {
     {0x3au, RdnaOpcode::VMinF16, Vop2SdwaProfile::Float16},
     {0x3cu, RdnaOpcode::VPkFmacF16},
     {0x06u, RdnaOpcode::VMacLegacyF32},
-    {0x07u, RdnaOpcode::VMulLegacyF32},
+    {0x07u, RdnaOpcode::VMulLegacyF32, Vop2SdwaProfile::Float},
     {0x3bu, RdnaOpcode::VLdexpF16},
 };
 
@@ -1303,14 +1302,14 @@ struct Vop2SdwaRule {
     std::uint32_t src1Selectors = sdwaSelFull();
     bool partialDst = false;
     bool sourceModifiers = false;
+    bool byteSelectorClamp = true;
 };
 
 constexpr Vop2SdwaRule vop2SdwaRules[] = {
     {},
-    {sdwaSelFull(), sdwaSelFull(), sdwaSelFull(), false, true},
-    {sdwaSelWords() | sdwaSelFull(), sdwaSelWords() | sdwaSelFull(), sdwaSelWords() | sdwaSelFull(), true, true},
     {sdwaSelAll(), sdwaSelAll(), sdwaSelAll(), true, true},
     {sdwaSelAll(), sdwaSelAll(), sdwaSelAll(), true, false},
+    {sdwaSelAll(), sdwaSelAll(), sdwaSelAll(), true, true, false},
 };
 
 const Vop2SdwaRule* findVop2SdwaRule(std::uint32_t encoding) {
@@ -1369,6 +1368,10 @@ void validateVop2Sdwa(const RdnaInstruction& instruction, std::uint32_t opcode, 
     const bool cndmaskFloatModifiers = instruction.op == RdnaOpcode::VCndmaskB32 && fields.src0Sel == 6u && fields.src1Sel == 6u;
     if (!rule->sourceModifiers && hasSourceModifiers && !cndmaskFloatModifiers) {
         throw std::invalid_argument("VOP2 SDWA source modifiers are not supported");
+    }
+    const bool byteSelector = fields.src0Sel < 4u || fields.src1Sel < 4u || fields.dstSel < 4u;
+    if (!rule->byteSelectorClamp && fields.clamp != 0u && byteSelector) {
+        throw std::invalid_argument("VOP2 SDWA clamp with byte selectors is not implemented");
     }
 }
 
