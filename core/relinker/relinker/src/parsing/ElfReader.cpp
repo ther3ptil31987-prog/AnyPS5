@@ -4,6 +4,14 @@
 
 namespace Relinker {
 
+namespace {
+
+bool _rangeFits(const std::uint64_t offset, const std::uint64_t length, const std::size_t size) {
+    return offset <= size && length <= size - offset;
+}
+
+}
+
 ElfReader::ElfReader(std::vector<std::uint8_t> fileBuffer)
     : _fileBuffer(std::move(fileBuffer))
 {
@@ -11,6 +19,17 @@ ElfReader::ElfReader(std::vector<std::uint8_t> fileBuffer)
 
 const std::vector<std::uint8_t>& ElfReader::GetRawBytes() const {
     return _fileBuffer;
+}
+
+std::string ElfReader::formatMagic() const {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string text;
+    for (std::size_t index = 0; index < 4; ++index) {
+        if (index != 0) text += ' ';
+        text += digits[_fileBuffer[index] >> 4];
+        text += digits[_fileBuffer[index] & 0x0f];
+    }
+    return text;
 }
 
 std::uint8_t ElfReader::_readU8At(FileByteOffset fileByteOffset) const {
@@ -21,7 +40,7 @@ std::uint8_t ElfReader::_readU8At(FileByteOffset fileByteOffset) const {
 }
 
 std::uint16_t ElfReader::_readU16At(FileByteOffset fileByteOffset) const {
-    if (fileByteOffset + 2 > _fileBuffer.size()) {
+    if (!_rangeFits(fileByteOffset, 2, _fileBuffer.size())) {
         throw RelinkerException("FileByteOffset out of bounds", fileByteOffset);
     }
     std::uint16_t value;
@@ -30,7 +49,7 @@ std::uint16_t ElfReader::_readU16At(FileByteOffset fileByteOffset) const {
 }
 
 std::uint32_t ElfReader::_readU32At(FileByteOffset fileByteOffset) const {
-    if (fileByteOffset + 4 > _fileBuffer.size()) {
+    if (!_rangeFits(fileByteOffset, 4, _fileBuffer.size())) {
         throw RelinkerException("FileByteOffset out of bounds", fileByteOffset);
     }
     std::uint32_t value;
@@ -39,7 +58,7 @@ std::uint32_t ElfReader::_readU32At(FileByteOffset fileByteOffset) const {
 }
 
 std::uint64_t ElfReader::_readU64At(FileByteOffset fileByteOffset) const {
-    if (fileByteOffset + 8 > _fileBuffer.size()) {
+    if (!_rangeFits(fileByteOffset, 8, _fileBuffer.size())) {
         throw RelinkerException("FileByteOffset out of bounds", fileByteOffset);
     }
     std::uint64_t value;
@@ -48,13 +67,17 @@ std::uint64_t ElfReader::_readU64At(FileByteOffset fileByteOffset) const {
 }
 
 ElfHeader ElfReader::ReadHeader() const {
-    if (_fileBuffer.size() < 20) {
+    if (_fileBuffer.size() < 0x40) {
         throw RelinkerException("File too small for ELF header");
+    }
+
+    if (_fileBuffer[0] == 0x4f && _fileBuffer[1] == 0x15 && _fileBuffer[2] == 0x3d && _fileBuffer[3] == 0x1d) {
+        throw RelinkerException("The input is a SELF container, not an ELF");
     }
 
     if (_fileBuffer[0] != 0x7f || _fileBuffer[1] != 'E' ||
         _fileBuffer[2] != 'L' || _fileBuffer[3] != 'F') {
-        throw RelinkerException("Invalid ELF magic number");
+        throw RelinkerException("Invalid ELF magic number: " + formatMagic());
     }
 
     ElfHeader header{};
@@ -191,7 +214,7 @@ FileByteOffset ElfReader::TranslateVirtualAddress(VirtualAddress address) const 
 }
 
 std::vector<std::uint8_t> ElfReader::ReadSection(const SectionHeader& header) const {
-    if (header.Offset + header.SectionSize > _fileBuffer.size()) {
+    if (!_rangeFits(header.Offset, header.SectionSize, _fileBuffer.size())) {
         throw RelinkerException("Section offset out of bounds", header.Offset);
     }
 
@@ -201,7 +224,7 @@ std::vector<std::uint8_t> ElfReader::ReadSection(const SectionHeader& header) co
 }
 
 std::vector<std::uint8_t> ElfReader::ReadSegment(const ProgramHeader& header) const {
-    if (header.Offset + header.FileSize > _fileBuffer.size()) {
+    if (!_rangeFits(header.Offset, header.FileSize, _fileBuffer.size())) {
         throw RelinkerException("Segment offset out of bounds", header.Offset);
     }
 

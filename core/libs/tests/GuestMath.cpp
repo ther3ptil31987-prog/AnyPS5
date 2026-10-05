@@ -1,0 +1,159 @@
+#include "prx/libc/include/general/VabiMacros.hpp"
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+extern "C" {
+double APS5_VABI atof_nid_postfix(const char*);
+float APS5_VABI strtof_nid_postfix(const char*, char**);
+long double APS5_VABI strtold_nid_postfix(const char*, char**);
+std::int64_t APS5_VABI strtol_nid_postfix(const char*, char**, int);
+std::uint64_t APS5_VABI strtoul_nid_postfix(const char*, char**, int);
+int* APS5_VABI __error_nid_postfix();
+float APS5_VABI fmodf_nid_postfix(float, float);
+float APS5_VABI asinf_nid_postfix(float);
+float APS5_VABI acosf_nid_postfix(float);
+float APS5_VABI atan2f_nid_postfix(float, float);
+float APS5_VABI tanf_nid_postfix(float);
+float APS5_VABI log10f_nid_postfix(float);
+double APS5_VABI exp2_nid_postfix(double);
+double APS5_VABI ldexp_nid_postfix(double, int);
+double APS5_VABI scalbn_nid_postfix(double, int);
+float APS5_VABI scalbnf_nid_postfix(float, int);
+double APS5_VABI frexp_nid_postfix(double, int*);
+float APS5_VABI frexpf_nid_postfix(float, int*);
+std::int64_t APS5_VABI lround_nid_postfix(double);
+std::int64_t APS5_VABI lroundf_nid_postfix(float);
+std::int64_t APS5_VABI llround_nid_postfix(double);
+int APS5_VABI __isfinitef_nid_postfix(float);
+int APS5_VABI __isnormal_nid_postfix(double);
+int APS5_VABI __isnormalf_nid_postfix(float);
+int APS5_VABI __isinff_nid_postfix(float);
+}
+static void Require(bool value) { if (!value) std::abort(); }
+
+static void CheckIntegerConversions() {
+    struct SignedCase {
+        const char* text;
+        int base;
+        std::int64_t value;
+        std::size_t consumed;
+        int error;
+    };
+    const SignedCase signedCases[] = {
+        {"-42tail", 10, -42, 3, 0},
+        {"2147483648!", 10, INT64_C(2147483648), 10, 0},
+        {"-2147483649!", 10, -INT64_C(2147483649), 11, 0},
+        {"4294967296!", 10, INT64_C(4294967296), 10, 0},
+        {"9223372036854775807!", 10, INT64_MAX, 19, 0},
+        {"-9223372036854775808!", 10, INT64_MIN, 20, 0},
+        {"9223372036854775808!", 10, INT64_MAX, 19, 34},
+        {"-9223372036854775809!", 10, INT64_MIN, 20, 34},
+        {"18446744073709551616000!", 10, INT64_MAX, 23, 34},
+        {" \t+0x100000000z", 0, INT64_C(4294967296), 14, 0},
+        {"-0x8000000000000000!", 0, INT64_MIN, 19, 0},
+        {"0x8000000000000000!", 16, INT64_MAX, 18, 34},
+        {"0100000000000!", 0, INT64_C(8589934592), 13, 0},
+        {"100000000000000000000000000000000!", 2, INT64_C(4294967296), 33, 0},
+        {"z!", 36, 35, 1, 0},
+        {"", 10, 0, 0, 0},
+        {" \t+!", 10, 0, 0, 0},
+        {"123!", 10, 123, 3, 0}
+    };
+    for (const auto& test : signedCases) {
+        char* end = nullptr;
+        *__error_nid_postfix() = 0;
+        const auto value = strtol_nid_postfix(test.text, &end, test.base);
+        if (value != test.value || end != test.text + test.consumed || *__error_nid_postfix() != test.error) {
+            std::fprintf(stderr, "Guest strtol failed for '%s' in base %d\n", test.text, test.base);
+            std::abort();
+        }
+    }
+    struct UnsignedCase {
+        const char* text;
+        int base;
+        std::uint64_t value;
+        std::size_t consumed;
+        int error;
+    };
+    const UnsignedCase unsignedCases[] = {
+        {"4294967296!", 10, UINT64_C(4294967296), 10, 0},
+        {"9223372036854775808!", 10, UINT64_C(9223372036854775808), 19, 0},
+        {"18446744073709551615!", 10, UINT64_MAX, 20, 0},
+        {"18446744073709551616!", 10, UINT64_MAX, 20, 34},
+        {"18446744073709551616000!", 10, UINT64_MAX, 23, 34},
+        {"-1!", 10, UINT64_MAX, 2, 0},
+        {"-4294967296!", 10, UINT64_MAX - UINT64_C(4294967295), 11, 0},
+        {"-18446744073709551615!", 10, 1, 21, 0},
+        {"-18446744073709551616!", 10, UINT64_MAX, 21, 34},
+        {" \t+0xffffffffffffffffz", 0, UINT64_MAX, 21, 0},
+        {"0x10000000000000000!", 16, UINT64_MAX, 19, 34},
+        {"0100000000000!", 0, UINT64_C(8589934592), 13, 0},
+        {"100000000000000000000000000000000!", 2, UINT64_C(4294967296), 33, 0},
+        {"z!", 36, 35, 1, 0},
+        {"", 10, 0, 0, 0},
+        {" \t-!", 10, 0, 0, 0},
+        {"123!", 10, 123, 3, 0}
+    };
+    for (const auto& test : unsignedCases) {
+        char* end = nullptr;
+        *__error_nid_postfix() = 0;
+        const auto value = strtoul_nid_postfix(test.text, &end, test.base);
+        if (value != test.value || end != test.text + test.consumed || *__error_nid_postfix() != test.error) {
+            std::fprintf(stderr, "Guest strtoul failed for '%s' in base %d\n", test.text, test.base);
+            std::abort();
+        }
+    }
+    *__error_nid_postfix() = 13;
+    Require(strtol_nid_postfix("-4294967296", nullptr, 10) == -INT64_C(4294967296));
+    Require(*__error_nid_postfix() == 13);
+    Require(strtoul_nid_postfix("4294967296", nullptr, 10) == UINT64_C(4294967296));
+    Require(*__error_nid_postfix() == 13);
+    *__error_nid_postfix() = 0;
+}
+
+int main() {
+    CheckIntegerConversions();
+    Require(atof_nid_postfix(" -12.5tail") == -12.5);
+    char* end = nullptr;
+    const char input[] = "0x1.8p+2 remainder";
+    Require(strtof_nid_postfix(input, &end) == 6.f && end == input + 8);
+    const char invalid[] = "invalid";
+    Require(strtof_nid_postfix(invalid, &end) == 0.f && end == invalid);
+    *__error_nid_postfix() = 0;
+    Require(std::isinf(strtof_nid_postfix("1e1000", nullptr)));
+    Require(*__error_nid_postfix() == 34);
+    Require(strtold_nid_postfix("1.0000000000000000001!", &end) > 1.L && *end == '!');
+    Require(fmodf_nid_postfix(5.5f, 2.f) == 1.5f);
+    Require(fmodf_nid_postfix(-5.5f, 2.f) == -1.5f);
+    Require(std::signbit(fmodf_nid_postfix(-4.f, 2.f)));
+    Require(std::isnan(fmodf_nid_postfix(1.f, 0.f)));
+    Require(std::abs(asinf_nid_postfix(0.5f) - 0.5235988f) < 0.000001f);
+    Require(std::abs(acosf_nid_postfix(0.5f) - 1.0471976f) < 0.000001f);
+    Require(std::abs(atan2f_nid_postfix(1.f, -1.f) - 2.3561945f) < 0.000001f);
+    Require(tanf_nid_postfix(0.f) == 0.f);
+    Require(log10f_nid_postfix(100.f) == 2.f);
+    Require(exp2_nid_postfix(-3.) == 0.125);
+    Require(ldexp_nid_postfix(0.75, 4) == 12.);
+    Require(scalbn_nid_postfix(0.75, -2) == 0.1875);
+    Require(scalbnf_nid_postfix(0.75f, 4) == 12.f);
+    int exponent = 0;
+    Require(frexp_nid_postfix(12., &exponent) == 0.75 && exponent == 4);
+    Require(frexpf_nid_postfix(-12.f, &exponent) == -0.75f && exponent == 4);
+    Require(lround_nid_postfix(4294967296.5) == INT64_C(4294967297));
+    Require(lround_nid_postfix(-2.5) == -3);
+    Require(lroundf_nid_postfix(4294967296.f) == INT64_C(4294967296));
+    Require(lroundf_nid_postfix(2.5f) == 3);
+    Require(llround_nid_postfix(-4294967296.5) == -INT64_C(4294967297));
+    const auto infinity = std::numeric_limits<float>::infinity();
+    const auto nan = std::numeric_limits<float>::quiet_NaN();
+    Require(__isinff_nid_postfix(infinity) == 1 && __isinff_nid_postfix(-infinity) == 1);
+    Require(__isinff_nid_postfix(nan) == 0 && __isinff_nid_postfix(1.f) == 0);
+    Require(__isfinitef_nid_postfix(0.f) == 1 && __isfinitef_nid_postfix(infinity) == 0);
+    Require(__isfinitef_nid_postfix(nan) == 0);
+    Require(__isnormalf_nid_postfix(1.f) == 1 && __isnormalf_nid_postfix(0.f) == 0);
+    Require(__isnormalf_nid_postfix(std::numeric_limits<float>::denorm_min()) == 0);
+    Require(__isnormal_nid_postfix(1.) == 1 && __isnormal_nid_postfix(0.) == 0);
+    Require(__isnormal_nid_postfix(std::numeric_limits<double>::denorm_min()) == 0);
+}

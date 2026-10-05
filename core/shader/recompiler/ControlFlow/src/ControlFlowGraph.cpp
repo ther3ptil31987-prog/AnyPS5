@@ -107,6 +107,7 @@ std::string BranchConditionToString(BranchCondition condition) {
         case BranchCondition::ExecZero: return "execz";
         case BranchCondition::ExecNonZero: return "execnz";
         case BranchCondition::ScalarInstruction: return "scalar_instruction";
+        case BranchCondition::IndirectTarget: return "indirect_target";
         case BranchCondition::GotoVariable: return "goto_variable";
         case BranchCondition::Unknown: return "unknown";
     }
@@ -143,7 +144,8 @@ std::string GraphToString(const ControlFlowGraph& graph) {
         text += "block_" + std::to_string(block.id);
         text += " pc=" + toHexString(block.startProgramCounter);
         text += " end=" + toHexString(block.endProgramCounter);
-        text += " inst=[" + std::to_string(block.instructionBegin) + "," + std::to_string(block.instructionEnd) + ")\n";
+        text += " inst=[" + std::to_string(block.instructionBegin) + "," + std::to_string(block.instructionEnd) + ")";
+        text += " words=" + std::to_string(block.estimatedSpirvWords) + "\n";
         text += "  predecessors=[" + joinIds(block.predecessors) + "]";
         text += " successors=[" + joinIds(block.successors) + "]\n";
         text += "  dominators=[" + joinIds(block.dominators) + "]";

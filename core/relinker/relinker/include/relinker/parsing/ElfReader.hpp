@@ -29,6 +29,7 @@ private:
     std::uint16_t _readU16At(FileByteOffset offset) const;
     std::uint8_t _readU8At(FileByteOffset offset) const;
     std::string _resolveShdrName(std::uint32_t nameOffset, const ElfHeader& header) const;
+    std::string formatMagic() const;
 };
 
 }

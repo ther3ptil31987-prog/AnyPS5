@@ -1,0 +1,35 @@
+
+name: Labels
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/labels.yml']
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - run: |
+          label() { gh label create "$1" --color "$2" --description "$3"; }
+          force_label() { gh label create "$1" --color "$2" --description "$3" --force; }
+
+          force_label 'needs rebase' b60205 'Conflicts with main, rebase needed'
+          force_label ci            5319e7 '.github'
+          force_label agc           1d76db 'libSceAgc*'
+          force_label shader        1d76db 'core/shader'
+
+          label relinker  5319e7 'core/relinker'
+          label libc      fbca04 'libc'
+          label libkernel d93f0b 'libkernel'
+          label prx       c5def5 'Other PRX libraries'
+          label build     bfd4f2 'CMake, submodules, 3rdparty'
+          label docs      0075ca 'Documentation'

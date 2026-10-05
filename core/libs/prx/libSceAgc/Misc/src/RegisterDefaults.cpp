@@ -9,6 +9,11 @@
 
 extern "C" {
 
+void* APS5_VABI sceAgcGetRegisterDefaults() {
+    // The legacy API has no version argument; use the baseline public table.
+    return Agc::Command::GetRegisterDefaults(0, false, __func__);
+}
+
 void* APS5_VABI sceAgcGetRegisterDefaults2(std::uint32_t version) {
     return Agc::Command::GetRegisterDefaults(version, false, __func__);
 }

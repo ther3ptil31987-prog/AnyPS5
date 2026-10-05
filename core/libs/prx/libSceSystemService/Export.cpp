@@ -1,33 +1,54 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include "prx/libc/include/Shutdown.hpp"
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
 
 extern "C" {
 
+int APS5_VABI sceSystemServiceLoadExec(const char* path, const char* const* arguments) {
+    if (!path || !*path) return SYSTEM_SERVICE_ERROR_PARAMETER;
+    if (std::strcmp(path, "exit") != 0) {
+        NotImplemented_nid_no_patch("sceSystemServiceLoadExec: executable replacement");
+    }
+    (void)arguments;
+    LibcRunShutdown_nid_postfix();
+    std::exit(0);
+}
+
 int APS5_VABI sceSystemServiceDisableNoticeScreenSkipFlagAutoSet(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return SYSTEM_SERVICE_OK;
 }
 
 int APS5_VABI sceSystemServiceGetDisplaySafeAreaInfo(SystemServiceDisplaySafeAreaInfo* info) {
- (void)info;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (info == nullptr) {
+  return SYSTEM_SERVICE_ERROR_PARAMETER;
+ }
+ *info = SystemServiceDisplaySafeAreaInfo{};
+ info->ratio = 1.0f;
+ return SYSTEM_SERVICE_OK;
 }
 
 int APS5_VABI sceSystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLuminance* luminance) {
- (void)luminance;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (luminance == nullptr) {
+  return SYSTEM_SERVICE_ERROR_PARAMETER;
+ }
+ constexpr float SdrReferenceWhiteNits = 100.0f;
+ luminance->max_full_frame_tone_map_luminance = SdrReferenceWhiteNits;
+ luminance->max_tone_map_luminance = SdrReferenceWhiteNits;
+ luminance->min_tone_map_luminance = 0.0f;
+ return SYSTEM_SERVICE_OK;
 }
 
 int APS5_VABI sceSystemServiceGetNoticeScreenSkipFlag(bool* value) {
- (void)value;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (value == nullptr) {
+  return SYSTEM_SERVICE_ERROR_PARAMETER;
+ }
+ *value = false;
+ return SYSTEM_SERVICE_OK;
 }
 
 int APS5_VABI sceSystemServiceGetStatus(SystemServiceStatus* status) {
@@ -76,8 +97,6 @@ int APS5_VABI sceSystemServiceReceiveEvent(SystemServiceEvent* event) {
  if (event == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
- event->event_type = -1;
- std::memset(event->data, 0, sizeof(event->data));
  return SYSTEM_SERVICE_ERROR_NO_EVENT;
 }
 
@@ -88,8 +107,27 @@ int APS5_VABI sceSystemServiceReportAbnormalTermination(const void* info) {
 }
 
 int APS5_VABI sceSystemServiceSetNoticeScreenSkipFlag(void) {
+ return SYSTEM_SERVICE_OK;
+}
+
+int APS5_VABI sceSystemServiceInitializePlayerDialogParam(void* param) {
+ if (param == nullptr) return SYSTEM_SERVICE_ERROR_PARAMETER;
+ return SYSTEM_SERVICE_OK;
+}
+
+int APS5_VABI sceSystemServiceDisableMediaPlay() {
  NotImplemented_nid_no_patch(__func__);
  return 0;
+}
+
+int APS5_VABI sceSystemServiceReenableMediaPlay() {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSystemServiceLaunchPlayerDialog(const void* param) {
+ if (param == nullptr) return SYSTEM_SERVICE_ERROR_PARAMETER;
+ return SYSTEM_SERVICE_OK;
 }
 
 }

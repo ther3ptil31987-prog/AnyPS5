@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace ShaderRecompiler {
 
@@ -41,6 +42,13 @@ struct ShaderBufferResource {
 struct ShaderColorComponentMapping {
     static constexpr std::uint8_t Identity = 0xe4u;
     std::uint8_t packed = Identity;
+
+    [[nodiscard]] std::uint32_t Map(std::uint32_t component) const {
+        return (packed >> (component * 2u)) & 0x3u;
+    }
+    [[nodiscard]] bool IsIdentity() const {
+        return packed == Identity;
+    }
 };
 
 struct ShaderVertexInputBuffer {
@@ -93,18 +101,19 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
     std::uint32_t maxVertices = 0;
     std::uint32_t maxPrimitives = 0;
     std::uint32_t provokingVertex = 0;
+    std::uint32_t esgsItemSize = 0;
 
     [[nodiscard]] std::uint32_t InputPrimitiveSize() const {
-        throw std::runtime_error("shader input helper not implemented");
+        return inputPrimitive == 1u ? 1u : inputPrimitive == 2u ? 2u : 3u;
     }
     [[nodiscard]] std::uint32_t InputPrimitiveStep() const {
-        throw std::runtime_error("shader input helper not implemented");
+        return inputPrimitive == 5u || inputPrimitive == 6u ? 1u : InputPrimitiveSize();
     }
     [[nodiscard]] std::uint32_t InputPrimitiveCount(std::uint32_t vertices) const {
-        throw std::runtime_error("shader input helper not implemented");
+        return vertices < InputPrimitiveSize() ? 0u : (vertices - InputPrimitiveSize()) / InputPrimitiveStep() + 1u;
     }
     [[nodiscard]] std::uint32_t InputVertexCount(std::uint32_t primitives) const {
-        throw std::runtime_error("shader input helper not implemented");
+        return primitives == 0u ? 0u : (primitives - 1u) * InputPrimitiveStep() + InputPrimitiveSize();
     }
 };
 
@@ -140,9 +149,8 @@ struct ShaderVertexInputInfo {
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
-    std::uint32_t dispatchThreadsNum[3] = {0, 0, 0};
     bool groupId[3] = {false, false, false};
-    bool dispatchThreadDimensions = false;
+    bool partialGroups = false;
     int threadIdsNum = 0;
     int workgroupRegister = 0;
     bool tgSizeEn = false;
@@ -152,9 +160,13 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 struct ShaderPixelInputInfo {
     std::uint32_t interpolatorSettings[32] = {0};
     std::uint32_t inputNum = 0;
-    std::uint32_t psSystemInputBase = 0;
     std::uint32_t customInterpolationMask = 0;
-    std::uint32_t psPerspectiveCenterVgpr = std::numeric_limits<std::uint32_t>::max();
+    static constexpr std::uint32_t NoPixelInputVgpr = std::numeric_limits<std::uint32_t>::max();
+    std::array<std::uint32_t, 16> psInputVgpr = [] {
+        std::array<std::uint32_t, 16> vgprs{};
+        vgprs.fill(NoPixelInputVgpr);
+        return vgprs;
+    }();
     std::uint8_t targetOutputMode[8] = {};
     std::array<ShaderColorComponentMapping, 8> targetExportMapping = {};
     std::uint32_t scratchSizeDwords = 0;
@@ -174,7 +186,37 @@ struct ShaderPixelInputInfo {
     ShaderStageRuntime stage;
 
     bool HasPositionInput() const {
-        throw std::runtime_error("shader input helper not implemented");
+        return psPosX || psPosY || psPosZ || psPosW;
+    }
+
+    [[nodiscard]] bool InputIsDefault(std::uint32_t input) const {
+        return input < inputNum && input < 32u && (interpolatorSettings[input] & 0x420u) == 0x20u;
+    }
+
+    [[nodiscard]] bool InputIsPassthrough(std::uint32_t input) const {
+        return input < inputNum && input < 32u && (interpolatorSettings[input] & 0x420u) == 0x420u;
+    }
+
+    [[nodiscard]] bool InputIsCustom(std::uint32_t input) const {
+        return input < 32u && ((customInterpolationMask & (1u << input)) != 0u || InputIsPassthrough(input));
+    }
+
+    [[nodiscard]] std::uint32_t InputSlot(std::uint32_t input) const {
+        return input < 32u ? interpolatorSettings[input] & 0x1fu : input;
+    }
+
+    [[nodiscard]] std::uint32_t InputDefaultBits(std::uint32_t input, std::uint32_t component) const {
+        const auto value = input < 32u ? (interpolatorSettings[input] >> 8u) & 0x3u : 0u;
+        const bool one = component == 3u ? (value & 0x1u) != 0u : (value & 0x2u) != 0u;
+        return one ? 0x3f800000u : 0u;
+    }
+
+    [[nodiscard]] bool InputIsLinear(std::uint32_t input, std::uint32_t linearInputs, std::uint32_t perspectiveInputs) const {
+        const auto bit = input < 32u ? 1u << input : 0u;
+        if ((linearInputs & perspectiveInputs & bit) != 0u) {
+            throw std::runtime_error("pixel input " + std::to_string(input) + " is interpolated through both a perspective and a linear I/J pair");
+        }
+        return (linearInputs & bit) != 0u || ((perspectiveInputs & bit) == 0u && psNoPerspective);
     }
 };
 

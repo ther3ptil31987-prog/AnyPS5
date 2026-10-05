@@ -5,6 +5,51 @@
 #include <array>
 #include <exception>
 #include <thread>
+#include <cstddef>
+#include <typeinfo>
+#include "../prx/libc/include/general/VabiMacros.hpp"
+
+extern "C" {
+extern const unsigned char _ZTVN10__cxxabiv117__class_type_infoE_nid_postfix[];
+extern const unsigned char _ZTVN10__cxxabiv120__si_class_type_infoE_nid_postfix[];
+extern const unsigned char _ZTVN10__cxxabiv121__vmi_class_type_infoE_nid_postfix[];
+}
+
+static void TestTypeInfoVtables() {
+    struct TypeRecord { const void* vtable; const char* name; };
+    struct SingleRecord { TypeRecord type; const TypeRecord* base; };
+    struct BaseRecord { const TypeRecord* type; std::ptrdiff_t flags; };
+    struct MultipleRecord { TypeRecord type; unsigned flags; unsigned count; BaseRecord bases[2]; };
+    const auto* classTable = _ZTVN10__cxxabiv117__class_type_infoE_nid_postfix;
+    const auto* singleTable = _ZTVN10__cxxabiv120__si_class_type_infoE_nid_postfix;
+    const auto* multipleTable = _ZTVN10__cxxabiv121__vmi_class_type_infoE_nid_postfix;
+    const unsigned char* tables[] {classTable, singleTable, multipleTable};
+    const char* names[] {"N10__cxxabiv117__class_type_infoE", "N10__cxxabiv120__si_class_type_infoE", "N10__cxxabiv121__vmi_class_type_infoE"};
+    for (std::size_t i = 0; i < 3; ++i) {
+        const std::type_info* category;
+        std::memcpy(&category, tables[i] + sizeof(void*), sizeof(category));
+        if (std::strcmp(category->name(), names[i])) throw std::runtime_error("incorrect RTTI category");
+    }
+    TypeRecord base {classTable + 2 * sizeof(void*), "4Base"};
+    TypeRecord other {classTable + 2 * sizeof(void*), "5Other"};
+    SingleRecord single {{singleTable + 2 * sizeof(void*), "6Single"}, &base};
+    MultipleRecord multiple {{multipleTable + 2 * sizeof(void*), "8Multiple"}, 0, 2, {{&other, 2}, {&base, (16 << 8) | 2}}};
+    using CatchType = bool (APS5_VABI *)(const void*, const void*, void**, unsigned);
+    using UpcastType = bool (APS5_VABI *)(const void*, const void*, void**);
+    CatchType catchType;
+    UpcastType upcastType;
+    std::memcpy(&catchType, classTable + 6 * sizeof(void*), sizeof(catchType));
+    std::memcpy(&upcastType, multipleTable + 7 * sizeof(void*), sizeof(upcastType));
+    std::array<unsigned char, 32> storage {};
+    void* object = storage.data();
+    if (!catchType(&base, &single, &object, 0) || object != storage.data()) throw std::runtime_error("single RTTI catch failed");
+    object = storage.data();
+    if (!catchType(&base, &multiple, &object, 0) || object != storage.data() + 16) throw std::runtime_error("multiple RTTI catch failed");
+    object = storage.data();
+    if (!upcastType(&multiple, &base, &object) || object != storage.data() + 16) throw std::runtime_error("multiple RTTI upcast failed");
+    object = storage.data();
+    if (catchType(&other, &single, &object, 0)) throw std::runtime_error("unrelated RTTI catch succeeded");
+}
 
 extern "C" void NotImplemented_nid_no_patch(const char*);
 
@@ -61,6 +106,7 @@ static void testExceptionPointer() {
 }
 
 int main() {
+    TestTypeInfoVtables();
     testExceptionPointer();
     try {
         Rethrow();

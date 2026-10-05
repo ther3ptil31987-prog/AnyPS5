@@ -3,11 +3,13 @@
 #include <SDL.h>
 #include <SDL_vulkan.h>
 #include <array>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -37,13 +39,19 @@ void Run(SDL_Window* window, const std::filesystem::path& directory, bool verify
         VkSurfaceKHR surface = VK_NULL_HANDLE;
         Require(SDL_Vulkan_CreateSurface(static_cast<SDL_Window*>(context), instance, &surface) == SDL_TRUE, SDL_GetError());
         return surface;
+    }, [](void* context, std::uint32_t* width, std::uint32_t* height) {
+        int drawableWidth = 0;
+        int drawableHeight = 0;
+        SDL_Vulkan_GetDrawableSize(static_cast<SDL_Window*>(context), &drawableWidth, &drawableHeight);
+        *width = drawableWidth > 0 ? static_cast<std::uint32_t>(drawableWidth) : 0;
+        *height = drawableHeight > 0 ? static_cast<std::uint32_t>(drawableHeight) : 0;
     }, Width, Height};
     AgcDriver::VulkanDevice device(&presentation);
     auto vertex = LoadShader(directory / "Triangle.vert.spv");
     auto fragment = LoadShader(directory / "Triangle.frag.spv");
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
         {ShaderRecompiler::ShaderStage::Vertex, &vertex, 0},
-        {ShaderRecompiler::ShaderStage::Fragment, &fragment, AgcDriver::Graphics::StagePushConstantBytes}
+        {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}
     }};
     for (std::size_t i = 0; i < Pixels.size(); i += 4) {
         Pixels[i] = std::byte{16};
@@ -62,20 +70,30 @@ void Run(SDL_Window* window, const std::filesystem::path& directory, bool verify
     state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     state.blend.colorWriteMask = 15;
     const std::array<std::uint16_t, 3> indices{0, 1, 2};
-    const AgcDriver::Pm4::IndexedDraw draw{reinterpret_cast<std::uintptr_t>(indices.data()), 3, 2, 1, 0};
-    device.DrawIndexed(state, draw, shaders);
+    const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(indices.data()), 3, 2, 1, 0};
+    device.Draw(state, draw, shaders);
+    const std::vector<std::byte> indexedPixels(Pixels.begin(), Pixels.end());
+    for (std::size_t i = 0; i < Pixels.size(); i += 4) {
+        Pixels[i] = std::byte{16};
+        Pixels[i + 1] = std::byte{24};
+        Pixels[i + 2] = std::byte{40};
+        Pixels[i + 3] = std::byte{255};
+    }
+    const AgcDriver::Pm4::DrawParameters autoDraw{0, 3, 0, 1, 0, false};
+    device.Draw(state, autoDraw, shaders);
+    Require(std::equal(Pixels.begin(), Pixels.end(), indexedPixels.begin()), "GPU readback: auto draw differs from indexed triangle");
     const auto center = (Height / 2 * Width + Width / 2) * 4;
     Require(std::to_integer<unsigned>(Pixels[center]) > 30 && std::to_integer<unsigned>(Pixels[center + 1]) > 30 && std::to_integer<unsigned>(Pixels[center + 2]) > 30, "GPU readback: triangle center was not rendered");
     Require(Pixels[0] == std::byte{16} && Pixels[1] == std::byte{24} && Pixels[2] == std::byte{40}, "GPU readback: background changed");
-    device.WaitPresented(device.PresentPixels(Width, Height, Pixels));
-    std::cout << "SPIR-V triangle rendered, GPU readback verified, frame presented. Close the window or press Escape.\n" << std::flush;
+    device.PresentPixels(Width, Height, Pixels);
+    std::cout << "SPIR-V triangle rendered, GPU readback verified, frame queued for presentation. Close the window or press Escape.\n" << std::flush;
     if (!verifyOnly) {
         bool running = true;
         while (running) {
             SDL_Event event{};
             if (SDL_WaitEventTimeout(&event, 100)) {
                 if (event.type == SDL_QUIT || (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)) running = false;
-                if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_EXPOSED) device.WaitPresented(device.PresentPixels(Width, Height, Pixels));
+                if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_EXPOSED) device.PresentPixels(Width, Height, Pixels);
             }
         }
     }

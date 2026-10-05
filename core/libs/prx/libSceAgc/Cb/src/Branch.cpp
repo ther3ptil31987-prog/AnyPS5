@@ -38,4 +38,9 @@ uint32_t* APS5_VABI sceAgcCbCondWrite(CommandBuffer* buf, uint32_t cond, uint32_
     return nullptr;
 }
 
+std::uint32_t APS5_VABI sceAgcCbCondWriteGetSize() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 }

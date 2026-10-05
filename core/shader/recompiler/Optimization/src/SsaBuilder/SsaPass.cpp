@@ -113,7 +113,7 @@ IrValue* Pass::TryRemoveTrivialPhi(IrValue& phi, Variable variable) {
         same = operand;
     }
     if (same == nullptr) {
-        same = MakeUndef(variable);
+        same = MakeInitialValue(variable);
     }
     std::vector<IrValue*> users = phi.Uses();
     phi.ReplaceUsesWith(same, true);
@@ -125,10 +125,15 @@ IrValue* Pass::TryRemoveTrivialPhi(IrValue& phi, Variable variable) {
     return same;
 }
 
-IrValue* Pass::MakeUndef(Variable variable) {
+IrValue* Pass::MakeInitialValue(Variable variable) {
     const IrType type = VariableType(variable);
-    const IrOpcode opcode = (type == IrType::Bool) ? IrOpcode::UndefU1 : IrOpcode::UndefU32;
-    return &_program.CreateValue(opcode, type);
+    IrValue& value = _program.CreateValue(IrOpcode::Void, type);
+    if (type == IrType::Bool) {
+        value.SetImmediateBool(false);
+    } else {
+        value.SetImmediateU32(0u);
+    }
+    return &value;
 }
 
 }

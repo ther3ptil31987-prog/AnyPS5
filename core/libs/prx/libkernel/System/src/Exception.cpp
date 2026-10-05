@@ -26,15 +26,11 @@ int APS5_VABI sceKernelRaiseException(Pthread thread, int signum) {
 }
 
 void APS5_VABI sceKernelDebugRaiseException(int c1, int c2) {
- (void)c1;
- (void)c2;
- NotImplemented_nid_no_patch(__func__);
+  APS5_LOG_OUT("sceKernelDebugRaiseException c1=%d c2=%d", c1, c2);
 }
 
 void APS5_VABI sceKernelDebugRaiseExceptionOnReleaseMode(int c1, int c2) {
- (void)c1;
- (void)c2;
- NotImplemented_nid_no_patch(__func__);
+  APS5_LOG_OUT("sceKernelDebugRaiseExceptionOnReleaseMode c1=%d c2=%d", c1, c2);
 }
 
 }

@@ -128,6 +128,7 @@ void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inpu
                         case StageInputKind::InvocationId:
                         case StageInputKind::PrimitiveId:
                         case StageInputKind::FrontFacing:
+                        case StageInputKind::HelperInvocation:
                         case StageInputKind::LocalInvocationIndex:
                             if (component != 0u) {
                                 return Fail("typed scalar builtin component is out of range");
@@ -148,6 +149,7 @@ void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inpu
                         case StageInputKind::WorkgroupId:
                         case StageInputKind::LocalInvocationId:
                         case StageInputKind::GlobalInvocationId:
+                        case StageInputKind::DispatchThreadLimit:
                             if (component >= 3u) {
                                 return Fail("typed invocation builtin component is out of range");
                             }
@@ -199,7 +201,7 @@ void CollectVertexInputs(const IrProgram& program, const ShaderVertexInputInfo* 
 }
 
 bool IsPixelParameterCustom(const ShaderPixelInputInfo& pixel, std::uint32_t input) {
-    return input < 32u && (pixel.customInterpolationMask & (1u << input)) != 0u;
+    return pixel.InputIsCustom(input);
 }
 
 bool IsPixelParameterFlat(const ShaderPixelInputInfo& pixel, std::uint32_t input) {
@@ -214,28 +216,66 @@ void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pi
     if (pixel->psFrontFace) {
         AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
     }
+    std::array<bool, 32> read {};
     std::array<bool, 32> perVertex {};
     std::array<bool, 32> interpolated {};
     for (const auto& block : program.Blocks()) {
         for (const IrValue* inst : block->Instructions()) {
             if (inst->Opcode() == IrOpcode::GetAttribute) {
-                interpolated[inst->Argument(0)->Resolve()->ImmediateU32()] = true;
+                const auto input = inst->Argument(0)->Resolve()->ImmediateU32();
+                if (IsPixelParameterCustom(*pixel, input)) {
+                    throw std::runtime_error("pixel input " + std::to_string(input) + " passes its vertices through unchanged but is read with v_interp_p1/p2");
+                }
+                read[input] = true;
+                interpolated[input] = true;
             } else if (inst->Opcode() == IrOpcode::GetInterpolationParameter) {
                 const auto input = inst->Argument(0)->Resolve()->ImmediateU32();
                 const auto mode = inst->Argument(2)->Resolve()->ImmediateU32();
+                read[input] = true;
                 perVertex[input] = perVertex[input] || mode < 2u || !IsPixelParameterFlat(*pixel, input);
             }
         }
     }
+    const auto& metadata = program.Metadata();
+    const auto linear = [&](std::uint32_t input) {
+        return pixel->InputIsLinear(input, metadata.pixelLinearInputs, metadata.pixelPerspectiveInputs);
+    };
+    const auto interpolation = [&](std::uint32_t input) {
+        return IsPixelParameterFlat(*pixel, input) ? 2u : linear(input) ? 1u : 0u;
+    };
+    constexpr std::uint32_t unassigned = std::numeric_limits<std::uint32_t>::max();
+    std::array<std::uint32_t, 32> slotInterpolation {};
+    slotInterpolation.fill(unassigned);
+    std::array<bool, 32> slotPerVertex {};
     for (std::uint32_t input = 0; input < pixel->inputNum; input++) {
-        AddInput(info, StageInputKind::Parameter, input, 4, "in_param_" + std::to_string(input), perVertex[input]);
-    }
-    for (std::uint32_t input = 0; input < pixel->inputNum; input++) {
-        if (interpolated[input] && perVertex[input]) {
-            const auto kind = pixel->psNoPerspective ? StageInputKind::BaryCoordNoPerspective : StageInputKind::BaryCoordSmooth;
-            AddInput(info, kind, 0, 3, pixel->psNoPerspective ? "gl_BaryCoordNoPerspKHR" : "gl_BaryCoordKHR");
-            break;
+        if (!read[input] || pixel->InputIsDefault(input)) {
+            continue;
         }
+        const auto slot = pixel->InputSlot(input);
+        if (slotInterpolation[slot] == unassigned) {
+            slotInterpolation[slot] = interpolation(input);
+        } else if (slotInterpolation[slot] != interpolation(input)) {
+            slotPerVertex[slot] = true;
+        }
+        slotPerVertex[slot] = slotPerVertex[slot] || perVertex[input];
+    }
+    bool smooth = false;
+    bool noPerspective = false;
+    for (std::uint32_t input = 0; input < pixel->inputNum; input++) {
+        if (!read[input] || pixel->InputIsDefault(input)) {
+            continue;
+        }
+        const bool vertexInput = slotPerVertex[pixel->InputSlot(input)];
+        AddInput(info, StageInputKind::Parameter, input, 4, "in_param_" + std::to_string(input), vertexInput);
+        if (vertexInput && interpolated[input] && !IsPixelParameterFlat(*pixel, input)) {
+            (linear(input) ? noPerspective : smooth) = true;
+        }
+    }
+    if (smooth) {
+        AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
+    }
+    if (noPerspective) {
+        AddInput(info, StageInputKind::BaryCoordNoPerspective, 0, 3, "gl_BaryCoordNoPerspKHR");
     }
 }
 
@@ -248,9 +288,6 @@ void CollectComputeInputs(const ShaderComputeInputInfo* compute, ShaderInfo& inf
     }
     if (compute->threadIdsNum > 0 || compute->tgSizeEn) {
         AddInput(info, StageInputKind::LocalInvocationIndex, 0, 1, "gl_LocalInvocationIndex");
-    }
-    if (compute->dispatchThreadDimensions) {
-        AddInput(info, StageInputKind::GlobalInvocationId, 0, 3, "gl_GlobalInvocationID");
     }
 }
 
@@ -286,6 +323,9 @@ void CollectBuiltinInputs(const IrProgram& program, ShaderInfo& info) {
                 case StageInputKind::FrontFacing:
                     AddInput(info, kind, 0, 1, "gl_FrontFacing");
                     break;
+                case StageInputKind::HelperInvocation:
+                    AddInput(info, kind, 0, 1, "gl_HelperInvocation");
+                    break;
                 case StageInputKind::Layer:
                     AddInput(info, kind, 0, 1, "gl_Layer");
                     break;
@@ -309,6 +349,9 @@ void CollectBuiltinInputs(const IrProgram& program, ShaderInfo& info) {
                     break;
                 case StageInputKind::GlobalInvocationId:
                     AddInput(info, kind, 0, 3, "gl_GlobalInvocationID");
+                    break;
+                case StageInputKind::DispatchThreadLimit:
+                    info.dispatchThreadLimit = true;
                     break;
                 case StageInputKind::PackedAncillary:
                 case StageInputKind::Parameter:

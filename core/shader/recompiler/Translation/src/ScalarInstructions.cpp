@@ -1,6 +1,7 @@
 #include "Translation/ScalarInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
 #include <stdexcept>
+#include <string>
 
 namespace ShaderRecompiler {
 
@@ -40,32 +41,120 @@ bool TranslationContext::emitScalar(const RdnaInstruction& inst) {
     case RdnaOpcode::SCselectB64:
         scalarSelect64(inst, sourceAt(inst, 1u));
         return true;
+    case RdnaOpcode::SCmovB32: {
+        const IrU32 source = readU32(sourceAt(inst, 0u));
+        const IrU32 previous = readU32(inst.destination);
+        const IrU32 result(ir.Select(ir.GetScc(), source.Value(), previous.Value()));
+        writeRawU32(inst.destination, result);
+        return true;
+    }
     case RdnaOpcode::SCmovB64:
         scalarSelect64(inst, inst.destination);
         return true;
     case RdnaOpcode::SSetregB32:
+    case RdnaOpcode::SVersion:
         emitControlNop();
         return true;
+    case RdnaOpcode::SSetregImm32B32: {
+        const std::uint32_t field = inst.source1.value;
+        const std::uint32_t offset = (field >> 6u) & 0x1fu;
+        const std::uint32_t size = ((field >> 11u) & 0x1fu) + 1u;
+        const std::uint64_t written = static_cast<std::uint64_t>(inst.source0.value) & ((std::uint64_t{1} << size) - 1u);
+        if ((field & 0x3fu) != 1u || offset + size > 4u || written != 0u) {
+            throw std::runtime_error("s_setreg_imm32_b32 at pc " + std::to_string(inst.programCounter) + " writes a hardware register field other than round to nearest even in MODE");
+        }
+        emitControlNop();
+        return true;
+    }
+    case RdnaOpcode::SGetregB32: {
+        const std::uint32_t field = inst.source0.value;
+        const std::uint32_t offset = (field >> 6u) & 0x1fu;
+        const std::uint32_t size = ((field >> 11u) & 0x1fu) + 1u;
+        if ((field & 0x3fu) != 1u || offset + size > 4u) {
+            throw std::runtime_error("s_getreg_b32 at pc " + std::to_string(inst.programCounter) + " reads hardware register " + std::to_string(field & 0x3fu) + " bits " + std::to_string(offset) + ".." + std::to_string(offset + size - 1u) + ": only the MODE round mode fields are modeled");
+        }
+        writeRawU32(inst.destination, IrU32(ir.Constant(0u)));
+        return true;
+    }
+    case RdnaOpcode::SCmovkI32: {
+        const IrU32 previous = readU32(inst.destination);
+        writeRawU32(inst.destination, IrU32(ir.Select(ir.GetScc(), ir.Constant(inst.source0.value), previous.Value())));
+        return true;
+    }
     case RdnaOpcode::SWaitcnt:
         emitWaitcnt();
         return true;
     case RdnaOpcode::SAndSaveexecB32:
         sSaveexec(inst, IrOpcode::LogicalAnd, false, false, false);
         return true;
+    case RdnaOpcode::SOrSaveexecB32:
+        sSaveexec(inst, IrOpcode::LogicalOr, false, false, false);
+        return true;
+    case RdnaOpcode::SXorSaveexecB32:
+        sSaveexec(inst, IrOpcode::LogicalXor, false, false, false);
+        return true;
     case RdnaOpcode::SAndn1SaveexecB32:
         sSaveexec(inst, IrOpcode::LogicalAnd, false, true, false);
+        return true;
+    case RdnaOpcode::SAndn2SaveexecB32:
+        sSaveexec(inst, IrOpcode::LogicalAnd, true, false, false);
+        return true;
+    case RdnaOpcode::SOrn1SaveexecB32:
+        sSaveexec(inst, IrOpcode::LogicalOr, false, true, false);
         return true;
     case RdnaOpcode::SOrn2SaveexecB32:
         sSaveexec(inst, IrOpcode::LogicalOr, true, false, false);
         return true;
+    case RdnaOpcode::SNandSaveexecB32:
+        sSaveexec(inst, IrOpcode::LogicalAnd, false, false, false, true);
+        return true;
+    case RdnaOpcode::SNorSaveexecB32:
+        sSaveexec(inst, IrOpcode::LogicalOr, false, false, false, true);
+        return true;
+    case RdnaOpcode::SXnorSaveexecB32:
+        sSaveexec(inst, IrOpcode::LogicalXor, false, false, false, true);
+        return true;
+    case RdnaOpcode::SAndn1WrexecB32:
+        sSaveexec(inst, IrOpcode::LogicalAnd, false, true, false, false, true);
+        return true;
+    case RdnaOpcode::SAndn2WrexecB32:
+        sSaveexec(inst, IrOpcode::LogicalAnd, true, false, false, false, true);
+        return true;
     case RdnaOpcode::SAndSaveexecB64:
         sSaveexec(inst, IrOpcode::LogicalAnd, false, false, true);
+        return true;
+    case RdnaOpcode::SOrSaveexecB64:
+        sSaveexec(inst, IrOpcode::LogicalOr, false, false, true);
+        return true;
+    case RdnaOpcode::SXorSaveexecB64:
+        sSaveexec(inst, IrOpcode::LogicalXor, false, false, true);
+        return true;
+    case RdnaOpcode::SAndn2SaveexecB64:
+        sSaveexec(inst, IrOpcode::LogicalAnd, true, false, true);
         return true;
     case RdnaOpcode::SAndn1SaveexecB64:
         sSaveexec(inst, IrOpcode::LogicalAnd, false, true, true);
         return true;
     case RdnaOpcode::SOrn2SaveexecB64:
         sSaveexec(inst, IrOpcode::LogicalOr, true, false, true);
+        return true;
+    case RdnaOpcode::SNandSaveexecB64:
+        sSaveexec(inst, IrOpcode::LogicalAnd, false, false, true, true);
+        return true;
+    case RdnaOpcode::SNorSaveexecB64:
+        sSaveexec(inst, IrOpcode::LogicalOr, false, false, true, true);
+        return true;
+    case RdnaOpcode::SXnorSaveexecB64:
+        sSaveexec(inst, IrOpcode::LogicalXor, false, false, true, true);
+        return true;
+    case RdnaOpcode::SOrn1SaveexecB64:
+        sSaveexec(inst, IrOpcode::LogicalOr, false, true, true);
+        return true;
+    case RdnaOpcode::SAndn1WrexecB64:
+        sSaveexec(inst, IrOpcode::LogicalAnd, false, true, true, false, true);
+        return true;
+    case RdnaOpcode::SAndn2WrexecB64:
+        sSaveexec(inst, IrOpcode::LogicalAnd, true, false, true, false, true);
         return true;
     case RdnaOpcode::SAddU32:
         addU32(inst, false, false);
@@ -187,6 +276,42 @@ bool TranslationContext::emitScalar(const RdnaInstruction& inst) {
         return simpleInteger(inst, IrOpcode::BitwiseNot32, IrType::U32, false, false, true);
     case RdnaOpcode::SBrevB32:
         return simpleInteger(inst, IrOpcode::BitReverse32, IrType::U32, false, false, false);
+    case RdnaOpcode::SBrevB64: {
+        const auto source = readU32Pair(sourceAt(inst, 0u));
+        const IrU32 low(ir.Emit(IrOpcode::BitReverse32, IrType::U32, {&source[1].Value()}));
+        const IrU32 high(ir.Emit(IrOpcode::BitReverse32, IrType::U32, {&source[0].Value()}));
+        writeU32Pair(inst.destination, {low, high});
+        return true;
+    }
+    case RdnaOpcode::SSextI32I8:
+    case RdnaOpcode::SSextI32I16: {
+        const auto source = readU32(sourceAt(inst, 0u));
+        const auto width = inst.op == RdnaOpcode::SSextI32I8 ? 8u : 16u;
+        auto& result = ir.Emit(IrOpcode::BitFieldSExtract, IrType::U32, {&source.Value(), &ir.Constant(0u), &ir.Constant(width)});
+        writeOperand(inst.destination, &result);
+        return true;
+    }
+    case RdnaOpcode::SBcnt0I32B32:
+    case RdnaOpcode::SFf0I32B32: {
+        const IrU32 source = readU32(sourceAt(inst, 0u));
+        auto& inverted = ir.BitwiseNot(source.Value());
+        const bool count = inst.op == RdnaOpcode::SBcnt0I32B32;
+        auto& result = ir.Emit(count ? IrOpcode::BitCount32 : IrOpcode::FindILsb32, IrType::U32, {&inverted});
+        writeOperand(inst.destination, &result);
+        if (count) {
+            ir.SetScc(ir.INotEqual(result, ir.Constant(0u)));
+        }
+        return true;
+    }
+    case RdnaOpcode::SBcnt0I32B64: {
+        const std::array<IrU32, 2> source = extractU64(readU64(sourceAt(inst, 0u)));
+        auto& low = ir.Emit(IrOpcode::BitCount32, IrType::U32, {&ir.BitwiseNot(source[0].Value())});
+        auto& high = ir.Emit(IrOpcode::BitCount32, IrType::U32, {&ir.BitwiseNot(source[1].Value())});
+        auto& result = ir.IAdd(low, high);
+        writeOperand(inst.destination, &result);
+        ir.SetScc(ir.INotEqual(result, ir.Constant(0u)));
+        return true;
+    }
     case RdnaOpcode::SBcnt1I32B32:
         return simpleInteger(inst, IrOpcode::BitCount32, IrType::U32, false, false, true);
     case RdnaOpcode::SBcnt1I32B64:
@@ -199,6 +324,8 @@ bool TranslationContext::emitScalar(const RdnaInstruction& inst) {
         return simpleInteger(inst, IrOpcode::ShiftRightLogical32, IrType::U32, false, true, true);
     case RdnaOpcode::SAshrI32:
         return simpleInteger(inst, IrOpcode::ShiftRightArithmetic32, IrType::U32, false, true, true);
+    case RdnaOpcode::SAshrI64:
+        return simpleInteger(inst, IrOpcode::ShiftRightArithmetic64, IrType::U64, false, false, true);
     case RdnaOpcode::SLshlB64:
         return simpleInteger(inst, IrOpcode::ShiftLeftLogical64, IrType::U64, false, false, true);
     case RdnaOpcode::SLshrB64:
@@ -213,12 +340,18 @@ bool TranslationContext::emitScalar(const RdnaInstruction& inst) {
         return composedIntegerBinary(inst, IrOpcode::BitwiseOr32, false, true, true);
     case RdnaOpcode::SXnorB32:
         return composedIntegerBinary(inst, IrOpcode::BitwiseXor32, false, true, true);
+    case RdnaOpcode::SFf0I32B64:
+        return sFfI32B64(inst, true);
     case RdnaOpcode::SFf1I32B64:
-        return sFf1I32B64(inst);
+        return sFfI32B64(inst, false);
     case RdnaOpcode::SFlbitI32B32:
         return vFfbh32(inst, false);
+    case RdnaOpcode::SFlbitI32:
+        return vFfbh32(inst, true);
     case RdnaOpcode::SFlbitI32B64:
-        return sFlbitI32B64(inst);
+        return sFlbitI32B64(inst, false);
+    case RdnaOpcode::SFlbitI32I64:
+        return sFlbitI32B64(inst, true);
     case RdnaOpcode::SBitset0B32:
         return sBitsetB32(inst, false);
     case RdnaOpcode::SBitset1B32:
@@ -229,8 +362,16 @@ bool TranslationContext::emitScalar(const RdnaInstruction& inst) {
         return sBitsetB64(inst, true);
     case RdnaOpcode::SBitreplicateB64B32:
         return sBitreplicateB64B32(inst);
+    case RdnaOpcode::SQuadmaskB32:
+        return sQuadmask(inst, false);
     case RdnaOpcode::SQuadmaskB64:
-        return sQuadmaskB64(inst);
+        return sQuadmask(inst, true);
+    case RdnaOpcode::SMovrelsB32:
+    case RdnaOpcode::SMovrelsB64:
+    case RdnaOpcode::SMovreldB32:
+    case RdnaOpcode::SMovreldB64:
+    case RdnaOpcode::SMovrelsd2B32:
+        return sMovrel(inst);
     case RdnaOpcode::SBfmB32:
         return bfmB32(inst);
     case RdnaOpcode::SBfmB64:
@@ -245,6 +386,10 @@ bool TranslationContext::emitScalar(const RdnaInstruction& inst) {
         return sBitcmpB32(inst, false);
     case RdnaOpcode::SBitcmp1B32:
         return sBitcmpB32(inst, true);
+    case RdnaOpcode::SBitcmp0B64:
+        return sBitcmpB64(inst, false);
+    case RdnaOpcode::SBitcmp1B64:
+        return sBitcmpB64(inst, true);
     case RdnaOpcode::SPackLlB32B16:
         return packB16(inst, false, false);
     case RdnaOpcode::SPackLhB32B16:
@@ -253,11 +398,25 @@ bool TranslationContext::emitScalar(const RdnaInstruction& inst) {
         return packB16(inst, true, true);
     case RdnaOpcode::SNop:
     case RdnaOpcode::SSleep:
+    case RdnaOpcode::SWakeup:
     case RdnaOpcode::SSetprio:
     case RdnaOpcode::STrap:
+    case RdnaOpcode::SClause:
+    case RdnaOpcode::SIcacheInv:
+    case RdnaOpcode::SIncperflevel:
+    case RdnaOpcode::SDecperflevel:
         emitControlNop();
         return true;
+    case RdnaOpcode::SRoundMode:
+        if (inst.source0.value != 0u) {
+            throw std::runtime_error("s_round_mode " + std::to_string(inst.source0.value) + " at pc " + std::to_string(inst.programCounter) + " selects a rounding mode other than round to nearest even");
+        }
+        emitControlNop();
+        return true;
+    case RdnaOpcode::SDenormMode:
+        throw std::runtime_error("s_denorm_mode " + std::to_string(inst.source0.value) + " at pc " + std::to_string(inst.programCounter) + ": the recompiler does not model denormal modes");
     case RdnaOpcode::SWaitcntDepctr:
+    case RdnaOpcode::SWaitIdle:
         emitWaitcnt();
         return true;
     case RdnaOpcode::SBarrier:
@@ -271,6 +430,8 @@ bool TranslationContext::emitScalar(const RdnaInstruction& inst) {
         return true;
     case RdnaOpcode::SInstPrefetch:
         sInstPrefetch();
+        return true;
+    case RdnaOpcode::SCbranchCdbg:
         return true;
     case RdnaOpcode::SBranch:
     case RdnaOpcode::SCbranchScc0:

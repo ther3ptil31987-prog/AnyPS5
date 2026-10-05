@@ -7,6 +7,7 @@
 #include "Optimization/BindingAllocator.hpp"
 #include "Optimization/ConstantFolder.hpp"
 #include "Optimization/DeadCodeEliminator.hpp"
+#include "Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/ReadLaneEliminator.hpp"
 #include "Optimization/ResourceTracker.hpp"
 #include "Optimization/ShaderInfoCollector.hpp"
@@ -152,7 +153,7 @@ int main(int argc, char** argv) {
         std::cout << "Disassembly written to disasm.txt (" << disasm.size() << " bytes)\n";
 
         const ShaderStageKind stageKind = ToShaderStageKind(request.shader.stage);
-        const auto inputInfo = BuildShaderStageInputInfo(stageKind, request.context);
+        const auto inputInfo = BuildShaderStageInputInfo(stageKind, request.context, request.target.subgroupSize, request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr);
 
         GraphBuilder graphBuilder;
         auto cfg = graphBuilder.Build(decoded);
@@ -208,6 +209,13 @@ int main(int argc, char** argv) {
             deadCodeEliminator.Eliminate(program);
         }
 
+        MaskedSelectEliminator maskedSelectEliminator;
+        const auto maskedSelectStats = maskedSelectEliminator.Eliminate(program);
+        std::cout << "MaskedSelectEliminator removed " << maskedSelectStats.removedSelects << "\n";
+        if (maskedSelectStats.removedSelects != 0u) {
+            deadCodeEliminator.Eliminate(program);
+        }
+
         SrtWalker srtWalker;
         srtWalker.BuildPlan(program);
         std::cout << "SrtWalker::BuildPlan OK\n";
@@ -227,7 +235,7 @@ int main(int argc, char** argv) {
         std::cout << "ShaderInfoCollector::Collect OK\n";
 
         BindingAllocator bindingAllocator;
-        const auto bindings = bindingAllocator.Allocate(program, request.layout.pushConstantOffsetBytes);
+        const auto bindings = bindingAllocator.Allocate(program, request.layout);
 
         std::cout << "BindingAllocator::Allocate OK, bindings=" << bindings.bindings.size() << "\n";
         std::cout << "ALL STAGES OK\n";

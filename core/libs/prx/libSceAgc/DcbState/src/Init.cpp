@@ -9,10 +9,9 @@
 extern "C" {
 
 APS5_EXPORT("23LRUSvYu1M", sceAgcInit);
-int APS5_VABI sceAgcInit(uint32_t* state, uint32_t ver) {
-    (void)state;
-    (void)ver;
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceAgcInit(std::uint32_t* state, std::uint32_t version) {
+    Agc::Command::CheckAddress(reinterpret_cast<std::uintptr_t>(state), alignof(std::uint32_t), __func__);
+    Agc::Command::Require(version < 14, __func__, "unsupported AGC initialization version");
     return 0;
 }
 

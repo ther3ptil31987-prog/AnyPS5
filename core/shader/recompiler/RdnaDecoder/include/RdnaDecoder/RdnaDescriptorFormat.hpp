@@ -20,6 +20,8 @@ enum class ImageType : std::uint32_t {
 [[nodiscard]] bool IsFmaskTextureFormat(IrBufferFormat format);
 [[nodiscard]] IrTextureNumericClass SampledTextureNumericClass(IrBufferFormat format);
 [[nodiscard]] IrBufferFormat RemapTextureFormat(IrBufferFormat format);
+[[nodiscard]] std::uint32_t DepthBitsTextureWidth(std::uint32_t word1, std::uint32_t word3);
+[[nodiscard]] bool IsDepthBitsTexture(std::uint32_t word1, std::uint32_t word3);
 
 }
 

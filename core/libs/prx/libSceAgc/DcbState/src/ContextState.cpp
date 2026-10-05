@@ -23,10 +23,37 @@ uint64_t APS5_VABI sceAgcDcbContextStateOpGetSize(uint32_t operation) {
 
 APS5_EXPORT("qj7QZpgr9Uw", sceAgcDcbContextStateAnotherOp);
 uint32_t* APS5_VABI sceAgcDcbContextStateAnotherOp(CommandBuffer* buf, uint32_t operation) {
-    (void)buf;
-    (void)operation;
-    NotImplemented_nid_no_patch(__func__);
-    return nullptr;
+    Agc::Command::Require(buf != nullptr, __func__, "null command buffer");
+    Agc::Command::Require(operation <= 3, __func__, "invalid context state operation");
+    const auto* function = __func__;
+    std::uint32_t* first = nullptr;
+    const auto append = [&](std::uint32_t count) {
+        auto* packet = Agc::Command::WriteNop(buf, count, function);
+        if (first == nullptr) {
+            first = packet;
+            packet[0] = Agc::Command::Header(0x10u, count, 0x68u);
+            packet[1] = operation;
+        }
+    };
+    if (operation == 0) {
+        append(5);
+        return first;
+    }
+    if (operation == 2) {
+        append(3);
+    }
+    Agc::Command::Reserve(buf, 22, function);
+    append(5);
+    append(8);
+    append(9);
+    if (operation != 2) {
+        append(3);
+    }
+    append(2);
+    if (operation == 3) {
+        append(5);
+    }
+    return first;
 }
 
 std::uint32_t APS5_VABI sceAgcDcbSetBaseDispatchIndirectArgsGetSize() {

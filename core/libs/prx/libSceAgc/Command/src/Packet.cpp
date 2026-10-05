@@ -1,6 +1,7 @@
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -15,11 +16,17 @@ void Require(bool condition, const char* function, const char* reason) {
 }
 
 void CheckBits(std::uint64_t value, std::uint64_t mask, const char* function) {
-    Require((value & ~mask) == 0, function, "reserved bits are set");
+    if ((value & ~mask) == 0) return;
+    char reason[96];
+    std::snprintf(reason, sizeof(reason), "reserved bits are set (value 0x%llx, allowed 0x%llx)", static_cast<unsigned long long>(value), static_cast<unsigned long long>(mask));
+    Require(false, function, reason);
 }
 
 void CheckAddress(std::uint64_t address, std::uint32_t alignment, const char* function) {
-    Require(address != 0 && (address & (alignment - 1u)) == 0, function, "null or misaligned address");
+    if (address != 0 && (address & (alignment - 1u)) == 0) return;
+    char message[64];
+    std::snprintf(message, sizeof(message), "null or misaligned address 0x%llx", static_cast<unsigned long long>(address));
+    Require(false, function, message);
 }
 
 std::uint32_t Header(std::uint32_t opcode, std::uint32_t count, std::uint32_t flags) {
@@ -38,14 +45,14 @@ std::uint32_t available(const CommandBuffer& buffer, const char* function) {
     Require(bottom <= up && up <= down && down <= top, function, "invalid command buffer cursors");
     Require(bottom != 0 || top == 0, function, "null command buffer storage");
     const auto count = (down - up) / sizeof(std::uint32_t);
-    Require(count >= buffer.reserved_dw, function, "reserved space exceeds command buffer capacity");
+    if (count <= buffer.reserved_dw) return 0;
     Require(count - buffer.reserved_dw <= std::numeric_limits<std::uint32_t>::max(), function, "command buffer capacity overflow");
     return static_cast<std::uint32_t>(count - buffer.reserved_dw);
 }
 
 }
 
-std::uint32_t* Allocate(CommandBuffer* buffer, std::uint32_t count, const char* function) {
+void Reserve(CommandBuffer* buffer, std::uint32_t count, const char* function) {
     Require(buffer != nullptr && count != 0, function, "null command buffer or empty allocation");
     if (available(*buffer, function) < count) {
         Require(buffer->callback != nullptr, function, "command buffer exhausted");
@@ -53,6 +60,10 @@ std::uint32_t* Allocate(CommandBuffer* buffer, std::uint32_t count, const char* 
         Require(buffer->callback(buffer, count + buffer->reserved_dw, buffer->user_data), function, "command buffer allocation callback failed");
         Require(available(*buffer, function) >= count, function, "command buffer allocation callback returned insufficient space");
     }
+}
+
+std::uint32_t* Allocate(CommandBuffer* buffer, std::uint32_t count, const char* function) {
+    Reserve(buffer, count, function);
     auto* result = buffer->cursor_up;
     buffer->cursor_up += count;
     return result;
@@ -146,6 +157,13 @@ void PatchIndirectCount(std::uint32_t* packet, std::uint32_t opcode, std::uint32
     ValidatePacket(packet, opcode, 5, function);
     Require(packet[3] == 0x80000000u && packet[4] <= 0x3fffu && count <= 0x3fffu - packet[4], function, "indirect register count overflow or invalid packet");
     packet[4] += count;
+}
+
+void SetIndirectCount(std::uint32_t* packet, std::uint32_t opcode, std::uint32_t count, const char* function) {
+    ValidatePacket(packet, opcode, 5, function);
+    Require(packet[3] == 0x80000000u && packet[4] <= 0x3fffu, function, "invalid indirect register packet");
+    CheckBits(count, 0x3fffu, function);
+    packet[4] = count;
 }
 
 }

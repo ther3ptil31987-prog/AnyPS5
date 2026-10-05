@@ -17,6 +17,8 @@ struct IrProgramMetadata {
     std::string failureReason;
     std::vector<BlockInfo> blockInfo;
     std::vector<ExportInfo> exportInfo;
+    std::uint32_t pixelLinearInputs = 0;
+    std::uint32_t pixelPerspectiveInputs = 0;
     std::vector<IrValue*> dynamicReads;
     bool shaderInfoComplete = false;
     IrBindingLayout bindings;

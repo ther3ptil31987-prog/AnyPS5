@@ -10,7 +10,10 @@ struct DecodedInstruction {
     const std::uint8_t* Data;
     std::size_t Length;
 
+    [[nodiscard]] std::size_t OpcodeOffset() const;
     [[nodiscard]] bool IsShaNi() const;
+    [[nodiscard]] bool IsSha256() const;
+    [[nodiscard]] bool IsSha1() const;
     [[nodiscard]] bool IsExtrq() const;
     [[nodiscard]] bool IsInsertq() const;
     [[nodiscard]] bool IsMonitorx() const;

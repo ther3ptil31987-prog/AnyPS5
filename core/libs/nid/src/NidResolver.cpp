@@ -1,4 +1,5 @@
 #include <nid/NidResolver.hpp>
+#include <nid/ExportExclusions.hpp>
 #include <nid/NidCompute.hpp>
 #include <nid/NidPatcherUtils.hpp>
 #include <cstdint>
@@ -19,7 +20,7 @@ std::string ResolveOneName(const std::string& funcName) {
     return ComputeNid(StripNidPostfix(funcName), "");
 }
 
-std::unordered_map<std::string, std::string> ResolveNids(const std::vector<std::string>& exportedNames, const std::string& libraryName) {
+std::unordered_map<std::string, std::string> ResolveNids(const std::vector<std::string>& exportedNames, const std::string& libraryName, const std::unordered_set<std::string>& excludedExports) {
     using namespace Internal;
 
     std::unordered_set<std::string> nameSet(exportedNames.begin(), exportedNames.end());
@@ -37,6 +38,10 @@ std::unordered_map<std::string, std::string> ResolveNids(const std::vector<std::
     result.reserve(exportedNames.size());
 
     for (const std::string& name : exportedNames) {
+        if (excludedExports.contains(NormalizeExportName(name))) {
+            result[name] = name;
+            continue;
+        }
         if (IsNidNoPatchCut(name)) {
             result[name] = StripNidNoPatchCut(name);
             continue;

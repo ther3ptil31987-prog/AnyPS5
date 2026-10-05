@@ -1,5 +1,10 @@
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
+#include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <spirv/unified1/spirv.hpp>
 #include <cstdint>
 #include <stdexcept>
@@ -32,31 +37,121 @@ void EmitKillIfPixelValidMaskInactive(SpirvEmitterState& state) {
     EmitKillIfBoolFalse(state, active);
 }
 
+// Block metadata is paired with BlockOrder by position (as IrProgram validation does); terminator
+// targets name control-flow ids, which are not IR block ids.
 const IrBlock* TargetBlock(const IrProgram& program, std::uint32_t id) {
-    for (const IrBlock* block : program.BlockOrder()) {
-        if (block != nullptr && block->Id() == id) {
-            return block;
+    const auto& blocks = program.BlockOrder();
+    const auto& blockInfo = program.Metadata().blockInfo;
+    if (blocks.size() != blockInfo.size()) {
+        throw std::runtime_error("SPIR-V control flow block metadata is inconsistent");
+    }
+    for (std::size_t index = 0; index < blockInfo.size(); index++) {
+        if (blockInfo[index].id == id) {
+            if (blocks[index] == nullptr) {
+                throw std::runtime_error("SPIR-V control flow target block is null");
+            }
+            return blocks[index];
         }
     }
-    return nullptr;
+    throw std::runtime_error("SPIR-V control flow target block is missing");
 }
 
 const BlockInfo* BlockInfoFor(const IrProgram& program, const IrBlock* block) {
-    for (const BlockInfo& info : program.Metadata().blockInfo) {
-        if (info.id == block->Id()) {
-            return &info;
+    const auto& blocks = program.BlockOrder();
+    const auto& blockInfo = program.Metadata().blockInfo;
+    if (blocks.size() != blockInfo.size()) {
+        throw std::runtime_error("SPIR-V control flow block metadata is inconsistent");
+    }
+    if (block == nullptr) {
+        throw std::runtime_error("SPIR-V control flow block is null");
+    }
+    for (std::size_t index = 0; index < blocks.size(); index++) {
+        if (blocks[index] == block) {
+            return &blockInfo[index];
         }
     }
-    return nullptr;
+    throw std::runtime_error("SPIR-V control flow block has no metadata");
 }
 
 void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
-    EmitKillIfPixelValidMaskInactive(ctx.state);
-    ctx.state.module.AddFunction(spv::OpReturn);
+    auto& state = ctx.state;
+    if (state.loopGuardLimit != 0 && state.faultBufferVariable != 0) {
+        const auto pc = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeU32(state), pc, state.loopGuardPc);
+        EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), pc, ConstantU32(state, 0u)), [&] {
+            RecordBdaFault(state, BdaConstant(state, state.program.Resources().shaderHash), ConstantU32(state, state.loopGuardLimit), EmitBinaryU32(state, spv::OpISub, pc, ConstantU32(state, 1u)), BdaAbi::FaultReason::LoopLimit);
+        });
+    }
+    EmitKillIfPixelValidMaskInactive(state);
+    state.module.AddFunction(spv::OpReturn);
+}
+
+// The loop guard (see SpirvEmitterState::loopGuardLimit) at a branch that may leave a loop: counts the
+// evaluation and, past the limit, takes the exit and remembers the block's PC (plus one, 0 = none).
+std::uint32_t GuardLoopExit(SpirvEmitterState& state, const BlockInfo& info, std::uint32_t condition, bool exitWhenTrue) {
+    const auto visits = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeU32(state), visits, state.loopGuardVisits);
+    const auto next = EmitBinaryU32(state, spv::OpIAdd, visits, ConstantU32(state, 1u));
+    state.module.AddFunction(spv::OpStore, state.loopGuardVisits, next);
+    const auto tripped = Binary(state, spv::OpUGreaterThan, TypeBool(state), next, ConstantU32(state, state.loopGuardLimit));
+    const auto previous = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeU32(state), previous, state.loopGuardPc);
+    const auto first = Binary(state, spv::OpLogicalAnd, TypeBool(state), tripped, Binary(state, spv::OpIEqual, TypeBool(state), previous, ConstantU32(state, 0u)));
+    const auto pc = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelect, TypeU32(state), pc, first, ConstantU32(state, info.startPc + 1u), previous);
+    state.module.AddFunction(spv::OpStore, state.loopGuardPc, pc);
+    if (exitWhenTrue) return Binary(state, spv::OpLogicalOr, TypeBool(state), condition, tripped);
+    const auto stay = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLogicalNot, TypeBool(state), stay, tripped);
+    return Binary(state, spv::OpLogicalAnd, TypeBool(state), condition, stay);
+}
+
+bool IsLoopMerge(const IrProgram& program, std::uint32_t block) {
+    for (const auto& info : program.Metadata().blockInfo) {
+        if (info.terminator.loopHeader && info.terminator.mergeBlock == block) return true;
+    }
+    return false;
+}
+
+bool IsContinueTarget(const IrProgram& program, std::uint32_t block) {
+    for (const auto& info : program.Metadata().blockInfo) {
+        if (info.terminator.loopHeader && info.terminator.continueBlock == block) return true;
+    }
+    return false;
+}
+
+std::uint32_t EmitWaveAny(SpirvEmitterState& state, std::uint32_t predicate) {
+    const auto ballot = state.module.AllocateId();
+    state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4u), ballot, ConstantU32(state, spv::ScopeSubgroup), predicate);
+    const auto wave = EmitWaveBallot(state, ballot);
+    const auto low = state.module.AllocateId();
+    const auto high = state.module.AllocateId();
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, wave, 0u);
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, wave, 1u);
+    state.module.AddFunction(spv::OpINotEqual, TypeBool(state), result, EmitBinaryU32(state, spv::OpBitwiseOr, low, high), ConstantU32(state, 0u));
+    return result;
+}
+
+std::uint32_t EmitWaveMaskBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& info) {
+    auto& state = ctx.state;
+    const auto kind = info.terminator.condition;
+    if (kind == BranchCondition::ExecNonZero || kind == BranchCondition::VccNonZero) {
+        return EmitWaveAny(state, ctx.Def(info.condition));
+    }
+    const auto clear = state.module.AllocateId();
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLogicalNot, TypeBool(state), clear, ctx.Def(info.condition));
+    state.module.AddFunction(spv::OpLogicalNot, TypeBool(state), result, EmitWaveAny(state, clear));
+    return result;
 }
 
 std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& info) {
-    if (ctx.otherHalf == nullptr || info.terminator.condition == BranchCondition::ScalarInstruction || info.terminator.condition == BranchCondition::GotoVariable) {
+    const auto condition = info.terminator.condition;
+    if (ctx.otherHalf == nullptr && IsWaveMaskBranch(condition)) {
+        return EmitWaveMaskBranchCondition(ctx, info);
+    }
+    if (ctx.otherHalf == nullptr || condition == BranchCondition::ScalarInstruction || condition == BranchCondition::GotoVariable || condition == BranchCondition::IndirectTarget) {
         return ctx.Def(info.condition);
     }
     auto& state = ctx.state;
@@ -107,7 +202,18 @@ void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& progr
                 EmitReturnTerminator(ctx);
                 return;
             }
-            const auto condition = EmitBranchCondition(ctx, info);
+            if (const IrValue* resolved = info.condition->Resolve(); !resolved->HasImmediate() && !ctx.definitions.contains(resolved)) {
+                const std::string where = resolved->Parent() == nullptr ? std::string("no block") : "block " + std::to_string(resolved->Parent()->Id());
+                const std::string message = "branch condition " + std::string(IrOpcodeName(resolved->Opcode())) + " of block " + std::to_string(info.id) + " (defined in " + where + ") was not emitted before the branch";
+                ctx.Fail(message.c_str());
+            }
+            auto condition = EmitBranchCondition(ctx, info);
+            if (state.loopGuardLimit != 0 && term.trueBlock != term.falseBlock) {
+                if (IsLoopMerge(program, term.trueBlock)) condition = GuardLoopExit(state, info, condition, true);
+                else if (IsLoopMerge(program, term.falseBlock)) condition = GuardLoopExit(state, info, condition, false);
+            }
+            static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
+            if (debug) std::fprintf(stderr, "[spirv] block %u branches on %%%u = %s (kind %d)\n", static_cast<unsigned>(info.id), condition, std::string(IrOpcodeName(info.condition->Resolve()->Opcode())).c_str(), static_cast<int>(info.terminator.condition));
             emitMerge();
             state.module.AddFunction(spv::OpBranchConditional, condition, ctx.Label(trueBlock), ctx.Label(falseBlock));
             return;
@@ -174,7 +280,10 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::ReferenceU32: return Invoke(EmitReferenceU32, ctx, inst);
         case IrOpcode::GetUserData: return Invoke(EmitGetUserData, ctx, inst);
         case IrOpcode::GetShaderBase: return Invoke(EmitGetShaderBase, ctx, inst);
+        case IrOpcode::ShaderClock: return Invoke(EmitShaderClock, ctx, inst);
+        case IrOpcode::RealtimeClock: return Invoke(EmitRealtimeClock, ctx, inst);
         case IrOpcode::MeshDrawParameter: return Invoke(EmitMeshDrawParameter, ctx, inst);
+        case IrOpcode::MeshArgument: return Invoke(EmitMeshArgument, ctx, inst);
         case IrOpcode::MeshAllocate: return Invoke(EmitMeshAllocate, ctx, inst);
         case IrOpcode::TessellationBase: return Invoke(EmitTessellationBase, ctx, inst);
         case IrOpcode::GetTessellationAttribute: return Invoke(EmitGetTessellationAttribute, ctx, inst);
@@ -235,8 +344,6 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::CompositeExtractU32x3: return Invoke(EmitCompositeExtractU32x3, ctx, inst);
         case IrOpcode::CompositeExtractU32x4: return Invoke(EmitCompositeExtractU32x4, ctx, inst);
         case IrOpcode::PackHalf2x16: return Invoke(EmitPackHalf2x16, ctx, inst);
-        case IrOpcode::PackSnorm2x16: return Invoke(EmitPackSnorm2x16, ctx, inst);
-        case IrOpcode::PackUnorm2x16: return Invoke(EmitPackUnorm2x16, ctx, inst);
         case IrOpcode::PackFloat2x16Rtz: return Invoke(EmitPackFloat2x16Rtz, ctx, inst);
         case IrOpcode::FPAbs32: return Invoke(EmitFPAbs32, ctx, inst);
         case IrOpcode::FPNeg32: return Invoke(EmitFPNeg32, ctx, inst);
@@ -320,6 +427,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::FPAdd32: return Invoke(EmitFPAdd32, ctx, inst);
         case IrOpcode::FPSub32: return Invoke(EmitFPSub32, ctx, inst);
         case IrOpcode::FPFma32: return Invoke(EmitFPFma32, ctx, inst);
+        case IrOpcode::FPMad32: return Invoke(EmitFPMad32, ctx, inst);
         case IrOpcode::FPMul32: return Invoke(EmitFPMul32, ctx, inst);
         case IrOpcode::FPMin32: return Invoke(EmitFPMin32, ctx, inst);
         case IrOpcode::FPMax32: return Invoke(EmitFPMax32, ctx, inst);
@@ -334,16 +442,41 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::FPCos: return Invoke(EmitFPCos, ctx, inst);
         case IrOpcode::FPExp2: return Invoke(EmitFPExp2, ctx, inst);
         case IrOpcode::FPLog2: return Invoke(EmitFPLog2, ctx, inst);
-        case IrOpcode::FPLdexp: return Invoke(EmitFPLdexp, ctx, inst);
         case IrOpcode::FPRoundEven32: return Invoke(EmitFPRoundEven32, ctx, inst);
         case IrOpcode::FPFloor32: return Invoke(EmitFPFloor32, ctx, inst);
         case IrOpcode::FPCeil32: return Invoke(EmitFPCeil32, ctx, inst);
         case IrOpcode::FPTrunc32: return Invoke(EmitFPTrunc32, ctx, inst);
         case IrOpcode::FPFract32: return Invoke(EmitFPFract32, ctx, inst);
+        case IrOpcode::FPAdd64: return Invoke(EmitFPAdd64, ctx, inst);
+        case IrOpcode::FPMul64: return Invoke(EmitFPMul64, ctx, inst);
+        case IrOpcode::FPFma64: return Invoke(EmitFPFma64, ctx, inst);
+        case IrOpcode::FPFmaScale64: return Invoke(EmitFPFmaScale64, ctx, inst);
+        case IrOpcode::FPMin64: return Invoke(EmitFPMin64, ctx, inst);
+        case IrOpcode::FPMax64: return Invoke(EmitFPMax64, ctx, inst);
+        case IrOpcode::FPSaturate64: return Invoke(EmitFPSaturate64, ctx, inst);
+        case IrOpcode::FPLdexp64: return Invoke(EmitFPLdexp64, ctx, inst);
+        case IrOpcode::FPRoundEven64: return Invoke(EmitFPRoundEven64, ctx, inst);
+        case IrOpcode::FPFloor64: return Invoke(EmitFPFloor64, ctx, inst);
+        case IrOpcode::FPCeil64: return Invoke(EmitFPCeil64, ctx, inst);
+        case IrOpcode::FPTrunc64: return Invoke(EmitFPTrunc64, ctx, inst);
+        case IrOpcode::FPFract64: return Invoke(EmitFPFract64, ctx, inst);
+        case IrOpcode::FPFrexpMant64: return Invoke(EmitFPFrexpMant64, ctx, inst);
+        case IrOpcode::FPFrexpExp64: return Invoke(EmitFPFrexpExp64, ctx, inst);
+        case IrOpcode::FPRcp64: return Invoke(EmitFPRcp64, ctx, inst);
+        case IrOpcode::FPRsq64: return Invoke(EmitFPRsq64, ctx, inst);
+        case IrOpcode::FPSqrt64: return Invoke(EmitFPSqrt64, ctx, inst);
+        case IrOpcode::FPTrigPreop64: return Invoke(EmitFPTrigPreop64, ctx, inst);
+        case IrOpcode::ConvertF32F64: return Invoke(EmitConvertF32F64, ctx, inst);
+        case IrOpcode::ConvertF64F32: return Invoke(EmitConvertF64F32, ctx, inst);
+        case IrOpcode::ConvertF64S32: return Invoke(EmitConvertF64S32, ctx, inst);
+        case IrOpcode::ConvertF64U32: return Invoke(EmitConvertF64U32, ctx, inst);
+        case IrOpcode::ConvertS32F64: return Invoke(EmitConvertS32F64, ctx, inst);
+        case IrOpcode::ConvertU32F64: return Invoke(EmitConvertU32F64, ctx, inst);
         case IrOpcode::LaneId: return Invoke(EmitLaneId, ctx, inst);
         case IrOpcode::WriteLane: return Invoke(EmitWriteLane, ctx, inst);
         case IrOpcode::Permlane16U32: return Invoke(EmitPermlane16U32, ctx, inst);
         case IrOpcode::BpermuteU32: return Invoke(EmitBpermuteU32, ctx, inst);
+        case IrOpcode::PermuteU32: return Invoke(EmitPermuteU32, ctx, inst);
         case IrOpcode::GetSrtResource: return Invoke(EmitGetSrtResource, ctx, inst);
         case IrOpcode::GetBufferResource: return Invoke(EmitGetBufferResource, ctx, inst);
         case IrOpcode::GetAddressResource: return Invoke(EmitGetAddressResource, ctx, inst);
@@ -356,9 +489,44 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::LoadAddressU8: return Invoke(EmitLoadAddressU8, ctx, inst);
         case IrOpcode::LoadAddressU16: return Invoke(EmitLoadAddressU16, ctx, inst);
         case IrOpcode::LoadAddressU32: return Invoke(EmitLoadAddressU32, ctx, inst);
+        case IrOpcode::LoadAddressU32x2: return Invoke(EmitLoadAddressU32x2, ctx, inst);
+        case IrOpcode::LoadAddressU32x3: return Invoke(EmitLoadAddressU32x3, ctx, inst);
+        case IrOpcode::LoadAddressU32x4: return Invoke(EmitLoadAddressU32x4, ctx, inst);
         case IrOpcode::StoreAddressU8: return Invoke(EmitStoreAddressU8, ctx, inst);
         case IrOpcode::StoreAddressU16: return Invoke(EmitStoreAddressU16, ctx, inst);
         case IrOpcode::StoreAddressU32: return Invoke(EmitStoreAddressU32, ctx, inst);
+        case IrOpcode::AddressAtomicSwap32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicCmpSwap32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicIAdd32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicISub32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicSMin32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicUMin32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicSMax32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicUMax32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicAnd32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicOr32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicXor32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicInc32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicDec32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicSwap64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicCmpSwap64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicIAdd64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicISub64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicSMin64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicUMin64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicSMax64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicUMax64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicAnd64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicOr64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicXor64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicFCmpSwap32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicFMin32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicFMax32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicFCmpSwap64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicFMin64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicFMax64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicInc64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicDec64: return Invoke(EmitAddressAtomic, ctx, inst);
         case IrOpcode::LoadBufferU8: return Invoke(EmitLoadBufferU8, ctx, inst);
         case IrOpcode::LoadBufferU16: return Invoke(EmitLoadBufferU16, ctx, inst);
         case IrOpcode::LoadBufferU32: return Invoke(EmitLoadBufferU32, ctx, inst);
@@ -383,6 +551,24 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::BufferAtomicAnd32: return Invoke(EmitBufferAtomicAnd32, ctx, inst);
         case IrOpcode::BufferAtomicOr32: return Invoke(EmitBufferAtomicOr32, ctx, inst);
         case IrOpcode::BufferAtomicOr64: return Invoke(EmitBufferAtomicOr64, ctx, inst);
+        case IrOpcode::BufferAtomicInc32: return Invoke(EmitBufferAtomicInc32, ctx, inst);
+        case IrOpcode::BufferAtomicDec32: return Invoke(EmitBufferAtomicDec32, ctx, inst);
+        case IrOpcode::BufferAtomicUSubSat32: return Invoke(EmitBufferAtomicUSubSat32, ctx, inst);
+        case IrOpcode::BufferAtomicIAdd64: return Invoke(EmitBufferAtomicIAdd64, ctx, inst);
+        case IrOpcode::BufferAtomicISub64: return Invoke(EmitBufferAtomicISub64, ctx, inst);
+        case IrOpcode::BufferAtomicSMin64: return Invoke(EmitBufferAtomicSMin64, ctx, inst);
+        case IrOpcode::BufferAtomicUMin64: return Invoke(EmitBufferAtomicUMin64, ctx, inst);
+        case IrOpcode::BufferAtomicSMax64: return Invoke(EmitBufferAtomicSMax64, ctx, inst);
+        case IrOpcode::BufferAtomicUMax64: return Invoke(EmitBufferAtomicUMax64, ctx, inst);
+        case IrOpcode::BufferAtomicAnd64: return Invoke(EmitBufferAtomicAnd64, ctx, inst);
+        case IrOpcode::BufferAtomicXor64: return Invoke(EmitBufferAtomicXor64, ctx, inst);
+        case IrOpcode::BufferAtomicCmpSwap64: return Invoke(EmitBufferAtomicCmpSwap64, ctx, inst);
+        case IrOpcode::BufferAtomicFCmpSwap32: return Invoke(EmitBufferAtomicFCmpSwap32, ctx, inst);
+        case IrOpcode::BufferAtomicFCmpSwap64: return Invoke(EmitBufferAtomicFCmpSwap64, ctx, inst);
+        case IrOpcode::BufferAtomicFMin64: return Invoke(EmitBufferAtomicFMin64, ctx, inst);
+        case IrOpcode::BufferAtomicFMax64: return Invoke(EmitBufferAtomicFMax64, ctx, inst);
+        case IrOpcode::BufferAtomicInc64: return Invoke(EmitBufferAtomicInc64, ctx, inst);
+        case IrOpcode::BufferAtomicDec64: return Invoke(EmitBufferAtomicDec64, ctx, inst);
         case IrOpcode::BufferAtomicXor32: return Invoke(EmitBufferAtomicXor32, ctx, inst);
         case IrOpcode::BufferAtomicFMin32: return Invoke(EmitBufferAtomicFMin32, ctx, inst);
         case IrOpcode::BufferAtomicFMax32: return Invoke(EmitBufferAtomicFMax32, ctx, inst);
@@ -412,12 +598,37 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::SharedAtomicAnd32: return Invoke(EmitSharedAtomicAnd32, ctx, inst);
         case IrOpcode::SharedAtomicOr32: return Invoke(EmitSharedAtomicOr32, ctx, inst);
         case IrOpcode::SharedAtomicXor32: return Invoke(EmitSharedAtomicXor32, ctx, inst);
+        case IrOpcode::SharedAtomicRsub32: return Invoke(EmitSharedAtomicRsub32, ctx, inst);
+        case IrOpcode::SharedAtomicFAdd32: return Invoke(EmitSharedAtomicFAdd32, ctx, inst);
+        case IrOpcode::SharedAtomicCmpst32: return Invoke(EmitSharedAtomicCmpst32, ctx, inst);
+        case IrOpcode::SharedAtomicCmpstF32: return Invoke(EmitSharedAtomicCmpstF32, ctx, inst);
+        case IrOpcode::SharedAtomicMskor32: return Invoke(EmitSharedAtomicMskor32, ctx, inst);
+        case IrOpcode::SharedAtomicWrap32: return Invoke(EmitSharedAtomicWrap32, ctx, inst);
+        case IrOpcode::SharedAtomicSwap64: return Invoke(EmitSharedAtomicSwap64, ctx, inst);
+        case IrOpcode::SharedAtomicIAdd64: return Invoke(EmitSharedAtomicIAdd64, ctx, inst);
+        case IrOpcode::SharedAtomicISub64: return Invoke(EmitSharedAtomicISub64, ctx, inst);
+        case IrOpcode::SharedAtomicRsub64: return Invoke(EmitSharedAtomicRsub64, ctx, inst);
+        case IrOpcode::SharedAtomicInc64: return Invoke(EmitSharedAtomicInc64, ctx, inst);
+        case IrOpcode::SharedAtomicDec64: return Invoke(EmitSharedAtomicDec64, ctx, inst);
+        case IrOpcode::SharedAtomicSMin64: return Invoke(EmitSharedAtomicSMin64, ctx, inst);
+        case IrOpcode::SharedAtomicUMin64: return Invoke(EmitSharedAtomicUMin64, ctx, inst);
+        case IrOpcode::SharedAtomicSMax64: return Invoke(EmitSharedAtomicSMax64, ctx, inst);
+        case IrOpcode::SharedAtomicUMax64: return Invoke(EmitSharedAtomicUMax64, ctx, inst);
+        case IrOpcode::SharedAtomicAnd64: return Invoke(EmitSharedAtomicAnd64, ctx, inst);
+        case IrOpcode::SharedAtomicOr64: return Invoke(EmitSharedAtomicOr64, ctx, inst);
+        case IrOpcode::SharedAtomicXor64: return Invoke(EmitSharedAtomicXor64, ctx, inst);
+        case IrOpcode::SharedAtomicFMin64: return Invoke(EmitSharedAtomicFMin64, ctx, inst);
+        case IrOpcode::SharedAtomicFMax64: return Invoke(EmitSharedAtomicFMax64, ctx, inst);
+        case IrOpcode::SharedAtomicCmpst64: return Invoke(EmitSharedAtomicCmpst64, ctx, inst);
+        case IrOpcode::SharedAtomicCmpstF64: return Invoke(EmitSharedAtomicCmpstF64, ctx, inst);
+        case IrOpcode::SharedAtomicMskor64: return Invoke(EmitSharedAtomicMskor64, ctx, inst);
         case IrOpcode::DataAppend: return Invoke(EmitDataAppend, ctx, inst);
         case IrOpcode::DataConsume: return Invoke(EmitDataConsume, ctx, inst);
         case IrOpcode::SwizzleU32: return Invoke(EmitSwizzleU32, ctx, inst);
         case IrOpcode::ImageQueryDimensions: return Invoke(EmitImageQueryDimensions, ctx, inst);
         case IrOpcode::ImageQueryLod: return Invoke(EmitImageQueryLod, ctx, inst);
         case IrOpcode::ImageRead: return Invoke(EmitImageRead, ctx, inst);
+        case IrOpcode::ImageBvhIntersectRay: return Invoke(EmitImageBvhIntersectRay, ctx, inst);
         case IrOpcode::ImageWrite: return Invoke(EmitImageWrite, ctx, inst);
         case IrOpcode::ImageSampleRaw: return Invoke(EmitImageSampleRaw, ctx, inst);
         case IrOpcode::ImageGatherRaw: return Invoke(EmitImageGatherRaw, ctx, inst);
@@ -428,6 +639,15 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::ImageAtomicAnd32: return Invoke(EmitImageAtomicAnd32, ctx, inst);
         case IrOpcode::ImageAtomicOr32: return Invoke(EmitImageAtomicOr32, ctx, inst);
         case IrOpcode::ImageAtomicXor32: return Invoke(EmitImageAtomicXor32, ctx, inst);
+        case IrOpcode::ImageAtomicCmpSwap32: return Invoke(EmitImageAtomicCmpSwap32, ctx, inst);
+        case IrOpcode::ImageAtomicISub32: return Invoke(EmitImageAtomicISub32, ctx, inst);
+        case IrOpcode::ImageAtomicSMin32: return Invoke(EmitImageAtomicSMin32, ctx, inst);
+        case IrOpcode::ImageAtomicSMax32: return Invoke(EmitImageAtomicSMax32, ctx, inst);
+        case IrOpcode::ImageAtomicInc32: return Invoke(EmitImageAtomicInc32, ctx, inst);
+        case IrOpcode::ImageAtomicDec32: return Invoke(EmitImageAtomicDec32, ctx, inst);
+        case IrOpcode::ImageAtomicFCmpSwap32: return Invoke(EmitImageAtomicFCmpSwap32, ctx, inst);
+        case IrOpcode::ImageAtomicFMin32: return Invoke(EmitImageAtomicFMin32, ctx, inst);
+        case IrOpcode::ImageAtomicFMax32: return Invoke(EmitImageAtomicFMax32, ctx, inst);
         case IrOpcode::GetAttribute: return Invoke(EmitGetAttribute, ctx, inst);
         case IrOpcode::GetInterpolationParameter: return Invoke(EmitGetInterpolationParameter, ctx, inst);
         case IrOpcode::SetAttribute: return Invoke(EmitSetAttribute, ctx, inst);
@@ -464,6 +684,10 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
     state.currentBlock = block;
     EmitLabel(state, ctx.Label(block));
     bool emittedNonPhi = false;
+    // Wave LDS ordering (see WaveLdsScope): a barrier separates an LDS write from the next LDS access
+    // and a read from the next write. The block may be entered right after a write.
+    bool ldsWritten = true;
+    bool ldsRead = false;
     for (const IrValue* inst : block->Instructions()) {
         if (inst->Opcode() == IrOpcode::Phi) {
             if (emittedNonPhi) {
@@ -472,9 +696,32 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
         } else {
             emittedNonPhi = true;
         }
+        if (state.waveLdsScope != 0) {
+            const auto access = SharedAccessOf(inst->Opcode());
+            if (inst->Opcode() == IrOpcode::Barrier) {
+                ldsWritten = false;
+                ldsRead = false;
+            } else if (access != SharedAccess::None) {
+                const bool writes = access != SharedAccess::Read;
+                if (ldsWritten || (writes && ldsRead)) {
+                    state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, state.waveLdsScope), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
+                    ldsWritten = false;
+                    ldsRead = false;
+                }
+                ldsWritten |= writes;
+                ldsRead |= access != SharedAccess::Write;
+            }
+        }
+        const bool shared = state.laneCount == 2u && inst->Type() != IrType::Void && !IrOpcodeHasSideEffects(inst->Opcode()) && state.sharedLaneValues.contains(inst);
         for (std::uint32_t half = 0; half < state.laneCount; half++) {
             if (half != 0 && ctx.otherHalf == nullptr) {
                 ctx.Fail(*inst, "requires a second lane context");
+            }
+            if (half != 0 && shared) {
+                if (const auto found = ctx.definitions.find(inst); found != ctx.definitions.end()) {
+                    ctx.otherHalf->Define(*inst, found->second);
+                    continue;
+                }
             }
             SpirvValueEmitContext& lane = half == 0 ? ctx : *ctx.otherHalf;
             state.laneHalf = half;
@@ -512,7 +759,24 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
     if (blocks.empty() || blocks.front() == nullptr) {
         context.Fail("structured control flow requires at least one block");
     }
+    if (state.loopGuardLimit != 0) {
+        const auto pointer = TypePointer(state, spv::StorageClassPrivate, TypeU32(state));
+        if (state.loopGuardVisits == 0) state.loopGuardVisits = state.module.DefineGlobalVariable(pointer, spv::StorageClassPrivate);
+        if (state.loopGuardPc == 0) state.loopGuardPc = state.module.DefineGlobalVariable(pointer, spv::StorageClassPrivate);
+        state.module.AddFunction(spv::OpStore, state.loopGuardVisits, ConstantU32(state, 0u));
+        state.module.AddFunction(spv::OpStore, state.loopGuardPc, ConstantU32(state, 0u));
+    }
     state.module.AddFunction(spv::OpBranch, context.Label(blocks.front()));
+    static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
+    if (debug) {
+        const auto& infos = program.Metadata().blockInfo;
+        for (std::size_t index = 0; index < blocks.size(); ++index) {
+            const auto* byId = BlockInfoFor(program, blocks[index]);
+            std::fprintf(stderr, "[spirv] order %zu: IR block %u, positional info id %u, id-matched info %s (kind %d true %u false %u)\n", index, blocks[index]->Id(),
+                         index < infos.size() ? infos[index].id : 0xffffffffu, byId ? std::to_string(byId->id).c_str() : "none",
+                         byId ? static_cast<int>(byId->terminator.kind) : -1, byId ? byId->terminator.trueBlock : 0u, byId ? byId->terminator.falseBlock : 0u);
+        }
+    }
     for (const IrBlock* block : blocks) {
         if (block == nullptr) {
             context.Fail("structured control flow contains a null block");
@@ -521,9 +785,12 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         if (info == nullptr) {
             context.Fail("structured control flow block has no terminator metadata");
         }
+        const bool stops = state.bdaStopsInvocations;
+        state.bdaStopsInvocations = stops && !IsContinueTarget(program, info->id);
         EmitStructuredBlock(context, functionState, block);
         functionState.blockExitLabels.emplace(block, state.currentLabel);
         EmitStructuredTerminator(context, program, *info);
+        state.bdaStopsInvocations = stops;
     }
     PatchStructuredPhis(context, functionState);
 }

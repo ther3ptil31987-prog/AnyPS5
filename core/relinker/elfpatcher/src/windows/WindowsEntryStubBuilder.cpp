@@ -1,6 +1,7 @@
 #include <elfpatcher/windows/WindowsEntryStubBuilder.hpp>
 #include <elfpatcher/windows/WindowsStubEmitter.hpp>
 #include <elfpatcher/windows/WindowsDependencyStubBuilder.hpp>
+#include <elfpatcher/windows/WindowsGuestStartup.hpp>
 #include <io/BufferUtils.hpp>
 #include <algorithm>
 #include <optional>
@@ -11,6 +12,8 @@ namespace {
 
 constexpr std::uint32_t PathCapacity = 32768;
 constexpr std::uint32_t ErrorMessageCapacity = 32768;
+constexpr std::uint32_t ArgumentCapacity = 32768;
+constexpr std::uint32_t ArgumentTextCapacity = ArgumentCapacity * 3;
 
 std::string normalizeRunPath(std::string path) {
     if (path.empty() || std::any_of(path.begin(), path.end(), [](const unsigned char value) { return value == 0 || value >= 128; }))
@@ -29,7 +32,7 @@ std::string normalizeRunPath(std::string path) {
 
 }
 
-WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, const std::uint32_t entryRva, const WindowsImports& nativeImports, const std::vector<std::string>& libraries, const std::vector<PeImport>& imports, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics) const {
+WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, const std::uint32_t entryRva, const WindowsImports& nativeImports, const std::vector<std::string>& libraries, const std::vector<PeImport>& imports, const std::string& runPath, const bool lazyBinding, const bool dependencyDiagnostics, const std::vector<Domain::GuestRuntime>& guestModules) const {
     if (!imports.empty() && libraries.empty())
         throw Domain::RelinkerException("ELF imports have no DT_NEEDED libraries");
     const auto path = normalizeRunPath(runPath);
@@ -53,15 +56,25 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
 
     const auto programPath = reserve(PathCapacity);
     const auto modulePath = reserve(PathCapacity);
+    const auto argumentBlock = reserve(8);
+    const auto argumentCount = reserve(4);
+    const auto wideArguments = reserve(8);
+    const auto shellHandle = reserve(8);
+    const auto shellLibrary = addString("shell32.dll");
+    const auto parseArguments = addString("CommandLineToArgvW");
     const auto handles = reserve(libraries.size() * 8);
+    const auto guestFinished = reserve(4);
+    const WindowsGuestStartup guestStartup;
+    Io::AlignBuffer(data, 4);
     const auto functionTable = reserve(12 * 32);
     const auto unwindRva = CheckedRva(dataRva + data.size());
     data.insert(data.end(), {1, 10, 6, 0, 10, 0xb2, 6, 0xc0, 4, 0x70, 3, 0x60, 2, 0x50, 1, 0x30});
 
     std::vector<std::uint32_t> libraryPaths;
     std::vector<std::string> libraryNames;
-    for (const auto& library : libraries) {
-        auto name = path + library;
+    for (std::size_t index = 0; index < libraries.size(); ++index) {
+        auto name = index < guestModules.size() ? libraries[index] : path + libraries[index];
+        std::replace(name.begin(), name.end(), '/', '\\');
         if (name.size() + 1 >= PathCapacity)
             throw Domain::RelinkerException("Windows library path exceeds the startup buffer: " + name);
         libraryPaths.push_back(addString(name));
@@ -78,6 +91,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     const auto loading = addString("Loading PRX: ");
     const auto loaded = addString(" -> OK\n");
     const auto loadFailed = addString(" -> FAILED\n");
+    const auto failedModule = addString("Failed to load module: ");
     const auto errorPrefix = addString("GetLastError: ");
     const auto messageSeparator = addString(" - ");
     const auto newline = addString("\n");
@@ -92,6 +106,8 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     std::vector<std::string> errors = {"FAIL: cannot obtain executable path\n", "FAIL: executable or library path is too long\n", "FAIL: executable path has no directory\n"};
     for (const auto& import : imports)
         errors.push_back("FAIL: unresolved ELF import " + import.Name + "\n");
+    const auto argumentError = errors.size();
+    errors.push_back("FAIL: cannot prepare command-line arguments\n");
     std::vector<std::uint32_t> errorRvas;
     for (const auto& error : errors)
         errorRvas.push_back(addString(error));
@@ -218,7 +234,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     code.Emit({0x49, 0xff, 0xc4});
 
     for (std::size_t index = 0; index < libraries.size(); ++index) {
-        if (absolutePath) {
+        if (absolutePath && index >= guestModules.size()) {
             code.Rip({0x48, 0x8d, 0x0d}, libraryPaths[index]);
         } else {
             code.Emit({0x4c, 0x89, 0xe0, 0x48, 0x29, 0xd8, 0x48, 0x05});
@@ -253,6 +269,9 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         const auto loadSucceeded = code.Branch({0x0f, 0x85});
         captureLastError();
         writeString(loadFailed, true);
+        writeString(failedModule, true);
+        writeString(resolvedPaths[index], true);
+        writeString(newline, true);
         writeLastError();
         if (dependencyDiagnostics) {
             code.Rip({0x48, 0x8d, 0x0d}, resolvedPaths[index]);
@@ -270,7 +289,14 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
 
     std::vector<std::size_t> unresolvedBranches;
     std::vector<std::size_t> lazyUnresolvedImports;
+    std::vector<std::size_t> tlsResolverAddresses;
     for (std::size_t index = 0; index < imports.size(); ++index) {
+        if (!guestModules.empty() && guestModules.front().UsePlatformTlsResolver && imports[index].Name == "vNe1w4diLCs") {
+            if (imports[index].Addend != 0) throw Domain::RelinkerException("TLS resolver import has an addend");
+            tlsResolverAddresses.push_back(code.Branch({0x48, 0x8d, 0x05}));
+            guestStartup.WriteImport(code, imports[index], handles);
+            continue;
+        }
         code.Rip({0x48, 0x8d, 0x1d}, handles);
         code.Rip({0x48, 0x8d, 0x35}, symbolNames[index]);
         code.Emit({0xbd});
@@ -291,7 +317,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
                 code.U64(imports[index].Addend);
                 code.Emit({0x48, 0x01, 0xd0});
             }
-            code.Rip({0x48, 0x89, 0x05}, imports[index].TargetRva);
+            guestStartup.WriteImport(code, imports[index], handles);
             code.PatchBranch(skipGotWrite, code.GetRva());
             continue;
         }
@@ -299,20 +325,71 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         writeString(errorRvas.at(3 + index), true);
         unresolvedBranches.push_back(code.Branch({0xe9}));
         code.PatchBranch(resolved, code.GetRva());
+        if (imports[index].RelocationType == 16) code.Emit({0x48, 0x8b, 0x00});
+        if (imports[index].RelocationType == 17) code.Emit({0x48, 0x8b, 0x40, 8});
         if (imports[index].Addend != 0) {
             code.Emit({0x48, 0xba});
             code.U64(imports[index].Addend);
             code.Emit({0x48, 0x01, 0xd0});
         }
-        code.Rip({0x48, 0x89, 0x05}, imports[index].TargetRva);
+        guestStartup.WriteImport(code, imports[index], handles);
     }
 
+    guestStartup.Initialize(code, guestModules, handles);
     writeString(enteringElf);
-    code.Emit({0x48, 0xc7, 0x44, 0x24, 0x40, 1, 0, 0, 0});
-    code.Rip({0x48, 0x8d, 0x05}, programPath);
-    code.Emit({0x48, 0x89, 0x44, 0x24, 0x48, 0x31, 0xc0, 0x48, 0x89, 0x44, 0x24, 0x50, 0x48, 0x89, 0x44, 0x24, 0x58, 0x48, 0x8d, 0x7c, 0x24, 0x40});
+    code.Rip({0x48, 0x8d, 0x0d}, shellLibrary);
+    code.Emit({0x31, 0xd2, 0x41, 0xb8, 0, 8, 0, 0});
+    call("LoadLibraryExA");
+    requireNonzero(argumentError, 0xc0000135u);
+    code.Rip({0x48, 0x89, 0x05}, shellHandle);
+    code.Emit({0x48, 0x89, 0xc1});
+    code.Rip({0x48, 0x8d, 0x15}, parseArguments);
+    call("GetProcAddress");
+    requireNonzero(argumentError, 0xc0000139u);
+    code.Emit({0x48, 0x89, 0xc3});
+    call("GetCommandLineW");
+    code.Emit({0x48, 0x89, 0xc1});
+    code.Rip({0x48, 0x8d, 0x15}, argumentCount);
+    code.Emit({0xff, 0xd3});
+    requireNonzero(argumentError, 0xc000000du);
+    code.Rip({0x48, 0x89, 0x05}, wideArguments);
+    code.Emit({0x48, 0x89, 0xc3});
+    code.Rip({0x8b, 0x2d}, argumentCount);
+    code.Emit({0x8d, 0x45, 0xff, 0x3d});
+    code.U32(ArgumentCapacity - 1);
+    const auto countFits = code.Branch({0x0f, 0x82});
+    fail(argumentError, 0xc000000du);
+    code.PatchBranch(countFits, code.GetRva());
+    code.Emit({0x31, 0xc9, 0xba});
+    code.U32((ArgumentCapacity + 3) * 8 + ArgumentTextCapacity);
+    code.Emit({0x41, 0xb8, 0, 0x30, 0, 0, 0x41, 0xb9, 4, 0, 0, 0});
+    call("VirtualAlloc");
+    requireNonzero(argumentError, 0xc0000017u);
+    code.Rip({0x48, 0x89, 0x05}, argumentBlock);
+    code.Emit({0x48, 0x89, 0x28, 0x48, 0x8d, 0x70, 8, 0x48, 0x8d, 0xb8});
+    code.U32((ArgumentCapacity + 3) * 8);
+    code.Emit({0x41, 0xbc});
+    code.U32(ArgumentTextCapacity);
+    const auto convertArgument = code.GetRva();
+    code.Emit({0x48, 0x89, 0x3e, 0xb9});
+    code.U32(65001);
+    code.Emit({0xba, 0x80, 0, 0, 0, 0x4c, 0x8b, 0x03, 0x41, 0xb9, 0xff, 0xff, 0xff, 0xff});
+    code.Emit({0x48, 0x89, 0x7c, 0x24, 0x20, 0x44, 0x89, 0x64, 0x24, 0x28});
+    code.Emit({0x48, 0xc7, 0x44, 0x24, 0x30, 0, 0, 0, 0, 0x48, 0xc7, 0x44, 0x24, 0x38, 0, 0, 0, 0});
+    call("WideCharToMultiByte");
+    requireNonzero(argumentError, 0xc000000du);
+    code.Emit({0x48, 0x01, 0xc7, 0x41, 0x29, 0xc4, 0x48, 0x83, 0xc3, 8, 0x48, 0x83, 0xc6, 8, 0xff, 0xcd});
+    code.Rip({0x0f, 0x85}, convertArgument);
+    code.Rip({0x48, 0x8b, 0x0d}, wideArguments);
+    call("LocalFree");
+    code.Rip({0x48, 0x8b, 0x0d}, shellHandle);
+    call("FreeLibrary");
+    code.Rip({0x48, 0x8b, 0x3d}, argumentBlock);
     const auto exitCallback = code.Branch({0x48, 0x8d, 0x35});
     code.Rip({0xe8}, entryRva);
+    code.Emit({0x89, 0x44, 0x24, 0x58});
+    guestStartup.Finalize(code, guestModules, handles, guestFinished);
+    code.Emit({0x8b, 0x44, 0x24, 0x58});
     code.Emit({0x89, 0xc1});
     call("ExitProcess");
     code.Emit({0x0f, 0x0b});
@@ -332,7 +409,12 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
 
     const auto functionEnd = code.GetRva();
     code.PatchBranch(exitCallback, functionEnd);
+    code.Emit({0x48, 0x83, 0xec, 0x28});
+    guestStartup.Finalize(code, guestModules, handles, guestFinished);
+    code.Emit({0x48, 0x83, 0xc4, 0x28});
     code.Emit({0xc3});
+    const auto tlsResolver = guestStartup.EmitTlsResolver(code);
+    for (const auto offset : tlsResolverAddresses) code.PatchBranch(offset, tlsResolver);
 
     for (const auto index : lazyUnresolvedImports) {
         const auto stubRva = code.GetRva();

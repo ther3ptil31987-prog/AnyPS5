@@ -67,11 +67,26 @@ bool usesGds(const IrProgram& program) {
 
 }
 
-BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, std::uint32_t pushDataStartDword) const {
+BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const BindingLayout& layout) const {
     IrProgramMetadata& metadata = program.Metadata();
     if (!metadata.shaderInfoComplete || metadata.bindingLayoutComplete) {
         fail(metadata.shaderInfoComplete ? "shader binding layout failed: binding layout already allocated"
                                           : "shader binding layout failed: shader info is not ready");
+    }
+    if (layout.descriptorSet != 0u) {
+        fail("shader binding layout failed: descriptor set must be 0");
+    }
+    if (layout.firstBinding != 0u) {
+        fail("shader binding layout failed: first binding must be 0");
+    }
+    if (layout.pushConstantOffsetBytes % 4u != 0u) {
+        fail("shader binding layout failed: push constant offset is not dword-aligned");
+    }
+    if (layout.pushConstantSizeBytes % 4u != 0u) {
+        fail("shader binding layout failed: push constant size is not dword-aligned");
+    }
+    if (layout.pushConstantOffsetBytes + layout.pushConstantSizeBytes > NativePushConstantSize) {
+        fail("shader binding layout failed: push constant range exceeds the native push constant size");
     }
 
     const ShaderInfo& info = program.Resources().info;
@@ -80,7 +95,11 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, std::uint
     next.userDataRegisters = collectUserData(program);
     next.memoryOffsetDword = static_cast<std::uint32_t>(next.userDataRegisters.size());
     next.memoryOffsetCount = static_cast<std::uint32_t>(info.buffers.size());
-    next.pushDataStartDword = PushData::StartFor(pushDataStartDword, next.ShaderDataDwords());
+    next.dispatchThreadLimit = info.dispatchThreadLimit;
+    const std::uint32_t pushDataStartDword = layout.pushConstantOffsetBytes / 4u;
+    const std::uint32_t pushConstantSizeDwords = layout.pushConstantSizeBytes / 4u;
+    const bool usesPushData = next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= pushConstantSizeDwords;
+    next.pushDataStartDword = usesPushData ? pushDataStartDword : PushData::NoStart;
 
     if (!info.buffers.empty()) {
         std::vector<std::uint32_t> resources(info.buffers.size());
@@ -91,7 +110,7 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, std::uint
     }
 
     std::array<std::vector<std::uint32_t>, ImageBindingCount> imageGroups;
-    for (std::uint32_t i = 0; i < info.images.size(); i++) {
+    const auto place = [&](std::uint32_t i) {
         const DescriptorBindingKind kind = DescriptorBindingForImage(info.images[i]);
         const std::uint32_t group = ImageBindingIndex(kind);
         if (group >= imageGroups.size()) {
@@ -105,6 +124,24 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, std::uint
                  std::to_string(info.images[i].mipCount));
         }
         resources.insert(resources.end(), count, i);
+    };
+    // A bindless table's slots follow their root as consecutive elements: the SPIR-V indexes the
+    // binding with element(root) + slot.
+    for (std::uint32_t i = 0; i < info.images.size(); i++) {
+        const auto root = info.images[i].indirectRoot;
+        if (root != ImageResource::NoIndirectImage && root != i) {
+            continue;
+        }
+        place(i);
+        if (root != i) {
+            continue;
+        }
+        for (const auto slot : info.images[i].indirectResources) {
+            if (slot >= info.images.size() || info.images[slot].indirectRoot != i) {
+                fail("shader binding layout failed: image " + std::to_string(i) + " has an inconsistent table slot");
+            }
+            if (slot != i) place(slot);
+        }
     }
     for (std::uint32_t i = 0; i < imageGroups.size(); i++) {
         if (!imageGroups[i].empty()) {

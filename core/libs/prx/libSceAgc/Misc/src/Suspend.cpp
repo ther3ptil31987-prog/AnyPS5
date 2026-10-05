@@ -13,4 +13,9 @@ int APS5_VABI sceAgcSuspendPoint(void) {
     return 0;
 }
 
+int APS5_VABI sceAgcSetSubmitMode(std::uint32_t mode) {
+    if (mode != 0) NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 }

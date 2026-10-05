@@ -45,11 +45,8 @@ void PlanBuilder::Run() {
 
 void PlanBuilder::Collect(IrValue* raw, std::uint32_t usePc) {
     IrValue* value = raw->Resolve();
-    if (value->HasImmediate()) {
-        return;
-    }
     if (value->Opcode() == IrOpcode::Void) {
-        Fail(_program.Resources(), usePc, "invalid typed planning value");
+        return;
     }
     IrValue* inst = value;
     const auto cycle = std::find(_visiting.begin(), _visiting.end(), inst);
@@ -73,7 +70,8 @@ void PlanBuilder::Collect(IrValue* raw, std::uint32_t usePc) {
         return;
     }
     IrValue* offset = inst->Argument(1)->Resolve();
-    if (!offset->HasImmediate() || offset->Type() != IrType::U32) {
+    const auto foldable = offset->HasImmediate() && offset->Type() == IrType::U32 && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst);
+    if (!foldable) {
         if (std::find(_program.Metadata().dynamicReads.begin(), _program.Metadata().dynamicReads.end(), value) == _program.Metadata().dynamicReads.end()) {
             _program.Metadata().dynamicReads.push_back(value);
         }

@@ -153,10 +153,12 @@ void vectorInstructionLengths() {
         {0xC5, 0xD9, 0x73, 0xD4, 0x20},
         {0xC4, 0xE1, 0x79, 0x70, 0xC0, 0x1B},
         {0xC4, 0xE1, 0x78, 0x77},
-        {0x62, 0xF1, 0x7D, 0x48, 0x72, 0xD0, 0x04}
+        {0x62, 0xF1, 0x7D, 0x48, 0x72, 0xD0, 0x04},
+        {0xF3, 0x0F, 0xB8, 0xC0},
+        {0xCD, 0x41}
     };
     for (const auto& instruction : instructions)
-        require(decoder.Decode(instruction.data(), instruction.size()) == instruction.size(), "Vector immediate or VZEROUPPER was decoded with the wrong length");
+        require(decoder.Decode(instruction.data(), instruction.size()) == instruction.size(), "Vector immediate, VZEROUPPER, POPCNT or INT was decoded with the wrong length");
 }
 
 void exceptionLandingPads() {
@@ -222,6 +224,22 @@ std::vector<std::uint8_t> elfFixture(const StrictReachabilityInput& input) {
     return bytes;
 }
 
+void filterCallbackDataImports() {
+    auto input = fixture();
+    ripOperand(input, 0, {0x48, 0x8D, 0x3D}, 0x1020);
+    emit(input, 7, {0xC3});
+    ripOperand(input, 32, {0x48, 0x8B, 0x05}, 0x2000);
+    emit(input, 39, {0xC3});
+    ripOperand(input, 48, {0x48, 0x8B, 0x05}, 0x2008);
+    emit(input, 55, {0xC3});
+    const auto bytes = elfFixture(input);
+    for (const std::uint32_t relocationType : {1, 6}) {
+        const std::vector<Relinker::NidReference> references = {{"callbackData", {}, relocationType, 0x300, 0x2000, 0}, {"deadData", {}, relocationType, 0x318, 0x2008, 0}};
+        const auto filtered = Relinker::MakeStrictUnusedNidFilter()->Filter(references, bytes, input.Text, input.TextVaddr);
+        require(filtered.size() == 1 && filtered[0].Nid == references[0].Nid, "Strict ELF filter lost callback data or retained unreachable data");
+    }
+}
+
 void filterAndPltCompaction() {
     auto input = fixture();
     importThunk(input, 0, 0x2000);
@@ -274,6 +292,7 @@ int main() {
         relativeTableAndWholeFunction();
         vectorInstructionLengths();
         exceptionLandingPads();
+        filterCallbackDataImports();
         filterAndPltCompaction();
         std::cout << "Strict NID filter tests passed\n";
     } catch (const std::exception& error) {

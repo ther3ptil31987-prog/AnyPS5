@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.ref_name }}
+  CONFIGURE: >-
+    -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+    -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+  WINLIBS_RELEASE: 15.2.0posix-14.0.0-ucrt-r7
+  WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.platform }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-latest
+            timeout: 30
+          - platform: windows
+            runner: windows-latest
+            timeout: 45
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - id: toolchain
+        if: matrix.platform == 'windows'
+        uses: actions/cache@v6
+        with:
+          path: C:\winlibs
+          key: ${{ env.WINLIBS_ZIP }}
+      - if: matrix.platform == 'windows' && steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/winlibs.zip" "https://github.com/brechtsanders/winlibs_mingw/releases/download/$WINLIBS_RELEASE/$WINLIBS_ZIP"
+          7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs
+      - if: matrix.platform == 'windows'
+        run: echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
+      - uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: ${{ matrix.platform }}
+          save: false
+      - name: Configure Linux
+        if: matrix.platform == 'linux'
+        run: cmake -S . -B build $CONFIGURE
+      - name: Configure Windows
+        if: matrix.platform == 'windows'
+        shell: cmd
+        run: cmake -S . -B build %CONFIGURE%
+      - name: Build project and tests (Linux)
+        if: matrix.platform == 'linux'
+        run: cmake --build build
+      - name: Build project and tests (Windows)
+        if: matrix.platform == 'windows'
+        shell: cmd
+        run: cmake --build build
+      - name: Run tests (Linux)
+        if: matrix.platform == 'linux'
+        run: ctest --test-dir build --output-on-failure --timeout 120 --stop-on-failure --no-tests=error
+      - name: Run tests (Windows)
+        if: matrix.platform == 'windows'
+        shell: cmd
+        run: ctest --test-dir build --output-on-failure --timeout 120 --stop-on-failure --no-tests=error
+      - name: Build patched libraries (Linux)
+        if: matrix.platform == 'linux'
+        run: cmake --build build --target libs
+      - name: Build patched libraries (Windows)
+        if: matrix.platform == 'windows'
+        shell: cmd
+        run: cmake --build build --target libs
+      - name: Package release files
+        run: python tools/package_release.py --platform "${{ matrix.platform }}" --build build --output dist --version "$RELEASE_TAG"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Check release files and collect documentation
+        shell: bash
+        run: |
+          for file in "prx-windows-$RELEASE_TAG.zip" "prx-windows-$RELEASE_TAG.tar.gz" "prx-linux-$RELEASE_TAG.zip" "prx-linux-$RELEASE_TAG.tar.gz" "relinker-$RELEASE_TAG.exe" "relinker-$RELEASE_TAG"; do
+            test -s "dist/$file"
+          done
+          python tools/package_release.py --docs docs/user --output dist
+          chmod +x "dist/relinker-$RELEASE_TAG"
+      - name: Create draft and upload files
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --draft --title "$RELEASE_TAG" --generate-notes
+      - name: Publish complete release
+        run: gh release edit "$RELEASE_TAG" --draft=false

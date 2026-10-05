@@ -19,6 +19,7 @@ private:
     void canonicalizeNaturalLoops(ControlFlowGraph& graph) const;
     void splitSharedMergeBlocks(ControlFlowGraph& graph) const;
     void isolateSemanticLoopHeaders(ControlFlowGraph& graph) const;
+    void orderByDominance(ControlFlowGraph& graph) const;
     void clearStructuredTerminators(ControlFlowGraph& graph) const;
     void verifyReducibility(const ControlFlowGraph& graph) const;
 };

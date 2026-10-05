@@ -18,7 +18,8 @@ X64InstructionRewriter::ReferenceSite X64InstructionRewriter::ClassifyInstructio
 
     while (pos < length) {
         const std::uint8_t b = data[pos];
-        if (b == PrefixLock || b == PrefixRepne || b == PrefixRep ||
+        if ((b >= RexMin && b <= RexMax) ||
+            b == PrefixLock || b == PrefixRepne || b == PrefixRep ||
             b == PrefixSegCs || b == PrefixSegSs || b == PrefixSegDs ||
             b == PrefixSegEs || b == PrefixSegFs || b == PrefixSegGs ||
             b == PrefixOperandSize || b == PrefixAddressSize) {
@@ -26,10 +27,6 @@ X64InstructionRewriter::ReferenceSite X64InstructionRewriter::ClassifyInstructio
             continue;
         }
         break;
-    }
-
-    if (pos < length && data[pos] >= RexMin && data[pos] <= RexMax) {
-        pos += 1;
     }
 
     if (pos >= length) {

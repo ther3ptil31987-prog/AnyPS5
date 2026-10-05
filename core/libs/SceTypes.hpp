@@ -158,6 +158,7 @@ struct PthreadRwlockPrivate;
 struct PthreadRwlockattrPrivate;
 struct PthreadCondattrPrivate;
 struct PthreadCondPrivate;
+struct PthreadSemPrivate;
 
 using KernelSema = KernelSemaPrivate*;
 using KernelEventFlag = KernelEventFlagPrivate*;
@@ -170,12 +171,13 @@ using PthreadRwlock = PthreadRwlockPrivate*;
 using PthreadRwlockattr = PthreadRwlockattrPrivate*;
 using PthreadCond = PthreadCondPrivate*;
 using PthreadCondattr = PthreadCondattrPrivate*;
+using PthreadSem = PthreadSemPrivate*;
 using PthreadKey = int;
 using pthread_entry_func_t = void* (*)(void*);
 using pthread_key_destructor_func_t = void (*)(void*);
-using thread_dtors_func_t = void (*)();
-using get_thread_atexit_count_func_t = int (*)(KernelModule);
-using thread_atexit_report_func_t = void (*)(KernelModule);
+using thread_dtors_func_t = void (APS5_VABI *)();
+using get_thread_atexit_count_func_t = int (APS5_VABI *)(KernelModule);
+using thread_atexit_report_func_t = void (APS5_VABI *)(KernelModule);
 
 struct FileStat {
     std::uint32_t st_dev;
@@ -387,6 +389,18 @@ struct AjmDecAt9ConfigDataInfo {
     std::uint32_t superframe_size;
 };
 
+struct AjmDecMp3ParseFrame {
+    std::uint64_t frame_size;
+    std::uint32_t num_channels;
+    std::uint32_t samples_per_channel;
+    std::uint32_t bitrate;
+    std::uint32_t sample_rate;
+    std::uint32_t encoder_delay;
+    std::uint32_t num_frames;
+    std::uint32_t total_samples;
+    std::uint32_t ofl_type;
+};
+
 using AudioOut2ContextHandle = std::uint64_t;
 using AudioOut2PortHandle = std::uint64_t;
 using AudioOut2UserHandle = std::uintptr_t;
@@ -509,138 +523,6 @@ struct AudioPropagationSystemMemory {
     std::size_t size_gpu_mem;
 };
 
-using Ngs2Handle = std::uintptr_t;
-using Ngs2BufferAllocHandler = std::int32_t (*)(void*);
-using Ngs2BufferFreeHandler = std::int32_t (*)(void*);
-
-struct Ngs2ContextBufferInfo {
-    void* host_buffer;
-    std::size_t host_buffer_size;
-    std::uintptr_t reserved[5];
-    std::uintptr_t user_data;
-};
-
-struct Ngs2BufferAllocator {
-    Ngs2BufferAllocHandler alloc_handler;
-    Ngs2BufferFreeHandler free_handler;
-    std::uintptr_t user_data;
-};
-
-struct Ngs2SystemOption {
-    std::size_t size;
-    char name[16];
-    std::uint32_t flags;
-    std::uint32_t max_grain_samples;
-    std::uint32_t num_grain_samples;
-    std::uint32_t sample_rate;
-    std::uint32_t reserved[6];
-};
-
-struct Ngs2SystemInfo {
-    char name[16];
-    Ngs2Handle system_handle;
-    Ngs2ContextBufferInfo buffer_info;
-    std::uint32_t uid;
-    std::uint32_t min_grain_samples;
-    std::uint32_t max_grain_samples;
-    std::uint32_t state_flags;
-    std::uint32_t rack_count;
-    float last_render_ratio;
-    std::int64_t last_render_tick;
-    std::int64_t render_count;
-    std::uint32_t sample_rate;
-    std::uint32_t num_grain_samples;
-};
-
-struct Ngs2RackOption {
-    std::size_t size;
-    char name[16];
-    std::uint32_t flags;
-    std::uint32_t max_grain_samples;
-    std::uint32_t max_voices;
-    std::uint32_t max_input_delay_blocks;
-    std::uint32_t max_matrices;
-    std::uint32_t max_ports;
-    std::uint32_t reserved[20];
-};
-
-struct Ngs2VoiceParamHeader {
-    std::uint16_t size;
-    std::int16_t next;
-    std::uint32_t id;
-};
-
-struct Ngs2RenderBufferInfo {
-    void* buffer;
-    std::size_t buffer_size;
-    std::uint32_t waveform_type;
-    std::uint32_t num_channels;
-};
-
-struct Ngs2VoiceState {
-    std::uint32_t state_flags;
-};
-
-struct Ngs2WaveformFormat {
-    std::uint32_t waveform_type;
-    std::uint32_t num_channels;
-    std::uint32_t sample_rate;
-    std::uint32_t config_data;
-    std::uint32_t frame_offset;
-    std::uint32_t frame_margin;
-};
-
-struct Ngs2WaveformBlock {
-    std::uint32_t data_offset;
-    std::uint32_t data_size;
-    std::uint32_t num_repeats;
-    std::uint32_t num_skip_samples;
-    std::uint32_t num_samples;
-    std::uint32_t reserved;
-    std::uintptr_t user_data;
-};
-
-struct Ngs2WaveformInfo {
-    Ngs2WaveformFormat format;
-    std::uint32_t data_offset;
-    std::uint32_t data_size;
-    std::uint32_t loop_begin_position;
-    std::uint32_t loop_end_position;
-    std::uint32_t num_samples;
-    std::uint32_t audio_unit_size;
-    std::uint32_t num_audio_unit_samples;
-    std::uint32_t num_audio_unit_per_frame;
-    std::uint32_t audio_frame_size;
-    std::uint32_t num_audio_frame_samples;
-    std::uint32_t num_delay_samples;
-    std::uint32_t num_blocks;
-    Ngs2WaveformBlock block[4];
-};
-
-struct Ngs2PanParam {
-    std::uint32_t reserved[16];
-};
-
-struct Ngs2PanWork {
-    std::uint32_t reserved[64];
-};
-
-struct Ngs2GeomListenerParam {
-    std::uint32_t reserved[32];
-};
-
-struct Ngs2GeomListenerWork {
-    std::uint32_t reserved[64];
-};
-
-struct Ngs2GeomSourceParam {
-    std::uint32_t reserved[32];
-};
-
-struct Ngs2GeomAttribute {
-    std::uint32_t reserved[32];
-};
-
 struct AvPlayerAudio {
     std::uint16_t channel_count;
     std::uint8_t reserved1[2];
@@ -683,6 +565,15 @@ struct AvPlayerFrameInfo {
     std::uint64_t timestamp;
     AvPlayerStreamDetails details;
 };
+static_assert(sizeof(AvPlayerFrameInfo) == 40 && offsetof(AvPlayerFrameInfo, timestamp) == 16);
+
+struct AvPlayerStreamInfo {
+    std::uint32_t type;
+    std::uint8_t reserved[4];
+    AvPlayerStreamDetails details;
+    std::uint64_t duration;
+};
+static_assert(sizeof(AvPlayerStreamInfo) == 32);
 
 struct AvPlayerAudioEx {
     std::uint16_t channel_count;
@@ -709,6 +600,8 @@ struct AvPlayerVideoEx {
     bool video_full_range_flag;
     std::uint8_t reserved1[37];
 };
+static_assert(sizeof(AvPlayerVideoEx) == 80);
+static_assert(offsetof(AvPlayerVideoEx, crop_left_offset) == 20 && offsetof(AvPlayerVideoEx, pitch) == 36);
 
 struct AvPlayerTimedTextEx {
     std::uint8_t language_code[4];
@@ -729,11 +622,22 @@ struct AvPlayerFrameInfoEx {
     std::uint64_t timestamp;
     AvPlayerStreamDetailsEx details;
 };
+static_assert(sizeof(AvPlayerFrameInfoEx) == 104 && offsetof(AvPlayerFrameInfoEx, details) == 24);
 
-using AvPlayerAllocate = void* (*)(void*, std::uint32_t, std::uint32_t);
-using AvPlayerDeallocate = void (*)(void*, void*);
-using AvPlayerAllocateTexture = void* (*)(void*, std::uint32_t, std::uint32_t);
-using AvPlayerDeallocateTexture = void (*)(void*, void*);
+struct AvPlayerStreamInfoEx {
+    std::uint64_t this_size;
+    std::uint32_t type;
+    std::uint8_t reserved[4];
+    AvPlayerStreamDetailsEx details;
+    std::uint64_t duration;
+};
+static_assert(sizeof(AvPlayerStreamInfoEx) == 104);
+static_assert(offsetof(AvPlayerStreamInfoEx, details) == 16 && offsetof(AvPlayerStreamInfoEx, duration) == 96);
+
+using AvPlayerAllocate = void* (APS5_VABI*)(void*, std::uint32_t, std::uint32_t);
+using AvPlayerDeallocate = void (APS5_VABI*)(void*, void*);
+using AvPlayerAllocateTexture = void* (APS5_VABI*)(void*, std::uint32_t, std::uint32_t);
+using AvPlayerDeallocateTexture = void (APS5_VABI*)(void*, void*);
 
 struct AvPlayerMemAllocator {
     void* object_ptr;
@@ -743,10 +647,10 @@ struct AvPlayerMemAllocator {
     AvPlayerDeallocateTexture deallocate_texture;
 };
 
-using AvPlayerOpenFile = std::int32_t (*)(void*, const char*);
-using AvPlayerCloseFile = std::int32_t (*)(void*);
-using AvPlayerReadOffsetFile = std::int32_t (*)(void*, std::uint8_t*, std::uint64_t, std::uint32_t);
-using AvPlayerSizeFile = std::uint64_t (*)(void*);
+using AvPlayerOpenFile = std::int32_t (APS5_VABI*)(void*, const char*);
+using AvPlayerCloseFile = std::int32_t (APS5_VABI*)(void*);
+using AvPlayerReadOffsetFile = std::int32_t (APS5_VABI*)(void*, std::uint8_t*, std::uint64_t, std::uint32_t);
+using AvPlayerSizeFile = std::uint64_t (APS5_VABI*)(void*);
 
 struct AvPlayerFileReplacement {
     void* object_ptr;
@@ -756,7 +660,7 @@ struct AvPlayerFileReplacement {
     AvPlayerSizeFile size;
 };
 
-using AvPlayerEventCallback = void (*)(void*, std::int32_t, std::int32_t, void*);
+using AvPlayerEventCallback = void (APS5_VABI*)(void*, std::int32_t, std::int32_t, void*);
 
 struct AvPlayerEventReplacement {
     void* object_ptr;
@@ -773,6 +677,60 @@ struct AvPlayerInitData {
     bool auto_start;
     std::uint8_t reserved[3];
     const char* default_language;
+};
+
+struct AvPlayerInitDataEx {
+    std::size_t this_size;
+    AvPlayerMemAllocator memory_replacement;
+    AvPlayerFileReplacement file_replacement;
+    AvPlayerEventReplacement event_replacement;
+    const char* default_language;
+    std::int32_t debug_level;
+    std::uint32_t audio_decoder_priority;
+    std::uint32_t audio_decoder_affinity;
+    std::uint32_t video_decoder_priority;
+    std::uint32_t video_decoder_affinity;
+    std::uint32_t demuxer_priority;
+    std::uint32_t demuxer_affinity;
+    std::uint32_t controller_priority;
+    std::uint32_t controller_affinity;
+    std::uint32_t http_streaming_priority;
+    std::uint32_t http_streaming_affinity;
+    std::uint32_t file_streaming_priority;
+    std::uint32_t file_streaming_affinity;
+    std::int32_t num_output_video_framebuffers;
+    bool auto_start;
+    std::uint8_t reserved[3];
+};
+
+struct AvPlayerUri {
+    const char* name;
+    std::uint32_t length;
+};
+
+struct AvPlayerSourceDetails {
+    AvPlayerUri uri;
+    std::uint8_t reserved1[64];
+    std::uint32_t source_type;
+    std::uint8_t reserved2[44];
+};
+
+struct AvPlayerDecoderInit {
+    std::uint8_t decoder_type[4];
+    std::uint8_t decoder_params[28];
+};
+
+struct AvPlayerHttpContext {
+    std::uint32_t http_context_id;
+    std::uint32_t ssl_context_id;
+};
+
+struct AvPlayerPostInitData {
+    std::uint32_t demux_video_buffer_size;
+    AvPlayerDecoderInit video_decoder_init;
+    AvPlayerDecoderInit audio_decoder_init;
+    AvPlayerHttpContext http_context;
+    std::uint8_t reserved[56];
 };
 
 struct AvPlayerInternal {};
@@ -794,6 +752,59 @@ struct AudiodecCtrl {
     void* pBsiInfo;
     AudiodecAuInfo* pAuInfo;
     AudiodecPcmItem* pPcmItem;
+};
+
+struct AudiodecParamAt9 {
+    std::uint32_t ui_size;
+    std::int32_t i_bw_pcm;
+    std::uint8_t ui_config_data[4];
+};
+
+struct AudiodecAt9Info {
+    std::uint32_t ui_size;
+    std::uint32_t ui_channel;
+    std::uint32_t ui_bitrate;
+    std::uint32_t ui_sampling_rate;
+    std::uint32_t ui_super_frame_size;
+    std::uint32_t ui_frames_in_super_frame;
+    std::uint32_t ui_next_frame_size;
+    std::uint32_t ui_frame_samples;
+    std::int32_t i_result;
+};
+
+struct AudiodecParamMp3 {
+    std::uint32_t ui_size;
+    std::int32_t i_bw_pcm;
+};
+
+struct AudiodecMp3Info {
+    std::uint32_t ui_size;
+    std::uint32_t ui_header;
+    std::uint8_t uc_crc;
+    std::uint8_t uc_mode;
+    std::uint8_t uc_mode_extension;
+    std::uint8_t uc_copyright;
+    std::uint8_t uc_original;
+    std::uint8_t uc_emphasis;
+    std::uint8_t uc_reserved[2];
+    std::int32_t i_result;
+};
+
+struct AudiodecParamM4aac {
+    std::uint32_t ui_size;
+    std::int32_t i_bw_pcm;
+    std::uint32_t ui_config_number;
+    std::uint32_t ui_sampling_freq_index;
+    std::uint32_t ui_max_channels;
+    std::uint32_t ui_enable_heaac;
+};
+
+struct AudiodecM4aacInfo {
+    std::uint32_t ui_size;
+    std::uint32_t ui_sampling_freq;
+    std::uint32_t ui_number_of_channels;
+    std::uint32_t ui_heaac;
+    std::int32_t i_result;
 };
 
 struct VoiceInitParam {
@@ -972,7 +983,7 @@ struct MouseData {
     std::uint8_t reserved[8];
 };
 
-constexpr std::uint32_t KEYBOARD_MAX_KEYCODES = 6;
+constexpr std::uint32_t KEYBOARD_MAX_KEYCODES = 16;
 
 struct KeyboardData {
     std::uint64_t timestamp;
@@ -1140,6 +1151,13 @@ struct ImeDialogResult {
 
 using Result = ImeDialogResult;
 
+struct MsgDialogResult {
+    std::int32_t mode;
+    std::int32_t result;
+    std::int32_t button_id;
+    char reserved[32];
+};
+
 struct PositionAndForm {
     std::uint32_t type;
     float posx;
@@ -1148,207 +1166,6 @@ struct PositionAndForm {
     std::uint32_t vertical_alignment;
     std::uint32_t width;
     std::uint32_t height;
-};
-
-using FontHandle = void*;
-using FontLibrary = void*;
-using FontLibrarySelection = void*;
-using FontRenderer = void*;
-using FontRendererSelection = void*;
-
-using FontMemoryDestroyCallback = void (*)(void*);
-
-struct FontMemoryInterface {
-    void* (*malloc_func)(std::size_t);
-    void (*free_func)(void*);
-};
-
-struct FontMemory {
-    std::uint16_t type;
-    std::uint16_t attr;
-    std::uint32_t size;
-    void* address;
-    void* mspace_object;
-    const FontMemoryInterface* mem_interface;
-    FontMemoryDestroyCallback destroy_callback;
-    void* destroy_object;
-    void* user_object;
-    void* parent_object;
-};
-
-using FontOpenDetail = void;
-
-struct FontHorizontalLayout {
-    float base_line_y;
-    float line_height;
-    float effect_height;
-};
-
-struct FontVerticalLayout {
-    float base_line_x;
-    float line_width;
-    float effect_width;
-};
-
-struct FontGlyphMetrics {
-    float width;
-    float height;
-    struct {
-        float bearing_x;
-        float bearing_y;
-        float advance;
-    } horizontal;
-    struct {
-        float bearing_x;
-        float bearing_y;
-        float advance;
-    } vertical;
-};
-
-struct FontRenderSurface {
-    void* buffer;
-    std::int32_t width_byte;
-    std::int8_t pixel_size_byte;
-    std::uint8_t system_ext0;
-    std::uint8_t system_ext1;
-    std::uint8_t system_ext2;
-    std::int32_t width;
-    std::int32_t height;
-    struct {
-        std::uint32_t x0;
-        std::uint32_t y0;
-        std::uint32_t x1;
-        std::uint32_t y1;
-    } scissor;
-    std::uint32_t system_use[22];
-};
-
-struct FontRenderCharacter { std::uint8_t reserved[128]; };
-
-struct FontTransImage {
-    std::uint8_t* address;
-    std::uint32_t width_byte;
-    std::uint32_t image_width;
-    std::uint32_t image_height;
-};
-
-struct FontSurfaceImage {
-    std::uint8_t* address;
-    std::uint32_t width_byte;
-    std::uint8_t pixel_size_byte;
-    std::uint8_t pixel_format;
-};
-
-struct FontGlyphImageMetrics {
-    float bearing_x;
-    float bearing_y;
-    float advance;
-    float stride;
-    std::uint32_t width;
-    std::uint32_t height;
-};
-
-struct FontRenderResult {
-    const FontTransImage* trans_image;
-    FontSurfaceImage surface_image;
-    struct {
-        std::uint32_t x;
-        std::uint32_t y;
-        std::uint32_t w;
-        std::uint32_t h;
-    } update_rect;
-    FontGlyphImageMetrics image_metrics;
-};
-
-using FontCreateStringOrdersFunction = void (*)(void*, void*);
-
-struct FontCreateStringDetail {
-    std::uint16_t detail_id;
-    std::uint8_t detail_type;
-    std::uint8_t detections;
-    std::uint32_t orders_option;
-    FontHandle default_font;
-    struct {
-        FontCreateStringOrdersFunction function;
-        void* object;
-    } orders;
-};
-
-struct FontGenerateGlyphDetail { std::uint8_t reserved[64]; };
-
-struct FontString { void* system_use[32]; };
-
-struct FontWriting { void* system_use[32]; };
-
-struct FontWritingExtent {
-    float top;
-    float bottom;
-    float left;
-    float right;
-};
-
-struct FontWritingMetrics {
-    float advance_x;
-    float advance_y;
-    FontWritingExtent extent;
-};
-
-struct FontWritingStep {
-    float x;
-    float y;
-    float advance_x;
-    float advance_y;
-    FontHandle font;
-    struct {
-        std::uint32_t character_count : 8;
-        std::uint32_t invisible_glyph : 1;
-    } profile;
-    std::uint32_t glyph_code;
-    struct {
-        float x;
-        float y;
-    } positioning;
-    FontGlyphMetrics glyph_metrics;
-};
-
-struct FontWritingLine { std::uint8_t reserved[128]; };
-
-struct FontWritingLineStep {
-    float x;
-    float y;
-    float advance_x;
-    float advance_y;
-    float spacing_progress;
-    void* writing_orderer;
-    struct {
-        float x;
-        float y;
-    } adjusting;
-    FontWritingMetrics metrics;
-};
-
-using FontTextParseFunction = int (*)(void*, std::uint32_t, void*);
-
-struct FontTextSource {
-    std::uint64_t system_use0;
-    const void* start;
-    const void* end;
-    const void* current;
-    FontTextParseFunction text_parser;
-    void* text_object;
-    FontHandle default_font;
-    void* system_use[5];
-};
-
-struct FontTextCharacter { std::uint8_t reserved[64]; };
-
-union FontTextCodes {
-    struct {
-        void* order;
-        std::uint32_t code;
-        std::uint32_t reserved;
-    } text;
-    void* system_reserved[8];
 };
 
 struct NetEtherAddr { std::uint8_t data[6]; };
@@ -1677,6 +1494,34 @@ struct ContentExportInitParam2 {
 
 struct ContentSearchInitParam { std::size_t memory_size; };
 
+struct PngEncCreateParam {
+    std::uint32_t this_size;
+    std::uint32_t attribute;
+    std::uint32_t max_image_width;
+    std::uint32_t max_filter_number;
+};
+
+struct PngEncEncodeParam {
+    const std::uint8_t* image_mem_addr;
+    std::uint8_t* png_mem_addr;
+    std::uint32_t image_mem_size;
+    std::uint32_t png_mem_size;
+    std::uint32_t image_width;
+    std::uint32_t image_height;
+    std::uint32_t image_pitch;
+    std::uint16_t pixel_format;
+    std::uint16_t color_space;
+    std::uint16_t bit_depth;
+    std::uint16_t clut_number;
+    std::uint16_t filter_type;
+    std::uint16_t compression_level;
+};
+
+struct PngEncOutputInfo {
+    std::uint32_t data_size;
+    std::uint32_t processed_height;
+};
+
 struct ContentDeleteInitParam {
     char reserved1[4];
     std::size_t heap_size;
@@ -1713,6 +1558,61 @@ struct PngDecImageInfo {
     std::uint32_t image_flag;
 };
 
+struct JpegEncCreateParam {
+    std::uint32_t size;
+    std::uint32_t attr;
+};
+
+struct JpegEncEncodeParam {
+    const void* image;
+    void* jpeg;
+    std::uint32_t image_size;
+    std::uint32_t jpeg_size;
+    std::uint32_t image_width;
+    std::uint32_t image_height;
+    std::uint32_t image_pitch;
+    std::uint16_t pixel_format;
+    std::uint16_t encode_mode;
+    std::uint16_t color_space;
+    std::uint8_t sampling_type;
+    std::uint8_t compression_ratio;
+    std::int32_t restart_interval;
+};
+
+struct JpegEncOutputInfo {
+    std::uint32_t size;
+    std::uint32_t height;
+};
+
+struct JpegDecCreateParam {
+    std::uint32_t size;
+    std::uint32_t attribute;
+};
+
+struct JpegDecParseParam {
+    const void* jpeg_mem_addr;
+    std::uint32_t jpeg_mem_size;
+    std::uint32_t reserved0;
+};
+
+struct JpegDecDecodeParam {
+    const void* jpeg_mem_addr;
+    void* image_mem_addr;
+    std::uint32_t jpeg_mem_size;
+    std::uint32_t image_mem_size;
+    std::uint16_t pixel_format;
+    std::uint16_t reserved0;
+    std::uint32_t image_pitch;
+};
+
+struct JpegDecImageInfo {
+    std::uint32_t image_width;
+    std::uint32_t image_height;
+    std::uint16_t color_space;
+    std::uint16_t bit_depth;
+    std::uint32_t image_flag;
+};
+
 struct PlayGoInitParams {
     const void* buf_addr;
     std::uint32_t buf_size;
@@ -1734,6 +1634,11 @@ union PlayGoOptionalChunk {
     std::uint64_t bitmask;
     std::uint64_t languages;
     std::uint64_t scenarios;
+};
+
+struct PlayGoDialogResult {
+    std::int32_t result;
+    std::int32_t reserved[9];
 };
 
 using RudpEventHandler = void (*)(int ctx_id, int event_id, int error_code, void* arg);

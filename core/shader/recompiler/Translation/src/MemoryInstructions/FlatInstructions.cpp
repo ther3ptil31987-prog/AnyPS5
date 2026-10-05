@@ -1,11 +1,30 @@
 #include "Translation/MemoryInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
 
 namespace {
+
+// A multi-dword global load is one address instruction so the emitter can resolve its guest address
+// once (see EmitBdaDwordReads). APS5_BDA_BYTE_READS=1 keeps one LoadAddressU32 per dword, as before.
+bool wideAddressLoadsEnabled() {
+    static const bool byteReads = std::getenv("APS5_BDA_BYTE_READS") != nullptr;
+    return !byteReads;
+}
+
+IrOpcode wideAddressLoadOpcode(std::uint32_t dwords) {
+    switch (dwords) {
+    case 2u:
+        return IrOpcode::LoadAddressU32x2;
+    case 3u:
+        return IrOpcode::LoadAddressU32x3;
+    default:
+        return IrOpcode::LoadAddressU32x4;
+    }
+}
 
 ResourceKind flatSegmentResourceKind(std::uint32_t segment) {
     switch (segment) {
@@ -36,7 +55,8 @@ MemoryInfo flatMemoryInfoFromInstruction(const RdnaInstruction& inst) {
 }
 
 bool TranslationContext::flatLoad(const RdnaInstruction& inst) {
-    const MemoryInfo memory = flatMemoryInfoFromInstruction(inst);
+    MemoryInfo memory = flatMemoryInfoFromInstruction(inst);
+    memory.coherent = inst.glc || inst.dlc;
     IrOpcode opcode;
     switch (memory.dataBits) {
     case 8u:
@@ -54,6 +74,18 @@ bool TranslationContext::flatLoad(const RdnaInstruction& inst) {
     const AddressOperands address = readAddressOperands(inst, 0u);
     IrValue& active = ir.GetExec();
     const std::uint32_t count = memory.dataBits == 32u ? std::min(memory.dataDwords, 4u) : 1u;
+    if (count > 1u && memory.kind != ResourceKind::Scratch && wideAddressLoadsEnabled()) {
+        MemoryInfo group = memory;
+        group.dataDwords = count;
+        group.componentCount = count;
+        group.componentIndex = 0u;
+        const IrOpcode wide = wideAddressLoadOpcode(count);
+        IrValue& loaded = ir.Emit(wide, IrOpcodeType(wide), {address.resource, address.low, address.high, &active}, addMemoryInfo(group, inst.programCounter));
+        for (std::uint32_t index = 0u; index < count; ++index) {
+            writeOperand(offsetOperand(inst.destination, index), &ir.CompositeExtract(loaded, index));
+        }
+        return true;
+    }
     for (std::uint32_t index = 0u; index < count; ++index) {
         MemoryInfo component = memory;
         component.offset += index * 4u;
@@ -65,8 +97,28 @@ bool TranslationContext::flatLoad(const RdnaInstruction& inst) {
     return true;
 }
 
+bool TranslationContext::globalAddtid(const RdnaInstruction& inst, bool write) {
+    MemoryInfo memory = flatMemoryInfoFromInstruction(inst);
+    memory.addressIsFull = false;
+    const IrU32 baseLow = readU32(inst.source0);
+    const IrU32 baseHigh = readU32(offsetOperand(inst.source0, 1u));
+    IrValue* resource = getAddressResource(&baseLow.Value(), &baseHigh.Value());
+    IrValue& lane = ir.Emit(IrOpcode::LaneId, IrOpcodeType(IrOpcode::LaneId), {});
+    IrValue& laneOffset = ir.ShiftLeftLogical(lane, ir.Constant(2u));
+    IrValue& active = ir.GetExec();
+    if (write) {
+        const IrU32 data = readU32(inst.destination);
+        (void)ir.Emit(IrOpcode::StoreAddressU32, IrType::Void, {resource, &laneOffset, &ir.Constant(0u), &data.Value(), &active}, addMemoryInfo(memory, inst.programCounter));
+        return true;
+    }
+    IrValue& loaded = ir.Emit(IrOpcode::LoadAddressU32, IrOpcodeType(IrOpcode::LoadAddressU32), {resource, &laneOffset, &ir.Constant(0u), &active}, addMemoryInfo(memory, inst.programCounter));
+    writeOperand(inst.destination, &loaded);
+    return true;
+}
+
 bool TranslationContext::flatStore(const RdnaInstruction& inst) {
-    const MemoryInfo memory = flatMemoryInfoFromInstruction(inst);
+    MemoryInfo memory = flatMemoryInfoFromInstruction(inst);
+    memory.coherent = inst.glc || inst.dlc;
     IrOpcode opcode;
     switch (memory.dataBits) {
     case 8u:
@@ -92,6 +144,36 @@ bool TranslationContext::flatStore(const RdnaInstruction& inst) {
         const IrU32 data = readU32(offsetOperand(inst.destination, index));
         IrValue* value = memory.dataBits == 32u ? &data.Value() : narrowSubdword(data, memory.dataBits);
         (void)ir.Emit(opcode, IrType::Void, {address.resource, address.low, address.high, value, &active}, addMemoryInfo(component, inst.programCounter));
+    }
+    return true;
+}
+
+bool TranslationContext::flatAtomic(const RdnaInstruction& inst, IrOpcode opcode) {
+    const MemoryInfo memory = flatMemoryInfoFromInstruction(inst);
+    const AddressOperands address = readAddressOperands(inst, 0u);
+    const MemoryFlags flags = addMemoryInfo(memory, inst.programCounter);
+    IrValue& active = ir.GetExec();
+    const bool compare = opcode == IrOpcode::AddressAtomicCmpSwap32 || opcode == IrOpcode::AddressAtomicCmpSwap64 || opcode == IrOpcode::AddressAtomicFCmpSwap32 || opcode == IrOpcode::AddressAtomicFCmpSwap64;
+    IrValue* result;
+    if (IrOpcodeType(opcode) == IrType::U64) {
+        const IrU64 value = readU64(inst.source2);
+        if (compare) {
+            const IrU64 comparator = readU64(offsetOperand(inst.source2, 2u));
+            result = &ir.Emit(opcode, IrOpcodeType(opcode), {address.resource, address.low, address.high, &value.Value(), &comparator.Value(), &active}, flags);
+        } else {
+            result = &ir.Emit(opcode, IrOpcodeType(opcode), {address.resource, address.low, address.high, &value.Value(), &active}, flags);
+        }
+    } else {
+        const IrU32 value = readU32(inst.source2);
+        if (compare) {
+            const IrU32 comparator = readU32(offsetOperand(inst.source2, 1u));
+            result = &ir.Emit(opcode, IrOpcodeType(opcode), {address.resource, address.low, address.high, &value.Value(), &comparator.Value(), &active}, flags);
+        } else {
+            result = &ir.Emit(opcode, IrOpcodeType(opcode), {address.resource, address.low, address.high, &value.Value(), &active}, flags);
+        }
+    }
+    if (inst.glc) {
+        writeOperand(inst.destination, result);
     }
     return true;
 }

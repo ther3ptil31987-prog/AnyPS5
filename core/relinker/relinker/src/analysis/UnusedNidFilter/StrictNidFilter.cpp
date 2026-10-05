@@ -178,17 +178,9 @@ public:
         const StrictImage image(elfBytes);
         const auto input = image.Build(nidRefs, textSection, textVAddr);
         const auto analysis = UnusedNidFilter::AnalyzeStrictReachability(input);
-        std::vector<NidReference> nonPlt;
-        for (const auto& reference : nidRefs)
-            if (reference.RelocationTypeValue != 7) nonPlt.push_back(reference);
-        const auto originalNonPltCount = nonPlt.size();
-        if (!nonPlt.empty()) nonPlt = MakeUnusedNidFilter()->Filter(nonPlt, elfBytes, textSection, textVAddr);
-        std::set<VirtualAddress> nonPltSlots;
-        for (const auto& reference : nonPlt) nonPltSlots.insert(reference.RelocationAddress);
-        std::cout << "CFG/GOT filtering: " << originalNonPltCount << " -> " << nonPlt.size() << "; filtered=" << originalNonPltCount - nonPlt.size() << "\n";
         std::vector<NidReference> result;
         for (const auto& reference : nidRefs) {
-            if (reference.RelocationTypeValue == 7 ? analysis.ImportSlots.contains(reference.RelocationAddress) : nonPltSlots.contains(reference.RelocationAddress)) result.push_back(reference);
+            if (analysis.ImportSlots.contains(reference.RelocationAddress)) result.push_back(reference);
         }
         std::cout << "Strict reachability: " << analysis.Instructions.size() << " instructions; conservative indirect transfers=" << analysis.IndirectTransfers << "\n";
         std::cout << "Function graph: " << analysis.LiveRegions << "/" << analysis.TotalRegions << " live regions; address-taken roots=" << analysis.AddressTakenRoots << "; unwind functions=" << input.Functions.size() << "\n";

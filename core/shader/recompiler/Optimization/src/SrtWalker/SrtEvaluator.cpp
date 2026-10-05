@@ -3,6 +3,9 @@
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -39,8 +42,7 @@ bool Evaluator::EvaluateWide(IrValue* raw, std::uint64_t& result) {
     if (_activeMask != nullptr && IsRuntimeSelect(inst->Opcode()) && inst->ArgumentCount() == 3 && inst->Argument(0)->Resolve() == _activeMask) {
         return EvaluateWide(inst->Argument(1), result);
     }
-    if (const auto found = _cache.find(inst); found != _cache.end()) {
-        result = found->second;
+    if (_cache.Find(inst, result)) {
         return true;
     }
     if (std::find(_visiting.begin(), _visiting.end(), inst) != _visiting.end()) {
@@ -51,9 +53,11 @@ bool Evaluator::EvaluateWide(IrValue* raw, std::uint64_t& result) {
     const bool evaluated = EvaluateInst(*inst, out);
     _visiting.pop_back();
     if (!evaluated) {
+        static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
+        if (debug) std::fprintf(stderr, "[srt] cannot evaluate %s (%zu arguments)\n", std::string(IrOpcodeName(inst->Opcode())).c_str(), inst->ArgumentCount());
         return false;
     }
-    _cache.emplace(inst, out);
+    _cache.Insert(inst, out);
     result = out;
     return true;
 }
@@ -147,6 +151,10 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
         if (!AddSignedAddress(base & ~std::uint64_t {3}, relative, address)) {
             return false;
         }
+    }
+    if (auto* trace = _runtime.readTrace; trace != nullptr) {
+        if (&inst == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
+        else trace->otherReads.push_back(address);
     }
     std::uint32_t word = 0;
     if (_runtime.readMemory != nullptr) {

@@ -6,6 +6,8 @@
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <cstdint>
 #include <vector>
+#include <span>
+#include <string_view>
 
 namespace ShaderRecompiler {
 
@@ -13,6 +15,10 @@ struct SpirvTargetOptions {
     std::uint32_t vulkanVersion;
     std::uint32_t spirvVersion;
     std::uint32_t subgroupSize;
+    std::uint32_t bdaAbiVersion;
+    std::span<const std::uint32_t> supportedCapabilities;
+    std::span<const std::string_view> supportedExtensions;
+    bool nonConstantImageOffsets = false;
 };
 
 class SpirvEmitter {

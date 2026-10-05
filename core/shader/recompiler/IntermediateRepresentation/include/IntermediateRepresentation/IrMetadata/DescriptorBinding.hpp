@@ -49,11 +49,15 @@ struct IrBindingLayout {
     std::uint32_t pushDataStartDword = PushData::NoStart;
     std::uint32_t memoryOffsetDword = 0;
     std::uint32_t memoryOffsetCount = 0;
+    bool dispatchThreadLimit = false;
     std::vector<std::uint32_t> userDataRegisters;
     std::vector<IrDescriptorBinding> descriptors;
 
-    [[nodiscard]] std::uint32_t ShaderDataDwords() const {
+    [[nodiscard]] std::uint32_t DispatchThreadLimitDword() const {
         return memoryOffsetDword + (memoryOffsetCount + 3u) / 4u;
+    }
+    [[nodiscard]] std::uint32_t ShaderDataDwords() const {
+        return DispatchThreadLimitDword() + (dispatchThreadLimit ? 3u : 0u);
     }
     [[nodiscard]] bool UsesPushData() const {
         return pushDataStartDword != PushData::NoStart;

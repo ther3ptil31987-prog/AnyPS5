@@ -7,7 +7,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -46,6 +49,7 @@ struct ImageSampleLayout {
     std::uint32_t bias = NoImageComponent;
     std::uint32_t coord = 0;
     std::uint32_t lod = NoImageComponent;
+    std::uint32_t clamp = NoImageComponent;
     std::uint32_t gradX = NoImageComponent;
     std::uint32_t gradY = NoImageComponent;
 };
@@ -63,6 +67,7 @@ struct MemoryResourceAccess {
     std::uint32_t indexOffset = 0;
     std::uint32_t byteOffset = 0;
     bool addIndexOffset = false;
+    std::uint32_t memoryAccess = 0;
 };
 
 struct SpirvEmitterState {
@@ -77,13 +82,39 @@ struct SpirvEmitterState {
 
     SpirvRequirements requirements;
     std::uint32_t laneCount = 1;
+    bool splitSubgroup = false;
+    std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
+    // The target's SPIR-V version and what the device accepts, for capabilities an emitter adds
+    // only when needed (bindless image tables: see TableImageIndex).
+    std::uint32_t spirvVersion = 0x00010300u;
+    std::span<const std::uint32_t> supportedCapabilities;
+    std::span<const std::string_view> supportedExtensions;
+    bool nonConstantImageOffsets = false;
+    // A bindless table's runtime slot is wave-uniform; it is uniform over the invocation group
+    // only for a single-wave compute workgroup, elsewhere it needs the NonUniform decoration.
+    bool tableIndexNonUniform = true;
     std::uint32_t storageBufferVariable = 0;
     std::uint32_t storageBufferU64Variable = 0;
     std::array<std::uint32_t, ShaderInfo::MaxBuffers> memoryByteOffsets {};
     std::uint32_t bdaPagetableVariable = 0;
     std::uint32_t faultBufferVariable = 0;
     std::uint32_t bdaPointerFunction = 0;
+    // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when
+    // every read takes the byte path.
+    std::uint32_t bdaProbeFunction = 0;
+    std::uint32_t bdaWritePointerFunction = 0;
+    std::uint32_t bdaNoteWriteFunction = 0;
+    // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
+    bool bdaStopsInvocations = true;
+    // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across
+    // host invocations (see WaveLdsScope); 0 when none are emitted.
+    std::uint32_t waveLdsScope = 0;
+    // Debug aid (APS5_LOOP_GUARD=<exits>): after that many evaluated loop exits an invocation leaves its
+    // loops, and the first loop that ran out is reported as a LoopLimit fault instead of hanging the GPU.
+    std::uint32_t loopGuardLimit = 0;
+    std::uint32_t loopGuardVisits = 0;
+    std::uint32_t loopGuardPc = 0;
     std::uint32_t gdsVariable = 0;
     std::uint32_t gdsLength = 0;
     std::uint32_t pushConstantVariable = 0;

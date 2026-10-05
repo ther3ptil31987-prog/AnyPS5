@@ -2,7 +2,9 @@
 #define CORE_LIBS_PRX_LIBSCEVIDEOOUT_INCLUDE_VIDEOOUTDRIVER_HPP
 
 #include <array>
+#include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <list>
 #include <mutex>
@@ -14,27 +16,44 @@
 #include <stdexcept>
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
+#include "prx/libSceVideoOut/include/DisplayWindow.hpp"
+#include "prx/libSceVideoOut/include/BufferReuseTracker.hpp"
+#include "prx/libc/include/Shutdown.hpp"
 
 #include "SDL.h"
 #include "SceTypes.hpp"
 
 static constexpr int VIDEO_OUT_ERROR_INVALID_VALUE = -2144796671;
 static constexpr int VIDEO_OUT_ERROR_INVALID_ADDRESS = -2144796670;
-static constexpr int VIDEO_OUT_ERROR_INVALID_HANDLE = -2144796669;
-static constexpr int VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE = -2144796668;
-static constexpr int VIDEO_OUT_ERROR_INVALID_INDEX = -2144796667;
-static constexpr int VIDEO_OUT_ERROR_INVALID_OPTION = -2144796666;
-static constexpr int VIDEO_OUT_ERROR_INVALID_CATEGORY = -2144796664;
-static constexpr int VIDEO_OUT_ERROR_SLOT_OCCUPIED = -2144796663;
-static constexpr int VIDEO_OUT_ERROR_RESOURCE_BUSY = -2144796656;
+static constexpr int VIDEO_OUT_ERROR_INVALID_HANDLE = -2144796661;
+static constexpr int VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE = -2144796660;
+static constexpr int VIDEO_OUT_ERROR_INVALID_INDEX = -2144796662;
+static constexpr int VIDEO_OUT_ERROR_INVALID_OPTION = -2144796646;
+static constexpr int VIDEO_OUT_ERROR_INVALID_CATEGORY = -2144796643;
+static constexpr int VIDEO_OUT_ERROR_SLOT_OCCUPIED = -2144796656;
+static constexpr int VIDEO_OUT_ERROR_RESOURCE_BUSY = -2144796663;
 static constexpr int VIDEO_OUT_ERROR_FLIP_QUEUE_FULL = -2144796654;
-static constexpr int VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE = -2144796634;
-static constexpr int VIDEO_OUT_ERROR_UNAVAILABLE_OUTPUT_MODE = -2144796633;
-static constexpr int VIDEO_OUT_ERROR_INVALID_EVENT = -2144796624;
+static constexpr int VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE = -2144796650;
+static constexpr int VIDEO_OUT_ERROR_UNAVAILABLE_OUTPUT_MODE = -2144796647;
+static constexpr int VIDEO_OUT_ERROR_INVALID_EVENT = -2144796659;
 
 static constexpr int VIDEO_OUT_BUS_TYPE_MAIN = 0;
 static constexpr int VIDEO_OUT_BUS_TYPE_OVERLAY = 1;
 static constexpr int VIDEO_OUT_BUS_TYPE_SUB = 2;
+
+static constexpr std::uint32_t VIDEO_OUT_OPEN_PARAM_FIRST_WORD = 16;
+static constexpr std::int32_t VIDEO_OUT_SERVICE_THREAD_PRIORITY_HIGHEST = 256;
+static constexpr std::int32_t VIDEO_OUT_SERVICE_THREAD_PRIORITY_LOWEST = 767;
+static constexpr std::uint64_t VIDEO_OUT_SERVICE_THREAD_AFFINITY_ALL = 0x1FFF;
+
+struct VideoOutOpenParam {
+    std::uint32_t firstWord;
+    std::uint32_t setPriority;
+    std::int32_t priority;
+    std::uint32_t setAffinity;
+    std::uint64_t affinity;
+};
+static_assert(offsetof(VideoOutOpenParam, affinity) == 16);
 
 static constexpr int VIDEO_OUT_BUFFER_NUM_MAX = 16;
 static constexpr int VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX = 4;
@@ -97,8 +116,10 @@ struct VideoOutConfig {
     bool opened = false;
     bool closing = false;
     std::exception_ptr failure;
+    std::stop_token shutdownToken = LibcShutdownToken_nid_postfix();
     int flipRate = 0;
     uint64_t lastFlipVblank = 0;
+    std::chrono::steady_clock::time_point lastTimingFlip{};
     uint64_t outputMode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
     float gamma = 1.0f;
 
@@ -108,10 +129,12 @@ struct VideoOutConfig {
 
     std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX> buffers{};
     std::array<uint32_t, VIDEO_OUT_BUFFER_NUM_MAX> bufferPending{};
+    std::array<BufferReuseTracker, VIDEO_OUT_BUFFER_NUM_MAX> bufferReuse;
     std::array<BufferAttributeGroup, VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX> groups{};
 
     void Check() const {
         if (failure) std::rethrow_exception(failure);
+        if (shutdownToken.stop_requested()) throw ProcessShutdown{};
         if (!opened || closing) throw std::runtime_error("VideoOut: port is closed");
     }
 };
@@ -119,9 +142,11 @@ struct VideoOutConfig {
 struct FlipQueue;
 
 struct FlipRequest final : AgcDriver::IFlipRequest, std::enable_shared_from_this<FlipRequest> {
+    std::uint64_t reuseTicket = 0;
     std::shared_ptr<VideoOutConfig> cfg;
     std::shared_ptr<FlipQueue> queue;
     uint64_t generation = 0;
+    std::uint32_t outputHandle = 0;
     int index = 0;
     int flipMode = 0;
     int flipRate = 0;
@@ -135,8 +160,11 @@ struct FlipRequest final : AgcDriver::IFlipRequest, std::enable_shared_from_this
     bool gpuComplete = false;
     bool terminal = false;
 
+    std::shared_ptr<AgcDriver::FrameTiming> timing;
+    std::chrono::steady_clock::time_point queuedAt;
+
     ~FlipRequest() override;
-    void GpuReady() override;
+    void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameTiming) override;
     void Fail(std::exception_ptr error) noexcept override;
 };
 
@@ -165,7 +193,8 @@ public:
     std::shared_ptr<VideoOutConfig> GetConfig(int handle);
     bool IsOpen(int handle);
 
-    void SubmitFlip(int handle, int index, int flipMode, int64_t flipArg);
+    // 0, or VIDEO_OUT_ERROR_FLIP_QUEUE_FULL when the title has VIDEO_OUT_FLIP_QUEUE_CAPACITY flips pending.
+    int SubmitFlip(int handle, int index, int flipMode, int64_t flipArg);
 
 private:
     bool close(int handle);
@@ -182,7 +211,7 @@ private:
     std::array<std::shared_ptr<AgcDriver::IVideoOutput>, VIDEO_OUT_NUM_MAX> outputs;
     std::shared_ptr<FlipQueue> flipQueue = std::make_shared<FlipQueue>();
 
-    SDL_Window* window = nullptr;
+    DisplayWindow window;
 
     std::jthread presentThread;
     std::jthread vblankThread;

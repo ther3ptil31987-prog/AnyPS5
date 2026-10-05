@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <elfpatcher/windows/WindowsDependencyStubBuilder.hpp>
 #include <elfpatcher/windows/WindowsPeWriter.hpp>
+#include <elfpatcher/windows/WindowsImportBuilder.hpp>
 #include <io/BufferUtils.hpp>
 #include <filesystem>
 #include <fstream>
@@ -13,6 +14,29 @@ namespace {
 
 namespace Fs = std::filesystem;
 using namespace Elfpatcher::Windows;
+
+void checkRuntimeDependencies() {
+    const auto check = [](const std::vector<std::string>& input, const std::vector<std::string>& expected) {
+        Domain::SysVDynamicSection dynamic;
+        for (const auto& name : input) {
+            const auto offset = dynamic.DynStrData.size();
+            dynamic.DynStrData.insert(dynamic.DynStrData.end(), name.begin(), name.end());
+            dynamic.DynStrData.push_back(0);
+            const auto position = dynamic.DynamicSegmentData.size();
+            dynamic.DynamicSegmentData.resize(position + 16);
+            Io::WriteU64(dynamic.DynamicSegmentData, position, 1);
+            Io::WriteU64(dynamic.DynamicSegmentData, position + 8, offset);
+        }
+        if (WindowsImportBuilder{}.ReadLibraries(dynamic) != expected)
+            throw std::runtime_error("Incorrect Windows runtime dependency visibility");
+    };
+    check({}, {});
+    check({"libkernel.prx"}, {"libkernel.prx"});
+    check({"libSceLibcInternal.prx", "libkernel.prx"},
+          {"libSceLibcInternal.prx", "libkernel.prx", "libc.prx"});
+    check({"libc.prx", "libSceLibcInternal.prx"},
+          {"libc.prx", "libSceLibcInternal.prx"});
+}
 
 void writeFile(const Fs::path& path, const std::vector<std::uint8_t>& bytes) {
     std::ofstream stream(path, std::ios::binary);
@@ -154,6 +178,7 @@ void expectDiagnostic(const Fs::path& runner, const std::vector<std::string>& ex
 
 int main() {
     try {
+        checkRuntimeDependencies();
         std::vector<char> filename(32768);
         const auto size = GetModuleFileNameA(nullptr, filename.data(), static_cast<DWORD>(filename.size()));
         if (size == 0 || size >= filename.size())

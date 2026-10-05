@@ -5,7 +5,7 @@
 
 namespace Elfpatcher::Windows {
 
-WindowsLoadImage::WindowsLoadImage(const std::vector<std::uint8_t>& source, const std::vector<Domain::ProgramHeader>& headers) {
+WindowsLoadImage::WindowsLoadImage(const std::vector<std::uint8_t>& source, const std::vector<Domain::ProgramHeader>& headers, const bool requireEntry) {
     if (source.size() < 64 || Io::ReadU32(source, 0) != 0x464c457f || source[4] != 2 || source[5] != 1 || source[6] != 1 || Io::ReadU16(source, 18) != 62)
         throw Domain::RelinkerException("Windows output requires a little-endian ELF64 x86-64 image");
     const auto type = Io::ReadU16(source, 16);
@@ -50,6 +50,7 @@ WindowsLoadImage::WindowsLoadImage(const std::vector<std::uint8_t>& source, cons
             pageFlags[page] |= flags;
     }
     const auto entry = Io::ReadU64(source, 24);
+    if (!requireEntry && entry == 0) return;
     entryRva = GetRva(entry);
     if ((pageFlags[(entryRva - LoadRva) / SectionAlignment] & SectionExecute) == 0)
         throw Domain::RelinkerException("ELF entry point is not executable", entry);

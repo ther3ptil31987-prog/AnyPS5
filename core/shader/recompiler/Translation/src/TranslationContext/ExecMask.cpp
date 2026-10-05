@@ -146,6 +146,15 @@ void TranslationContext::AddBranchCondition(const BasicBlock& source, BlockInfo&
         case BranchCondition::VccNonZero: condition = IrU1(ir.GetVcc()); break;
         case BranchCondition::ExecZero: condition = IrU1(ir.LogicalNot(ir.GetExec())); break;
         case BranchCondition::ExecNonZero: condition = IrU1(ir.GetExec()); break;
+        case BranchCondition::IndirectTarget: {
+            if (source.terminator.indirectTargetProgramCounters.size() != 1u || source.terminator.indirectPcSgpr == InvalidControlFlowId) {
+                throw std::runtime_error("invalid lowered indirect branch");
+            }
+            auto& base = ir.Emit(IrOpcode::GetShaderBase, IrType::U64, {});
+            const IrU64 target(ir.Emit(IrOpcode::IAdd64, IrType::U64, {&base, &ir.ConstantU64(source.terminator.indirectTargetProgramCounters.front())}));
+            condition = IrU1(ir.IEqual(ir.GetScalarReg(static_cast<ScalarReg>(source.terminator.indirectPcSgpr)), extractU64(target)[0].Value()));
+            break;
+        }
         case BranchCondition::ScalarInstruction:
             if (instructionBranchCondition.Value().IsEmpty()) {
                 throw std::runtime_error("TranslationContext::AddBranchCondition block " + std::to_string(source.id) + " has no scalar branch condition");

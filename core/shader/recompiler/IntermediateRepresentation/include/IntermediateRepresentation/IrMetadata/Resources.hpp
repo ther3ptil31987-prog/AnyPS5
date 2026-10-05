@@ -25,6 +25,7 @@ struct BufferResource {
     bool atomic = false;
     bool formatted = false;
     bool scalar = false;
+    bool empty = false;
 
     bool operator==(const BufferResource& other) const = default;
 };
@@ -49,6 +50,10 @@ struct ImageResource {
     bool depthCompare = false;
     bool cube = false;
     bool r128 = false;
+    bool depthBits = false;
+    bool depthUnorm16 = false;
+    bool packed = false;
+    IrBufferFormat packedFormat = IrBufferFormat::Invalid;
     std::uint32_t indirectRoot = NoIndirectImage;
     std::uint32_t indirectMappingOffset = 0;
     std::uint32_t indirectSearchIterations = 0;

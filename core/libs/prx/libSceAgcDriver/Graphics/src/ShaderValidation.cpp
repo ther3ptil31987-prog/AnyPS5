@@ -1,4 +1,6 @@
+#include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <map>
@@ -16,10 +18,10 @@ struct Decoration {
     std::optional<std::uint32_t> set;
     std::optional<std::uint32_t> binding;
     std::optional<std::uint32_t> stride;
-    bool bufferBlock = false;
+    bool block = false;
     bool patch = false;
     bool perPrimitive = false;
-    bool nonWritable = false;
+    bool perVertex = false;
 };
 
 struct Variable {
@@ -33,13 +35,13 @@ struct Module {
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> builtins;
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> offsets;
     std::map<std::uint32_t, Variable> variables;
-    std::set<std::pair<std::uint32_t, std::uint32_t>> readOnlyMembers;
     std::map<std::uint32_t, std::uint32_t> constants;
     std::set<std::uint32_t> interface;
     std::map<std::uint32_t, std::string> inputs;
     std::map<std::uint32_t, std::string> outputs;
     bool position = false;
     bool primitiveIndices = false;
+    bool fragmentBarycentric = false;
     std::map<std::uint32_t, std::vector<std::uint32_t>> modes;
 
     const std::vector<std::uint32_t>& Type(std::uint32_t id) const {
@@ -73,28 +75,20 @@ struct Module {
         return location + 1;
     }
 
-    std::uint64_t Size(std::uint32_t id, std::uint32_t depth = 0) {
-        Require(depth < 8, "SPIR-V push constant type nesting exceeds supported depth");
-        const auto& type = Type(id);
-        const auto op = static_cast<spv::Op>(type[0] & 0xffffu);
-        if ((op == spv::OpTypeInt || op == spv::OpTypeFloat) && type.size() >= 3 && type[2] == 32) return 4;
-        if (op == spv::OpTypeVector && type.size() == 4 && type[3] >= 2 && type[3] <= 4) return Size(type[2], depth + 1) * type[3];
-        if (op == spv::OpTypeArray && type.size() == 4) {
-            const auto count = constants.find(type[3]);
-            const auto stride = decorations[id].stride;
-            Require(count != constants.end() && count->second != 0 && count->second <= StagePushConstantBytes && stride.has_value(), "invalid push constant array");
-            const auto elementSize = Size(type[2], depth + 1);
-            Require(*stride >= elementSize && *stride <= StagePushConstantBytes, "invalid push constant array stride");
-            return static_cast<std::uint64_t>(count->second - 1) * *stride + elementSize;
-        }
-        throw std::runtime_error("AGC graphics: unsupported push constant member type");
-    }
-
-    void Builtin(std::uint32_t value, std::uint32_t type, std::uint32_t storage, ShaderRecompiler::ShaderStage stage) {
+    void Builtin(std::uint32_t value, std::uint32_t type, std::uint32_t storage, ShaderRecompiler::ShaderStage stage, const VkPhysicalDeviceSubgroupProperties& subgroup) {
         using Stage = ShaderRecompiler::ShaderStage;
         const bool vertex = stage == Stage::Vertex || stage == Stage::Local;
         const bool input = storage == spv::StorageClassInput;
         const auto& raw = Type(type);
+        if (value == spv::BuiltInBaryCoordKHR || value == spv::BuiltInBaryCoordNoPerspKHR) {
+            Require(fragmentBarycentric && stage == Stage::Fragment && input && Signature(type) == "f32x3", "invalid barycentric built-in: expected fragment Float32 vec3 input with FragmentBarycentricKHR");
+            return;
+        }
+        if (value == spv::BuiltInSubgroupLocalInvocationId) {
+            Require(input && Signature(type) == "u32", "invalid subgroup local invocation ID input");
+            Require((subgroup.supportedStages & VulkanStage(stage)) != 0 && (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0, "subgroup local invocation ID is unsupported for this shader stage");
+            return;
+        }
         if ((value == spv::BuiltInTessLevelOuter || value == spv::BuiltInTessLevelInner) && (stage == Stage::TessellationControl || stage == Stage::TessellationEvaluation)) {
             Require(raw.size() == 4 && (raw[0] & 0xffffu) == spv::OpTypeArray && Signature(raw[2]) == "f32", "invalid tessellation level type");
             const auto count = constants.find(raw[3]);
@@ -124,12 +118,12 @@ struct Module {
             Require(value == spv::BuiltInPosition && signature == "f32x4" && !position, "unsupported or duplicate vertex built-in output");
             position = true;
         } else {
-            Require(storage == spv::StorageClassInput && ((value == spv::BuiltInFragCoord && signature == "f32x4") || (value == spv::BuiltInFrontFacing && signature == "bool")), "unsupported fragment built-in");
+            Require(storage == spv::StorageClassInput && ((value == spv::BuiltInFragCoord && signature == "f32x4") || ((value == spv::BuiltInFrontFacing || value == spv::BuiltInHelperInvocation) && signature == "bool")), "unsupported fragment built-in");
         }
     }
 };
 
-Module Inspect(const CompiledShader& compiled, const State& state) {
+Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysicalDeviceSubgroupProperties& subgroup, bool fragmentShaderBarycentric, bool descriptorIndexing) {
     using Stage = ShaderRecompiler::ShaderStage;
     Require(compiled.program != nullptr, "missing compiled shader");
     const auto& shader = *compiled.program;
@@ -139,9 +133,22 @@ Module Inspect(const CompiledShader& compiled, const State& state) {
     const bool mesh = stage == Stage::Mesh;
     const bool control = stage == Stage::TessellationControl;
     const bool evaluation = stage == Stage::TessellationEvaluation;
+    const bool rectListControl = state.rectList && control;
+    if (rectListControl) {
+        Require(shader.bdaAbiVersion == ShaderRecompiler::BdaAbi::Version, "incompatible rect-list fault ABI version");
+        Require(shader.bindings.size() == 1, "rect-list control shader must declare exactly one fault buffer");
+        const auto& binding = shader.bindings.front();
+        Require(binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer && binding.kind == ShaderRecompiler::DescriptorKind::StorageBuffer && binding.descriptorSet == 0 && binding.count == 1 && binding.guestDescriptor.empty() && !binding.readOnly, "invalid rect-list fault buffer contract");
+    }
     const auto model = mesh ? spv::ExecutionModelMeshEXT : control ? spv::ExecutionModelTessellationControl : evaluation ? spv::ExecutionModelTessellationEvaluation : vertex ? spv::ExecutionModelVertex : spv::ExecutionModelFragment;
     const auto& words = shader.spirv;
-    Require(words.size() >= 5 && words[0] == spv::MagicNumber && words[1] >= 0x10000u && words[1] <= 0x10400u && words[3] != 0 && words[4] == 0, "invalid or unsupported SPIR-V header");
+
+    Require(words.size() >= 5, "SPIR-V header is truncated: " + std::to_string(words.size()) + " words");
+    Require(words[0] == spv::MagicNumber, "invalid SPIR-V magic number: " + std::to_string(words[0]));
+    Require(words[1] >= 0x10000u && words[1] <= 0x10400u, "unsupported SPIR-V version: " + std::to_string(words[1]));
+    Require(words[3] != 0, "invalid SPIR-V bound: 0");
+    Require(words[4] == 0, "unsupported SPIR-V schema: " + std::to_string(words[4]));
+
     Module module;
     std::uint32_t entries = 0;
     std::uint32_t memoryModels = 0;
@@ -154,14 +161,98 @@ Module Inspect(const CompiledShader& compiled, const State& state) {
         const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
         const auto instruction = std::span(words).subspan(cursor, count);
         switch (op) {
-            case spv::OpCapability:
-                Require(count == 2 && (instruction[1] == spv::CapabilityShader || ((control || evaluation) && instruction[1] == spv::CapabilityTessellation) || (mesh && instruction[1] == spv::CapabilityMeshShadingEXT)), "SPIR-V requires an unsupported device capability");
+            case spv::OpCapability: {
+                Require(count == 2, "invalid OpCapability instruction");
+
+                const auto capability = static_cast<spv::Capability>(instruction[1]);
+                const bool isBarycentricCapability = capability == spv::CapabilityFragmentBarycentricKHR;
+                if (isBarycentricCapability) {
+                    Require(fragment, "FragmentBarycentricKHR requires a fragment shader");
+                    Require(fragmentShaderBarycentric, "device does not support enabled VK_KHR_fragment_shader_barycentric with fragmentShaderBarycentric");
+                    module.fragmentBarycentric = true;
+                }
+                VkSubgroupFeatureFlags subgroupOperations = 0;
+                switch (capability) {
+                    case spv::CapabilityGroupNonUniform: subgroupOperations = VK_SUBGROUP_FEATURE_BASIC_BIT; break;
+                    case spv::CapabilityGroupNonUniformBallot: subgroupOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT; break;
+                    case spv::CapabilityGroupNonUniformShuffle: subgroupOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT; break;
+                    default: break;
+                }
+                const bool isSubgroupCapability = subgroupOperations != 0;
+                if (isSubgroupCapability) {
+                    Require((subgroup.supportedStages & VulkanStage(stage)) != 0, "subgroup capability " + std::to_string(instruction[1]) + " is unsupported for shader stage " + std::to_string(VulkanStage(stage)));
+                    Require((subgroup.supportedOperations & subgroupOperations) == subgroupOperations, "device lacks operations for subgroup capability " + std::to_string(instruction[1]));
+                }
+
+                const bool isBaseCapability =
+                    capability == spv::CapabilityShader ||
+                    capability == spv::CapabilitySignedZeroInfNanPreserve;
+
+                const bool isBdaCapability =
+                    shader.bdaAbiVersion == ShaderRecompiler::BdaAbi::Version &&
+                    (capability == spv::CapabilityInt64 ||
+                     capability == spv::CapabilityPhysicalStorageBufferAddresses ||
+                     capability == spv::CapabilityStorageBuffer8BitAccess);
+
+                const bool isTessellationCapability =
+                    (control || evaluation) &&
+                    capability == spv::CapabilityTessellation;
+
+                const bool isMeshCapability =
+                    mesh &&
+                    capability == spv::CapabilityMeshShadingEXT;
+
+                // Enabled unconditionally or by the device setup in VulkanDevice.
+                const bool isFeatureCapability =
+                    capability == spv::CapabilitySampled1D ||
+                    capability == spv::CapabilityImage1D ||
+                    capability == spv::CapabilityImageGatherExtended ||
+                    capability == spv::CapabilityImageQuery ||
+                    capability == spv::CapabilityStorageImageWriteWithoutFormat ||
+                    capability == spv::CapabilityStorageImageReadWithoutFormat ||
+                    capability == spv::CapabilityInt64 ||
+                    capability == spv::CapabilityInt16 ||
+                    capability == spv::CapabilityFloat16 ||
+                    capability == spv::CapabilityFloat64 ||
+                    capability == spv::CapabilityStorageBuffer8BitAccess ||
+                    capability == spv::CapabilityPhysicalStorageBufferAddresses ||
+                    capability == spv::CapabilitySampledImageArrayDynamicIndexing ||
+                    capability == spv::CapabilityStorageImageArrayDynamicIndexing;
+
+                // Bindless image tables index their slots non-uniformly in graphics stages
+                // (VK_EXT_descriptor_indexing, enabled by the device setup when available).
+                const bool isDescriptorIndexingCapability =
+                    descriptorIndexing &&
+                    (capability == spv::CapabilityShaderNonUniform ||
+                     capability == spv::CapabilitySampledImageArrayNonUniformIndexing ||
+                     capability == spv::CapabilityStorageImageArrayNonUniformIndexing);
+
+                Require(
+                    isBaseCapability ||
+                    isBarycentricCapability ||
+                    isSubgroupCapability ||
+                    isBdaCapability ||
+                    isTessellationCapability ||
+                    isMeshCapability ||
+                    isFeatureCapability ||
+                    isDescriptorIndexingCapability,
+                    std::string("SPIR-V requires unsupported device capability ") +
+                        std::to_string(static_cast<std::uint32_t>(capability)));
+
                 break;
+            }
+
             case spv::OpExtension: {
                 const auto bytes = std::as_bytes(instruction.subspan(1));
                 const auto* text = reinterpret_cast<const char*>(bytes.data());
                 const auto end = std::find(text, text + bytes.size(), '\0');
-                Require(mesh && end != text + bytes.size() && std::string_view(text, static_cast<std::size_t>(end - text)) == "SPV_EXT_mesh_shader", "unsupported SPIR-V extension");
+                Require(end != text + bytes.size(), "unterminated SPIR-V extension");
+                const std::string_view extension(text, static_cast<std::size_t>(end - text));
+                if (extension == "SPV_KHR_fragment_shader_barycentric") {
+                    Require(fragment && fragmentShaderBarycentric, "SPV_KHR_fragment_shader_barycentric requires enabled fragmentShaderBarycentric in a fragment shader");
+                    break;
+                }
+                Require(extension == "SPV_KHR_float_controls" || (mesh && (extension == "SPV_EXT_mesh_shader" || extension == "SPV_KHR_physical_storage_buffer")) || (descriptorIndexing && extension == "SPV_EXT_descriptor_indexing") || (shader.bdaAbiVersion == ShaderRecompiler::BdaAbi::Version && (extension == "SPV_KHR_physical_storage_buffer" || extension == "SPV_KHR_8bit_storage")), "unsupported SPIR-V extension");
                 break;
             }
             case spv::OpDecorateId:
@@ -174,10 +265,15 @@ Module Inspect(const CompiledShader& compiled, const State& state) {
             case spv::OpSpecConstantComposite:
             case spv::OpSpecConstantOp:
                 throw std::runtime_error("AGC graphics: unsupported SPIR-V extension, grouped decoration or specialization constant");
-            case spv::OpMemoryModel:
-                Require(count == 3 && instruction[1] == spv::AddressingModelLogical && instruction[2] == spv::MemoryModelGLSL450, "unsupported SPIR-V memory model");
+            case spv::OpMemoryModel: {
+                // Address-based shaders use PhysicalStorageBuffer64; everything else (including the
+                // generated rect-list stages) is Logical.
+                Require(count == 3, "invalid SPIR-V OpMemoryModel word count: " + std::to_string(count));
+                Require(instruction[1] == spv::AddressingModelPhysicalStorageBuffer64 || instruction[1] == spv::AddressingModelLogical, "unsupported SPIR-V addressing model: " + std::to_string(instruction[1]));
+                Require(instruction[2] == spv::MemoryModelGLSL450, "unsupported SPIR-V memory model: " + std::to_string(instruction[2]));
                 ++memoryModels;
                 break;
+            }
             case spv::OpEntryPoint:
                 Require(count >= 5 && instruction[1] == model && instruction[3] == 0x6e69616du && instruction[4] == 0, "expected a main entry point for the assigned graphics stage");
                 entryPoint = instruction[2];
@@ -185,6 +281,11 @@ Module Inspect(const CompiledShader& compiled, const State& state) {
                 for (std::size_t i = 5; i < count; ++i) Require(module.interface.insert(instruction[i]).second, "duplicate SPIR-V interface ID");
                 break;
             case spv::OpExecutionMode:
+                if (count == 4 && instruction[2] == spv::ExecutionModeSignedZeroInfNanPreserve) {
+                    Require(instruction[3] == 32u || instruction[3] == 64u, "SignedZeroInfNanPreserve requires Float32 or Float64");
+                    executionModeTargets.insert(instruction[1]);
+                    break;
+                }
                 Require(count >= 3 && module.modes.emplace(instruction[2], std::vector<std::uint32_t>(instruction.begin() + 3, instruction.end())).second, "duplicate or malformed execution mode");
                 executionModeTargets.insert(instruction[1]);
                 if (instruction[2] == spv::ExecutionModeOriginUpperLeft) upperLeft = true;
@@ -204,13 +305,15 @@ Module Inspect(const CompiledShader& compiled, const State& state) {
                 Require(kind != spv::DecorationComponent && kind != spv::DecorationIndex && kind != spv::DecorationStream && kind != spv::DecorationXfbBuffer && kind != spv::DecorationXfbStride, "unsupported shader interface packing or transform feedback");
                 if (kind == spv::DecorationPatch) decoration.patch = true;
                 if (kind == spv::DecorationPerPrimitiveEXT) decoration.perPrimitive = true;
-                if (kind == spv::DecorationNonWritable) decoration.nonWritable = true;
-                if (kind == spv::DecorationBufferBlock) decoration.bufferBlock = true;
+                if (kind == spv::DecorationPerVertexKHR) {
+                    Require(count == 3, "malformed PerVertexKHR decoration");
+                    decoration.perVertex = true;
+                }
+                if (kind == spv::DecorationBlock) decoration.block = true;
                 break;
             }
             case spv::OpMemberDecorate:
                 Require(count >= 4, "malformed SPIR-V member decoration");
-                if (instruction[3] == spv::DecorationNonWritable) module.readOnlyMembers.emplace(instruction[1], instruction[2]);
                 if (instruction[3] == spv::DecorationBuiltIn || instruction[3] == spv::DecorationOffset) {
                     Require(count == 5, "malformed SPIR-V member literal decoration");
                     auto& fields = instruction[3] == spv::DecorationBuiltIn ? module.builtins : module.offsets;
@@ -248,18 +351,20 @@ Module Inspect(const CompiledShader& compiled, const State& state) {
     if (mesh) {
         Require(state.stages.mesh.has_value(), "mesh configuration is missing");
         const auto& config = *state.stages.mesh;
-        mode(spv::ExecutionModeLocalSize, {config.threadsPerGroup, 1, 1});
+        const auto local = module.modes.find(spv::ExecutionModeLocalSize);
+        const bool paired = state.stages.vertexWaveSize == 64u && subgroup.subgroupSize == 32u && local != module.modes.end() && local->second == std::vector<std::uint32_t>{config.threadsPerGroup / 2u, 1, 1};
+        mode(spv::ExecutionModeLocalSize, {paired ? config.threadsPerGroup / 2u : config.threadsPerGroup, 1, 1});
         mode(spv::ExecutionModeOutputVertices, {config.maxVertices});
         mode(spv::ExecutionModeOutputPrimitivesEXT, {config.maxPrimitives});
         mode(spv::ExecutionModeOutputTrianglesEXT, {});
         Require(module.modes.size() == 4, "unsupported mesh execution mode");
     } else if (control) {
-        Require(state.stages.tessellation.has_value(), "tessellation configuration is missing");
-        mode(spv::ExecutionModeOutputVertices, {state.stages.tessellation->outputControlPoints});
+        Require(state.rectList || state.stages.tessellation.has_value(), "tessellation configuration is missing");
+        mode(spv::ExecutionModeOutputVertices, {state.rectList ? 4u : state.stages.tessellation->outputControlPoints});
         Require(module.modes.size() == 1, "unsupported tessellation-control execution mode");
     } else if (evaluation) {
-        mode(spv::ExecutionModeTriangles, {});
-        mode(spv::ExecutionModeSpacingFractionalOdd, {});
+        mode(state.rectList ? spv::ExecutionModeQuads : spv::ExecutionModeTriangles, {});
+        mode(state.rectList ? spv::ExecutionModeSpacingEqual : spv::ExecutionModeSpacingFractionalOdd, {});
         mode(spv::ExecutionModeVertexOrderCw, {});
         Require(module.modes.size() == 3, "unsupported tessellation-evaluation execution mode");
     } else if (fragment) {
@@ -278,6 +383,13 @@ Module Inspect(const CompiledShader& compiled, const State& state) {
         const bool tessellationLevels = decoration.builtin && (*decoration.builtin == spv::BuiltInTessLevelOuter || *decoration.builtin == spv::BuiltInTessLevelInner);
         const bool vertexArray = !tessellationLevels && ((control && (input || output)) || (evaluation && input) || (mesh && output)) && !decoration.patch;
         const auto& outer = module.Type(typeId);
+        if (decoration.perVertex) {
+            Require(fragment && input && module.fragmentBarycentric && !decoration.patch && !decoration.perPrimitive && !decoration.builtin && decoration.location.has_value(), "PerVertexKHR requires a fragment location input with FragmentBarycentricKHR");
+            Require(outer.size() == 4 && (outer[0] & 0xffffu) == spv::OpTypeArray, "PerVertexKHR input must be an array");
+            const auto length = module.constants.find(outer[3]);
+            Require(length != module.constants.end() && length->second == 3, "PerVertexKHR input must contain three vertices");
+            typeId = outer[2];
+        }
         if (vertexArray && (outer[0] & 0xffffu) == spv::OpTypeArray) {
             Require(outer.size() == 4, "malformed per-vertex interface array");
             const auto length = module.constants.find(outer[3]);
@@ -286,7 +398,7 @@ Module Inspect(const CompiledShader& compiled, const State& state) {
                 const bool primitive = decoration.perPrimitive || (decoration.builtin && (*decoration.builtin == spv::BuiltInPrimitiveTriangleIndicesEXT || *decoration.builtin == spv::BuiltInCullPrimitiveEXT));
                 Require(length->second == (primitive ? state.stages.mesh->maxPrimitives : state.stages.mesh->maxVertices), "mesh interface array disagrees with output limits");
             } else {
-                const auto expected = control && input ? state.stages.tessellation->inputControlPoints : state.stages.tessellation->outputControlPoints;
+                const auto expected = state.rectList ? (control && input ? 3u : 4u) : control && input ? state.stages.tessellation->inputControlPoints : state.stages.tessellation->outputControlPoints;
                 Require(length->second == expected, "tessellation interface array disagrees with control-point count");
             }
             typeId = outer[2];
@@ -297,48 +409,80 @@ Module Inspect(const CompiledShader& compiled, const State& state) {
             if (decoration.location) {
                 Require(!vertexArray || (outer[0] & 0xffffu) == spv::OpTypeArray, "per-vertex interface lacks a control-point or mesh-output dimension");
                 Require(!decoration.perPrimitive, "per-primitive user outputs are unsupported");
-                Require(!decoration.builtin && !(vertex && variable.storage == spv::StorageClassInput), "vertex attributes require unsupported vertex input bindings");
+                Require(!decoration.builtin, "shader input cannot have both location and built-in decorations");
                 auto& locations = variable.storage == spv::StorageClassInput ? module.inputs : module.outputs;
                 module.AddLocations(locations, *decoration.location, typeId, decoration.patch);
             } else if (decoration.builtin) {
-                module.Builtin(*decoration.builtin, typeId, variable.storage, stage);
+                module.Builtin(*decoration.builtin, typeId, variable.storage, stage, subgroup);
             } else {
                 Require((type[0] & 0xffffu) == spv::OpTypeStruct, "shader interface lacks a location or built-in");
                 for (std::size_t i = 2; i < type.size(); ++i) {
                     const auto builtin = module.builtins.find({typeId, static_cast<std::uint32_t>(i - 2)});
                     Require(builtin != module.builtins.end(), "interface blocks with non-built-in members are unsupported");
-                    module.Builtin(builtin->second, type[i], variable.storage, stage);
+                    module.Builtin(builtin->second, type[i], variable.storage, stage, subgroup);
                 }
             }
         } else if (variable.storage == spv::StorageClassPushConstant) {
-            Require(!push && !shader.pushConstants.empty() && (type[0] & 0xffffu) == spv::OpTypeStruct, "invalid push constant interface");
+            Require(!push && (!shader.pushConstants.empty() || mesh) && (type[0] & 0xffffu) == spv::OpTypeStruct, "invalid push constant interface");
             push = true;
-            const auto first = compiled.pushConstantOffset;
-            for (std::size_t i = 2; i < type.size(); ++i) {
-                const auto offset = module.offsets.find({typeId, static_cast<std::uint32_t>(i - 2)});
-                Require(offset != module.offsets.end(), "push constant member has no offset");
-                Require(offset->second >= first && static_cast<std::uint64_t>(offset->second) + module.Size(type[i]) <= first + shader.pushConstants.size(), "push constant member exceeds its stage range");
-            }
+            Require(type.size() == 3 && module.decorations[typeId].block, "push constant variable must be a Block struct with exactly one member");
+            const auto offset = module.offsets.find({typeId, 0});
+            Require(offset != module.offsets.end() && offset->second == 0, "push constant member must have offset zero");
+            const auto& array = module.Type(type[2]);
+            Require(array.size() == 4 && (array[0] & 0xffffu) == spv::OpTypeArray && module.Signature(array[2]) == "u32", "push constant member must be an array of u32");
+            const auto length = module.constants.find(array[3]);
+            Require(length != module.constants.end() && length->second == PipelinePushConstantBytes / 4, "push constant array must contain 32 elements");
+            const auto stride = module.decorations[type[2]].stride;
+            Require(stride.has_value() && *stride == 4, "push constant array must have an ArrayStride of 4");
         } else if (variable.storage == spv::StorageClassWorkgroup) {
             Require(mesh, "workgroup memory outside a mesh shader");
-        } else {
-            Require((variable.storage == spv::StorageClassUniform || variable.storage == spv::StorageClassStorageBuffer) && decoration.set && decoration.binding, "unsupported or unbound shader resource");
-            Require((type[0] & 0xffffu) == spv::OpTypeStruct, "descriptor arrays and non-buffer shader resources are unsupported");
+        } else if (variable.storage == spv::StorageClassUniformConstant) {
+            Require(decoration.set && decoration.binding, "unbound shader resource");
             const auto key = std::make_pair(*decoration.set, *decoration.binding);
             Require(descriptors.insert(key).second, "duplicate SPIR-V resource binding");
             const auto binding = std::find_if(shader.bindings.begin(), shader.bindings.end(), [&](const auto& item) { return item.descriptorSet == key.first && item.binding == key.second; });
             Require(binding != shader.bindings.end(), "SPIR-V resource is absent from recompiler binding metadata");
-            const auto kind = variable.storage == spv::StorageClassStorageBuffer || module.decorations[typeId].bufferBlock ? ShaderRecompiler::DescriptorKind::StorageBuffer : ShaderRecompiler::DescriptorKind::UniformBuffer;
-            if (kind == ShaderRecompiler::DescriptorKind::StorageBuffer && binding->readOnly) {
-                bool membersReadOnly = type.size() > 2;
-                for (std::size_t member = 2; member < type.size(); ++member) membersReadOnly = membersReadOnly && module.readOnlyMembers.contains({typeId, static_cast<std::uint32_t>(member - 2)});
-                Require(decoration.nonWritable || membersReadOnly, "read-only buffer metadata lacks NonWritable decoration");
+            Require(binding->kind == ShaderRecompiler::DescriptorKind::Sampler || binding->kind == ShaderRecompiler::DescriptorKind::SampledImage || binding->kind == ShaderRecompiler::DescriptorKind::StorageImage, "SPIR-V descriptor type disagrees with recompiler binding metadata");
+        } else {
+            Require(variable.storage == spv::StorageClassStorageBuffer && decoration.set && decoration.binding, "unsupported or unbound shader resource");
+            const auto key = std::make_pair(*decoration.set, *decoration.binding);
+            Require(descriptors.insert(key).second, "duplicate SPIR-V resource binding");
+            const auto binding = std::find_if(shader.bindings.begin(), shader.bindings.end(), [&](const auto& item) { return item.descriptorSet == key.first && item.binding == key.second; });
+            Require(binding != shader.bindings.end(), "SPIR-V resource is absent from recompiler binding metadata");
+            Require(binding->kind == ShaderRecompiler::DescriptorKind::StorageBuffer, "SPIR-V descriptor type disagrees with recompiler binding metadata");
+            Require(!binding->readOnly, "read-only descriptor metadata is unsupported because the recompiler emits no NonWritable decoration");
+            const bool array = binding->role == ShaderRecompiler::DescriptorRole::GuestBuffers;
+            Require(array || (shader.bdaAbiVersion == ShaderRecompiler::BdaAbi::Version && (binding->role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding->role == ShaderRecompiler::DescriptorRole::FaultBuffer)) || binding->role == ShaderRecompiler::DescriptorRole::ShaderData || binding->role == ShaderRecompiler::DescriptorRole::FlattenedSrt, "SPIR-V descriptor role is unsupported");
+            auto blockId = typeId;
+            if (array) {
+                Require(type.size() == 4 && (type[0] & 0xffffu) == spv::OpTypeArray, "guest buffer descriptors must be declared as a descriptor array");
+                const auto count = module.constants.find(type[3]);
+                Require(count != module.constants.end() && count->second == binding->count, "descriptor array length disagrees with recompiler binding count");
+                blockId = type[2];
+            } else {
+                Require(binding->count == 1, "non-array descriptor must have a binding count of one");
             }
-            Require(binding->kind == kind, "SPIR-V descriptor type disagrees with recompiler binding metadata");
+            const auto& block = module.Type(blockId);
+            Require(block.size() == 3 && (block[0] & 0xffffu) == spv::OpTypeStruct && module.decorations[blockId].block, "descriptor must be a Block struct with exactly one member");
+            const auto& words = module.Type(block[2]);
+            Require(words.size() == 3 && (words[0] & 0xffffu) == spv::OpTypeRuntimeArray && module.Signature(words[2]) == "u32", "descriptor block member must be a runtime array of u32");
+            const auto member = module.offsets.find({blockId, 0});
+            Require(member != module.offsets.end() && member->second == 0, "descriptor block member must have offset zero");
         }
     }
+    if (vertex) {
+        std::set<std::uint32_t> locations;
+        for (const auto& attribute : shader.vertexAttributes) {
+            Require(locations.insert(attribute.location).second, "duplicate vertex attribute metadata");
+            const auto input = module.inputs.find(attribute.location);
+            Require(input != module.inputs.end() && input->second == "vertex:" + VertexAttributeSignature(attribute), "vertex attribute metadata disagrees with shader input");
+        }
+        Require(locations.size() == module.inputs.size(), "vertex input is missing attribute metadata");
+    } else {
+        Require(shader.vertexAttributes.empty(), "vertex attribute metadata is invalid for this stage");
+    }
     Require(descriptors.size() == shader.bindings.size(), "recompiler binding metadata contains undeclared resources");
-    Require(push == !shader.pushConstants.empty(), "recompiler push constant metadata disagrees with SPIR-V");
+    Require(push == (!shader.pushConstants.empty() || mesh), "recompiler push constant metadata disagrees with SPIR-V");
     for (const auto id : module.interface) Require(module.variables.contains(id), "entry point interface contains an unknown variable");
     if (mesh) Require(module.primitiveIndices, "mesh shader does not export primitive indices");
     if (stage == Stage::Vertex || mesh || evaluation) Require(module.position, "vertex shader does not export position");
@@ -347,21 +491,23 @@ Module Inspect(const CompiledShader& compiled, const State& state) {
 
 }
 
-void ValidateShaders(std::span<const CompiledShader> shaders, const State& state) {
+std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders, const State& state, const VkPhysicalDeviceSubgroupProperties& subgroup, bool fragmentShaderBarycentric, bool descriptorIndexing) {
     using Stage = ShaderRecompiler::ShaderStage;
     const bool tessellation = state.stages.path == ShaderPath::Tessellation;
     const bool mesh = state.stages.path == ShaderPath::Geometry;
     Require(state.stages.path == ShaderPath::Vertex || tessellation || mesh, "unsupported graphics shader path");
     Require(state.stages.mesh.has_value() == mesh && state.stages.tessellation.has_value() == tessellation, "graphics stage configuration disagrees with its path");
-    Require(shaders.size() == (tessellation ? 4u : 2u), "incorrect graphics stage count");
+    Require(!state.rectList || (state.stages.path == ShaderPath::Vertex && state.topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST && state.cullMode == VK_CULL_MODE_NONE), "invalid rect-list pipeline state");
+    Require(shaders.size() == (tessellation || state.rectList ? 4u : 2u), "incorrect graphics stage count");
     const std::array<Stage, 4> tessStages{Stage::Local, Stage::TessellationControl, Stage::TessellationEvaluation, Stage::Fragment};
+    static_cast<void>(AssemblePushConstants(shaders));
     Module previous;
     for (std::size_t i = 0; i < shaders.size(); ++i) {
-        const auto expected = tessellation ? tessStages[i] : i == 1 ? Stage::Fragment : state.stages.path == ShaderPath::Geometry ? Stage::Mesh : Stage::Vertex;
-        Require(shaders[i].program != nullptr && shaders[i].program->pushConstants.size() <= PushConstantStride(shaders.size()), "graphics push constants exceed the assigned range");
-        Require(shaders[i].stage == expected && shaders[i].pushConstantOffset == i * PushConstantStride(shaders.size()), "graphics stage order or push constant layout disagrees");
-        for (const auto& binding : shaders[i].program->bindings) Require(binding.descriptorSet == i, "graphics resource uses a different stage descriptor set");
-        const auto current = Inspect(shaders[i], state);
+        const auto expected = state.rectList ? (i == 0 ? Stage::Vertex : tessStages[i]) : tessellation ? tessStages[i] : i == 1 ? Stage::Fragment : state.stages.path == ShaderPath::Geometry ? Stage::Mesh : Stage::Vertex;
+        Require(shaders[i].program != nullptr, "missing compiled shader");
+        Require(shaders[i].stage == expected, "graphics stage order disagrees");
+        for (const auto& binding : shaders[i].program->bindings) Require(binding.descriptorSet == 0, "graphics resource uses a descriptor set other than zero");
+        const auto current = Inspect(shaders[i], state, subgroup, fragmentShaderBarycentric, descriptorIndexing);
         if (i != 0) {
             for (const auto& [location, signature] : current.inputs) {
                 const auto output = previous.outputs.find(location);
@@ -370,14 +516,21 @@ void ValidateShaders(std::span<const CompiledShader> shaders, const State& state
         }
         previous = current;
     }
-    Require(previous.outputs.size() == 1 && previous.outputs.contains(0) && previous.outputs.at(0) == "vertex:f32x4", "fragment shader must export one float4 color at location zero");
+    const auto attachments = std::max<std::size_t>(state.blends.size(), 1u);
+    std::set<std::uint32_t> locations;
+    for (const auto& [location, signature] : previous.outputs) {
+        if (location >= attachments) continue;
+        Require(signature == "vertex:f32x4", "fragment shader must export float4 colors to its attachments");
+        locations.insert(location);
+    }
+    return locations;
 }
 
 void ValidateShaderPair(const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment) {
-    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, StagePushConstantBytes}}};
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, static_cast<std::uint32_t>(vertex.pushConstants.size())}}};
     State state{};
     state.stages.path = ShaderPath::Vertex;
-    ValidateShaders(shaders, state);
+    ValidateShaders(shaders, state, VkPhysicalDeviceSubgroupProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES}, false);
 }
 
 }

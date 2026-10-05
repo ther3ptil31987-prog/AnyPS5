@@ -55,8 +55,8 @@ bool fillModuleInfoForUnwind(std::uint64_t addr, ModuleInfoForUnwind* info) {
         std::uint64_t end = 0;
         char perms[8] = {};
         std::uint64_t offset = 0;
-        int devMajor = 0;
-        int devMinor = 0;
+        unsigned int devMajor = 0;
+        unsigned int devMinor = 0;
         std::uint64_t inode = 0;
         char path[4096] = {};
         int parsed = std::sscanf(
@@ -154,7 +154,36 @@ int APS5_VABI sceSysmoduleUnloadModule(std::uint16_t id) {
         throw std::runtime_error("sceSysmoduleUnloadModule: invalid id 0");
     }
     if (!findModuleName(id)) {
-        throw std::runtime_error(std::string("sceSysmoduleUnloadModule: unknown id ") + std::to_string(id));
+        APS5_LOG_OUT("unknown id: %u", static_cast<unsigned>(id));
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(gMutex);
+    auto it = gLoadCount.find(id);
+    if (it == gLoadCount.end() || it->second < 1) {
+        return 0x80A90003;
+    }
+    it->second--;
+    return 0;
+}
+
+int APS5_VABI sceSysmoduleLoadModuleInternal(std::uint32_t id) {
+    if ((id & 0x7fffffffu) == 0) {
+        throw std::runtime_error("sceSysmoduleLoadModuleInternal: invalid id 0");
+    }
+    if (!findModuleName(id)) {
+        throw std::runtime_error(std::string("sceSysmoduleLoadModuleInternal: unknown id ") + std::to_string(id));
+    }
+    std::lock_guard<std::mutex> lock(gMutex);
+    gLoadCount[id]++;
+    return 0;
+}
+
+int APS5_VABI sceSysmoduleUnloadModuleInternal(std::uint32_t id) {
+    if ((id & 0x7fffffffu) == 0) {
+        throw std::runtime_error("sceSysmoduleUnloadModuleInternal: invalid id 0");
+    }
+    if (!findModuleName(id)) {
+        throw std::runtime_error(std::string("sceSysmoduleUnloadModuleInternal: unknown id ") + std::to_string(id));
     }
     std::lock_guard<std::mutex> lock(gMutex);
     auto it = gLoadCount.find(id);

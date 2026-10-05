@@ -8,12 +8,13 @@
 
 #if defined(__linux__) || defined(_WIN32)
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
 extern "C" _Unwind_Reason_Code __gxx_personality_v0(int, _Unwind_Action, std::uint64_t, _Unwind_Exception*, _Unwind_Context*);
+extern "C" _Unwind_Reason_Code __gcc_personality_v0(int, _Unwind_Action, std::uint64_t, _Unwind_Exception*, _Unwind_Context*);
 #endif
 
 namespace LibcUnwind {
-bool OwnPersonality(Word personality) {
+_Unwind_Reason_Code CallPersonality(Word personality, _Unwind_Action actions, _Unwind_Exception* exception, _Unwind_Context* context) {
 #ifdef _WIN32
     const auto* code = reinterpret_cast<const Byte*>(personality);
     if (code[0] == 0xff && code[1] == 0x25) {
@@ -22,11 +23,11 @@ bool OwnPersonality(Word personality) {
         std::memcpy(&personality, code + 6 + displacement, sizeof(personality));
     }
 #endif
-    if (personality == reinterpret_cast<Word>(__gxx_personality_v0_nid_postfix)) return true;
-#ifdef _WIN32
-    if (personality == reinterpret_cast<Word>(__gxx_personality_v0)) return true;
-#endif
-    return false;
+    if (personality == reinterpret_cast<Word>(__gxx_personality_v0_nid_postfix) || personality == reinterpret_cast<Word>(__gxx_personality_v0))
+        return __gxx_personality_v0_nid_postfix(1, actions, exception->exception_class, exception, context);
+    if (personality == reinterpret_cast<Word>(__gcc_personality_v0))
+        return __gcc_personality_v0(1, actions, exception->exception_class, exception, context);
+    return (actions & _UA_SEARCH_PHASE) ? _URC_FATAL_PHASE1_ERROR : _URC_FATAL_PHASE2_ERROR;
 }
 struct Lookup { Word pc; const Byte* fde {}; Word text {}; Word data {}; };
 
@@ -393,8 +394,7 @@ _Unwind_Reason_Code PhaseTwo(_Unwind_Context context, _Unwind_Exception* excepti
                 if (result != _URC_NO_REASON) return result;
             } else if (context.cfa == exception->private_2) actions = _Unwind_Action(actions | _UA_HANDLER_FRAME);
             if (frame.personality) {
-                if (!OwnPersonality(frame.personality)) return _URC_FATAL_PHASE2_ERROR;
-                auto result = __gxx_personality_v0_nid_postfix(1, actions, exception->exception_class, exception, &context);
+                auto result = CallPersonality(frame.personality, actions, exception, &context);
                 if (result == _URC_INSTALL_CONTEXT) LibcRestoreRegisters(context.registers);
                 if (result != _URC_CONTINUE_UNWIND) return _URC_FATAL_PHASE2_ERROR;
             }
@@ -422,8 +422,7 @@ _Unwind_Reason_Code APS5_VABI _Unwind_RaiseException_nid_postfix(_Unwind_Excepti
         LibcUnwind::Frame frame; LibcUnwind::Rules rules;
         if (!LibcUnwind::GetRules(context, frame, rules)) return _URC_END_OF_STACK;
         if (frame.personality) {
-            if (!LibcUnwind::OwnPersonality(frame.personality)) return _URC_FATAL_PHASE1_ERROR;
-            auto result = __gxx_personality_v0_nid_postfix(1, _UA_SEARCH_PHASE, exception->exception_class, exception, &context);
+            auto result = LibcUnwind::CallPersonality(frame.personality, _UA_SEARCH_PHASE, exception, &context);
             if (result == _URC_HANDLER_FOUND) {
                 exception->private_2 = context.cfa;
                 return LibcUnwind::PhaseTwo(start, exception);
@@ -435,7 +434,7 @@ _Unwind_Reason_Code APS5_VABI _Unwind_RaiseException_nid_postfix(_Unwind_Excepti
     return _URC_FATAL_PHASE1_ERROR;
 }
 
-[[noreturn]] void _Unwind_Resume_nid_postfix(_Unwind_Exception* exception) {
+[[noreturn]] void APS5_VABI _Unwind_Resume_nid_postfix(_Unwind_Exception* exception) {
     _Unwind_Context context;
     LibcCaptureRegisters(context.registers);
     if (!LibcUnwind::Step(context)) std::abort();
@@ -460,14 +459,14 @@ void APS5_VABI _Unwind_SetGR_nid_postfix(_Unwind_Context* context, int index, _U
     if (index < 0 || index >= 17) std::abort();
     context->registers[index] = value;
 }
-_Unwind_Ptr _Unwind_GetIP_nid_postfix(_Unwind_Context* context) { return context->registers[16]; }
-void _Unwind_SetIP_nid_postfix(_Unwind_Context* context, _Unwind_Ptr value) { context->registers[16] = value; }
-_Unwind_Ptr _Unwind_GetIPInfo_nid_postfix(_Unwind_Context* context, int* before) { if (before) *before = context->signalFrame; return context->registers[16]; }
-_Unwind_Word _Unwind_GetCFA_nid_postfix(_Unwind_Context* context) { return context->cfa; }
-_Unwind_Ptr _Unwind_GetLanguageSpecificData_nid_postfix(_Unwind_Context* context) { return context->lsda; }
-_Unwind_Ptr _Unwind_GetRegionStart_nid_postfix(_Unwind_Context* context) { return context->region; }
-_Unwind_Ptr _Unwind_GetDataRelBase_nid_postfix(_Unwind_Context* context) { return context->dataBase; }
-_Unwind_Ptr _Unwind_GetTextRelBase_nid_postfix(_Unwind_Context* context) { return context->textBase; }
+_Unwind_Ptr APS5_VABI _Unwind_GetIP_nid_postfix(_Unwind_Context* context) { return context->registers[16]; }
+void APS5_VABI _Unwind_SetIP_nid_postfix(_Unwind_Context* context, _Unwind_Ptr value) { context->registers[16] = value; }
+_Unwind_Ptr APS5_VABI _Unwind_GetIPInfo_nid_postfix(_Unwind_Context* context, int* before) { if (before) *before = context->signalFrame; return context->registers[16]; }
+_Unwind_Word APS5_VABI _Unwind_GetCFA_nid_postfix(_Unwind_Context* context) { return context->cfa; }
+_Unwind_Ptr APS5_VABI _Unwind_GetLanguageSpecificData_nid_postfix(_Unwind_Context* context) { return context->lsda; }
+_Unwind_Ptr APS5_VABI _Unwind_GetRegionStart_nid_postfix(_Unwind_Context* context) { return context->region; }
+_Unwind_Ptr APS5_VABI _Unwind_GetDataRelBase_nid_postfix(_Unwind_Context* context) { return context->dataBase; }
+_Unwind_Ptr APS5_VABI _Unwind_GetTextRelBase_nid_postfix(_Unwind_Context* context) { return context->textBase; }
 
 _Unwind_Reason_Code APS5_VABI _Unwind_ForcedUnwind_nid_postfix(_Unwind_Exception* exception, _Unwind_Stop_Fn stop, void* argument) {
     if (!stop) return _URC_FATAL_PHASE2_ERROR;
@@ -497,22 +496,22 @@ _Unwind_Reason_Code APS5_VABI _Unwind_Backtrace_nid_postfix(_Unwind_Trace_Fn tra
 #else
 
 extern "C" {
-_Unwind_Reason_Code _Unwind_RaiseException_nid_postfix(_Unwind_Exception*) { std::abort(); }
-[[noreturn]] void _Unwind_Resume_nid_postfix(_Unwind_Exception*) { std::abort(); }
-_Unwind_Reason_Code _Unwind_Resume_or_Rethrow_nid_postfix(_Unwind_Exception*) { std::abort(); }
-void _Unwind_DeleteException_nid_postfix(_Unwind_Exception* e) { if (e && e->exception_cleanup) e->exception_cleanup(_URC_FOREIGN_EXCEPTION_CAUGHT, e); }
-_Unwind_Word _Unwind_GetGR_nid_postfix(_Unwind_Context*, int) { std::abort(); }
-void _Unwind_SetGR_nid_postfix(_Unwind_Context*, int, _Unwind_Word) { std::abort(); }
-_Unwind_Ptr _Unwind_GetIP_nid_postfix(_Unwind_Context*) { std::abort(); }
-void _Unwind_SetIP_nid_postfix(_Unwind_Context*, _Unwind_Ptr) { std::abort(); }
-_Unwind_Ptr _Unwind_GetIPInfo_nid_postfix(_Unwind_Context*, int*) { std::abort(); }
-_Unwind_Word _Unwind_GetCFA_nid_postfix(_Unwind_Context*) { std::abort(); }
-_Unwind_Ptr _Unwind_GetLanguageSpecificData_nid_postfix(_Unwind_Context*) { std::abort(); }
-_Unwind_Ptr _Unwind_GetRegionStart_nid_postfix(_Unwind_Context*) { std::abort(); }
-_Unwind_Ptr _Unwind_GetDataRelBase_nid_postfix(_Unwind_Context*) { std::abort(); }
-_Unwind_Ptr _Unwind_GetTextRelBase_nid_postfix(_Unwind_Context*) { std::abort(); }
-_Unwind_Reason_Code _Unwind_ForcedUnwind_nid_postfix(_Unwind_Exception*, _Unwind_Stop_Fn, void*) { std::abort(); }
-_Unwind_Reason_Code _Unwind_Backtrace_nid_postfix(_Unwind_Trace_Fn, void*) { std::abort(); }
+_Unwind_Reason_Code APS5_VABI _Unwind_RaiseException_nid_postfix(_Unwind_Exception*) { std::abort(); }
+[[noreturn]] void APS5_VABI _Unwind_Resume_nid_postfix(_Unwind_Exception*) { std::abort(); }
+_Unwind_Reason_Code APS5_VABI _Unwind_Resume_or_Rethrow_nid_postfix(_Unwind_Exception*) { std::abort(); }
+void APS5_VABI _Unwind_DeleteException_nid_postfix(_Unwind_Exception* e) { if (e && e->exception_cleanup) e->exception_cleanup(_URC_FOREIGN_EXCEPTION_CAUGHT, e); }
+_Unwind_Word APS5_VABI _Unwind_GetGR_nid_postfix(_Unwind_Context*, int) { std::abort(); }
+void APS5_VABI _Unwind_SetGR_nid_postfix(_Unwind_Context*, int, _Unwind_Word) { std::abort(); }
+_Unwind_Ptr APS5_VABI _Unwind_GetIP_nid_postfix(_Unwind_Context*) { std::abort(); }
+void APS5_VABI _Unwind_SetIP_nid_postfix(_Unwind_Context*, _Unwind_Ptr) { std::abort(); }
+_Unwind_Ptr APS5_VABI _Unwind_GetIPInfo_nid_postfix(_Unwind_Context*, int*) { std::abort(); }
+_Unwind_Word APS5_VABI _Unwind_GetCFA_nid_postfix(_Unwind_Context*) { std::abort(); }
+_Unwind_Ptr APS5_VABI _Unwind_GetLanguageSpecificData_nid_postfix(_Unwind_Context*) { std::abort(); }
+_Unwind_Ptr APS5_VABI _Unwind_GetRegionStart_nid_postfix(_Unwind_Context*) { std::abort(); }
+_Unwind_Ptr APS5_VABI _Unwind_GetDataRelBase_nid_postfix(_Unwind_Context*) { std::abort(); }
+_Unwind_Ptr APS5_VABI _Unwind_GetTextRelBase_nid_postfix(_Unwind_Context*) { std::abort(); }
+_Unwind_Reason_Code APS5_VABI _Unwind_ForcedUnwind_nid_postfix(_Unwind_Exception*, _Unwind_Stop_Fn, void*) { std::abort(); }
+_Unwind_Reason_Code APS5_VABI _Unwind_Backtrace_nid_postfix(_Unwind_Trace_Fn, void*) { std::abort(); }
 }
 
 #endif

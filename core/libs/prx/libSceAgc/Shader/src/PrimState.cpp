@@ -60,7 +60,6 @@ int APS5_VABI sceAgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_
         }
     }
 
-    APS5_LOG_OUT("OK prim_type=%u", prim_type);
     return 0;
 }
 
@@ -75,7 +74,6 @@ int APS5_VABI sceAgcUpdatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_
         uc_regs[2].value |= prim_type;
     }
 
-    APS5_LOG_OUT("OK prim_type=%u", prim_type);
     return 0;
 }
 

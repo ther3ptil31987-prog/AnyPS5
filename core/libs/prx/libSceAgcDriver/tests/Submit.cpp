@@ -4,13 +4,20 @@
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Query.hpp"
+#include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "prx/libkernel/Equeue/Equeue.hpp"
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+extern "C" int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* name);
+extern "C" int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq);
 
 static_assert(sizeof(Packet) == 16);
 static_assert(offsetof(Packet, addr) == 0);
@@ -144,6 +151,197 @@ void testSubmissions() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
+void testEndOfPipeInterrupts() {
+    KernelEqueue eq = 0;
+    check(sceKernelCreateEqueue(&eq, "AGC test") == 0, "event queue creation failed");
+    auto owner = EqueuePin_nid_postfix(eq);
+    int graphicsTag = 0;
+    int computeTag = 0;
+    check(sceAgcDriverAddEqEvent(eq, 0, &graphicsTag) == 0, "graphics event registration failed");
+    check(sceAgcDriverAddEqEvent(eq, 0x20, &computeTag) == 0, "compute event registration failed");
+    expectFailure([] { sceAgcDriverAddEqEvent(0, 0, nullptr); });
+    std::array<std::uint32_t, 8> words{0xc0064900, 0, 1u << 24u, 0, 0, 0, 0, 0};
+    Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&packet) == 0 && sceAgcDriverSubmitDcb(&packet) == 0, "interrupt submit failed");
+    AgcDriverWaitIdle_nid_postfix();
+    std::array<KernelEvent, 2> events{};
+    check(owner->GetTriggeredEvents(events.data(), 2) == 1, "graphics end-of-pipe interrupt was not delivered to its queue only");
+    check(events[0].filter == -14 && events[0].udata == &graphicsTag && events[0].data == 2 && sceAgcDriverGetEqEventType(events.data()) == 0, "graphics end-of-pipe event encoding is wrong");
+    check(owner->GetTriggeredEvents(events.data(), 2) == 0, "delivered interrupt was not cleared");
+    check(sceAgcDriverSubmitAcb(0x20, &packet) == 0, "compute interrupt submit failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(owner->GetTriggeredEvents(events.data(), 2) == 1 && events[0].udata == &computeTag && sceAgcDriverGetEqEventType(events.data()) == 0x20, "compute end-of-pipe interrupt missing");
+    words[2] = 0;
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "plain release submit failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(owner->GetTriggeredEvents(events.data(), 2) == 0, "release without INT_SEL raised an interrupt");
+    check(sceAgcDriverDeleteEqEvent(eq, 0) == 0, "graphics event deletion failed");
+    expectFailure([&] { sceAgcDriverDeleteEqEvent(eq, 0); });
+    words[2] = 1u << 24u;
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "interrupt submit after deletion failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(owner->GetTriggeredEvents(events.data(), 2) == 0, "deleted event still received interrupts");
+    check(sceAgcDriverDeleteEqEvent(eq, 0x20) == 0, "compute event deletion failed");
+    owner.reset();
+    check(sceKernelDeleteEqueue(eq) == 0, "event queue deletion failed");
+}
+
+std::array<std::uint32_t, 5> writeData(volatile std::uint32_t* address, std::uint32_t value) {
+    const auto target = reinterpret_cast<std::uintptr_t>(address);
+    return {0xc0033700, 0x00100200, static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(static_cast<std::uint64_t>(target) >> 32u), value};
+}
+
+std::array<std::uint32_t, 7> waitEqual(volatile std::uint32_t* address, std::uint32_t value) {
+    const auto target = reinterpret_cast<std::uintptr_t>(address);
+    return {0xc0053c00, 0x13, static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(static_cast<std::uint64_t>(target) >> 32u), value, 0xffffffffu, 0x19};
+}
+
+std::array<std::uint32_t, 9> waitEqual64(volatile std::uint32_t* address, std::uint64_t value, std::uint64_t mask) {
+    const auto target = reinterpret_cast<std::uintptr_t>(address);
+    return {0xc0079300, 0x13, static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(static_cast<std::uint64_t>(target) >> 32u), static_cast<std::uint32_t>(value), static_cast<std::uint32_t>(value >> 32u), static_cast<std::uint32_t>(mask), static_cast<std::uint32_t>(mask >> 32u), 0x19};
+}
+
+void submit(std::uint32_t queue, const std::vector<std::uint32_t>& words) {
+    Packet packet{const_cast<std::uint32_t*>(words.data()), static_cast<std::uint32_t>(words.size()), 0, {}};
+    check((queue == 0 ? sceAgcDriverSubmitDcb(&packet) : sceAgcDriverSubmitAcb(queue, &packet)) == 0, "label submit failed");
+}
+
+std::chrono::milliseconds waitFor(volatile std::uint32_t* address, std::uint32_t value, const char* message) {
+    const auto start = std::chrono::steady_clock::now();
+    while (*address != value) {
+        check(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), message);
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+}
+
+template<std::size_t... N>
+std::vector<std::uint32_t> commands(const std::array<std::uint32_t, N>&... packets) {
+    std::vector<std::uint32_t> words;
+    (words.insert(words.end(), packets.begin(), packets.end()), ...);
+    return words;
+}
+
+std::array<std::uint32_t, 8> endOfPipeLabel(volatile std::uint32_t* address, std::uint32_t value) {
+    const auto target = reinterpret_cast<std::uintptr_t>(address);
+    return {0xc0064900, 0x514, (1u << 29u) | (2u << 24u), static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(static_cast<std::uint64_t>(target) >> 32u), value, 0, 0};
+}
+
+void testEndOfPipeLabelsWithoutWork() {
+    alignas(64) static volatile std::uint32_t first = 0, second = 0, done = 0;
+    KernelEqueue eq = 0;
+    check(sceKernelCreateEqueue(&eq, "AGC EOP labels") == 0, "event queue creation failed");
+    auto owner = EqueuePin_nid_postfix(eq);
+    int tag = 0;
+    check(sceAgcDriverAddEqEvent(eq, 0, &tag) == 0, "graphics event registration failed");
+    submit(0x20, commands(waitEqual(&second, 2), writeData(&done, 1)));
+    submit(0, commands(endOfPipeLabel(&first, 1), endOfPipeLabel(&second, 2)));
+    waitFor(&done, 1, "an end-of-pipe label with no work before it never landed");
+    check(first == 1 && second == 2, "end-of-pipe labels with no work before them landed wrong");
+    AgcDriverWaitIdle_nid_postfix();
+    std::array<KernelEvent, 2> events{};
+    check(owner->GetTriggeredEvents(events.data(), 2) == 1 && events[0].udata == &tag && events[0].data == 2, "end-of-pipe labels with no work before them lost their interrupts");
+    check(sceAgcDriverDeleteEqEvent(eq, 0) == 0, "graphics event deletion failed");
+    owner.reset();
+    check(sceKernelDeleteEqueue(eq) == 0, "event queue deletion failed");
+}
+
+void testLabelStoredSinceSubmission() {
+    alignas(64) static volatile std::uint32_t gate = 0, label = 0, done = 0, late = 0;
+    submit(0x20, commands(waitEqual(&gate, 1), waitEqual(&label, 1), writeData(&done, 1)));
+    submit(0, commands(writeData(&label, 1)));
+    waitFor(&label, 1, "producer label never landed");
+    label = 0;
+    gate = 1;
+    check(waitFor(&done, 1, "consumer never passed its waits") < std::chrono::milliseconds(500), "a label stored after the wait's submission did not satisfy it");
+    AgcDriverWaitIdle_nid_postfix();
+    submit(0x20, commands(waitEqual(&label, 1), writeData(&late, 1)));
+    check(waitFor(&late, 1, "consumer never passed its wait") >= std::chrono::milliseconds(900), "a label stored before the wait's submission satisfied it");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+void testWideLabelStoredSinceSubmission() {
+    alignas(64) static volatile std::uint32_t gate = 0, done = 0, late = 0;
+    alignas(64) static volatile std::uint32_t label[2] = {0, 0x5eed};
+    submit(0x20, commands(waitEqual(&gate, 1), waitEqual64(label, 1, 0xffffffffu), writeData(&done, 1)));
+    submit(0, commands(writeData(label, 1)));
+    waitFor(label, 1, "producer label never landed");
+    label[0] = 0;
+    gate = 1;
+    check(waitFor(&done, 1, "consumer never passed its waits") < std::chrono::milliseconds(500), "a 32-bit label stored after a low-dword 64-bit wait's submission did not satisfy it");
+    AgcDriverWaitIdle_nid_postfix();
+    gate = 0;
+    submit(0x20, commands(waitEqual(&gate, 1), waitEqual64(label, 1, ~0ull), writeData(&late, 1)));
+    submit(0, commands(writeData(label, 1)));
+    waitFor(label, 1, "producer label never landed");
+    label[0] = 0;
+    gate = 1;
+    check(waitFor(&late, 1, "consumer never passed its wait") >= std::chrono::milliseconds(900), "a 32-bit store satisfied a 64-bit wait whose high dword never matched");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+void testLabelHeldAtSubmission() {
+    alignas(64) static volatile std::uint32_t gate = 0, label = 1, done = 0, reset = 0;
+    submit(0x20, commands(waitEqual(&gate, 1), waitEqual(&label, 1), writeData(&done, 1)));
+    label = 0;
+    gate = 1;
+    check(waitFor(&done, 1, "consumer never passed its waits") < std::chrono::milliseconds(500), "a label held when the wait was submitted did not satisfy it");
+    AgcDriverWaitIdle_nid_postfix();
+    gate = 0;
+    label = 1;
+    submit(0x20, commands(waitEqual(&gate, 1), writeData(&label, 0), waitEqual(&label, 1), writeData(&reset, 1)));
+    gate = 1;
+    check(waitFor(&reset, 1, "consumer never passed its wait") >= std::chrono::milliseconds(900), "a label its own queue stored first counted as held at the submission");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+void testWaitFreeSubmissionAfterEarlierQueue0Work() {
+    alignas(64) static volatile std::uint32_t first = 0, second = 0;
+    constexpr std::uint32_t writes = 20000;
+    std::vector<std::uint32_t> words;
+    for (std::uint32_t i = 1; i <= writes; ++i) {
+        const auto write = writeData(&first, i);
+        words.insert(words.end(), write.begin(), write.end());
+    }
+    submit(0, words);
+    submit(0x20, commands(writeData(&second, 1)));
+    waitFor(&second, 1, "the wait-free submission never ran");
+    check(first == writes, "a wait-free submission ran before queue 0's earlier submission finished");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+void testWaitFreeSubmissionQueue0WaitsOn() {
+    alignas(64) static volatile std::uint32_t label = 0, done = 0;
+    submit(0, commands(waitEqual(&label, 1), writeData(&done, 1)));
+    submit(0x20, commands(writeData(&label, 1)));
+    check(waitFor(&done, 1, "queue 0 never passed the wait the held submission satisfies") < std::chrono::milliseconds(500), "queue 0's wait on a held wait-free submission's label was not released at once");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+void testWaitFreeSubmissionBehindHeldOne() {
+    alignas(64) static volatile std::uint32_t other = 0, label = 0, done = 0;
+    submit(0, commands(waitEqual(&label, 1), writeData(&done, 1)));
+    submit(0x20, commands(writeData(&other, 1)));
+    submit(0x20, commands(writeData(&label, 1)));
+    check(waitFor(&done, 1, "queue 0 never passed the wait a later submission of the held queue satisfies") < std::chrono::milliseconds(500), "queue 0's wait on a label stored behind a held submission was not released at once");
+    check(other == 1, "the held submission did not run before the one behind it");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+void testWaitFreeSubmissionTheCpuWaitsFor() {
+    alignas(64) static volatile std::uint32_t stored = 0, flag = 0, done = 0;
+    submit(0, commands(waitEqual(&flag, 1), writeData(&done, 1)));
+    submit(0x20, commands(writeData(&stored, 1)));
+    std::thread title([] {
+        waitFor(&stored, 1, "the held submission never ran while queue 0 waited on the CPU");
+        flag = 1;
+    });
+    const auto waited = waitFor(&done, 1, "queue 0 never passed a wait the CPU satisfies after the held submission");
+    title.join();
+    check(waited < std::chrono::milliseconds(500), "a held submission the CPU waits for was not released while queue 0 waited on the CPU");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
 void testWorkerFailure() {
     std::array<std::uint32_t, 5> words{0xc0031500, 1, 1, 1, 0x41};
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
@@ -168,6 +366,15 @@ int main() {
         testValidation();
         testClearState();
         testSubmissions();
+        testEndOfPipeInterrupts();
+        testLabelStoredSinceSubmission();
+        testEndOfPipeLabelsWithoutWork();
+        testLabelHeldAtSubmission();
+        testWideLabelStoredSinceSubmission();
+        testWaitFreeSubmissionAfterEarlierQueue0Work();
+        testWaitFreeSubmissionQueue0WaitsOn();
+        testWaitFreeSubmissionBehindHeldOne();
+        testWaitFreeSubmissionTheCpuWaitsFor();
         testWorkerFailure();
         check(expectFailure([] { LibcRunShutdown_nid_postfix(); }).find("required shader register") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC driver submit tests passed");

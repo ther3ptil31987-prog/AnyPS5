@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -7,6 +9,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <vector>
+#include <prx/libc/include/General.hpp>
 
 #include "SDL.h"
 #include "SceTypes.hpp"
@@ -23,6 +26,7 @@ static constexpr int PORT_TYPE_AUX = 127;
 
 static constexpr int PORTS_MAX = 32;
 static constexpr int DEFAULT_VOLUME = 32768;
+static constexpr int DEFAULT_PADSPK_MIX_LEVEL = 11626;
 static constexpr std::uint32_t FORMAT_MASK = 0xFFu;
 static constexpr std::uint64_t TARGET_LATENCY_US = 40000;
 static constexpr std::uint64_t DRAIN_TIMEOUT_US = 200000;
@@ -83,7 +87,9 @@ struct Port {
     Format format = Format::Unknown;
     int channels = 0;
     int volume[8] = {};
+    int mixLevel = DEFAULT_VOLUME;
     std::uint64_t lastOutputTime = 0;
+    std::uint64_t lastDataOutputTime = 0;
     SDL_AudioDeviceID device = 0;
     SDL_AudioSpec spec = {};
 };
@@ -140,7 +146,7 @@ static const void* prepareBuffer(const Port& port, const void* data, std::vector
     const auto bps = bytesPerSample(port.format);
     const auto size = frames * ch * bps;
 
-    bool volumeChanged = false;
+    bool volumeChanged = port.mixLevel != DEFAULT_VOLUME;
     for (std::uint32_t i = 0; i < ch; i++) {
         if (port.volume[i] != DEFAULT_VOLUME) {
             volumeChanged = true;
@@ -158,11 +164,12 @@ static const void* prepareBuffer(const Port& port, const void* data, std::vector
     if (formatIsFloat(port.format)) {
         auto* dst = reinterpret_cast<float*>(buf.data());
         const auto* src = static_cast<const float*>(data);
+        const float mixLevel = static_cast<float>(port.mixLevel) / static_cast<float>(DEFAULT_VOLUME);
         for (std::uint32_t fr = 0; fr < frames; fr++) {
             for (std::uint32_t c = 0; c < ch; c++) {
                 const auto srcCh = isStd ? STD_8CH_MAP[c] : c;
                 dst[fr * ch + c] = src[fr * ch + srcCh] *
-                    (static_cast<float>(port.volume[c]) / static_cast<float>(DEFAULT_VOLUME));
+                    (static_cast<float>(port.volume[c]) / static_cast<float>(DEFAULT_VOLUME)) * mixLevel;
             }
         }
     } else {
@@ -172,7 +179,7 @@ static const void* prepareBuffer(const Port& port, const void* data, std::vector
             for (std::uint32_t c = 0; c < ch; c++) {
                 const auto srcCh = isStd ? STD_8CH_MAP[c] : c;
                 std::int64_t s = static_cast<std::int64_t>(src[fr * ch + srcCh]) *
-                    port.volume[c] / DEFAULT_VOLUME;
+                    port.volume[c] * port.mixLevel / (static_cast<std::int64_t>(DEFAULT_VOLUME) * DEFAULT_VOLUME);
                 s = std::clamp(s,
                     static_cast<std::int64_t>(std::numeric_limits<std::int16_t>::min()),
                     static_cast<std::int64_t>(std::numeric_limits<std::int16_t>::max()));
@@ -184,7 +191,22 @@ static const void* prepareBuffer(const Port& port, const void* data, std::vector
 }
 
 static void queueAudio(Port& port, const void* data) {
-    if (port.device == 0 || data == nullptr) {
+    // Without an SDL device there is nothing to queue: the callers already sleep for the block's
+    // duration so the game's timing holds. A null pointer is the documented way to wait until the
+    // port's queued audio has been output (sceAudioOutOutput(handle, NULL)); it queues nothing.
+    if (port.device == 0) return;
+    if (data == nullptr) {
+        const std::uint64_t waitStart = sceKernelGetProcessTime();
+        while (SDL_GetQueuedAudioSize(port.device) > 0) {
+            if (sceKernelGetProcessTime() - waitStart > DRAIN_TIMEOUT_US) {
+                SDL_ClearQueuedAudio(port.device);
+                break;
+            }
+            struct timespec req{};
+            req.tv_sec = 0;
+            req.tv_nsec = static_cast<long>(DRAIN_SLEEP_US * 1000ULL);
+            nanosleep(&req, nullptr);
+        }
         return;
     }
 
@@ -242,6 +264,7 @@ static void queueAudio(Port& port, const void* data) {
     if (SDL_QueueAudio(port.device, queueData, queueSize) < 0) {
         throw std::runtime_error(std::string("SDL_QueueAudio: ") + SDL_GetError());
     }
+    // APS5_LOG_OUT("device=%u type=%d bytes=%u queued=%u", port.device, port.type, queueSize, SDL_GetQueuedAudioSize(port.device));
 }
 
 static bool portTypeValid(int type) {
@@ -270,6 +293,12 @@ int APS5_VABI sceAudioOutOpen(int userId, int type, int index, std::uint32_t len
     (void)userId;
     if (!portTypeValid(type)) {
         return -2144993270;
+    }
+    if (len == 0) {
+        return -2144993274;
+    }
+    if (freq == 0) {
+        return -2144993272;
     }
     if (index != 0) {
         throw std::runtime_error("sceAudioOutOpen: index != 0 not supported");
@@ -300,12 +329,16 @@ int APS5_VABI sceAudioOutOpen(int userId, int type, int index, std::uint32_t len
             port.format = format;
             port.channels = channelsForFormat(format);
             port.lastOutputTime = 0;
+            port.lastDataOutputTime = 0;
+            port.mixLevel = type == PORT_TYPE_PADSPK ? DEFAULT_PADSPK_MIX_LEVEL : DEFAULT_VOLUME;
             for (int c = 0; c < port.channels; c++) {
                 port.volume[c] = DEFAULT_VOLUME;
             }
             if (type != PORT_TYPE_VIBRATION) {
                 openDevice(port);
             }
+            static const bool trace = std::getenv("APS5_TRACE_AUDIOOUT") != nullptr;
+            if (trace) std::fprintf(stderr, "[audioout] port %d: type %d, %u samples at %u Hz, format %d, device %u\n", i + 1, type, len, freq, static_cast<int>(format), static_cast<unsigned>(port.device));
             return i + 1;
         }
     }
@@ -343,6 +376,7 @@ int APS5_VABI sceAudioOutOutput(int handle, const void* ptr) {
 
     queueAudio(*port, ptr);
     port->lastOutputTime = sceKernelGetProcessTime();
+    if (ptr != nullptr) port->lastDataOutputTime = port->lastOutputTime;
     return static_cast<int>(port->samplesNum);
 }
 
@@ -389,12 +423,15 @@ int APS5_VABI sceAudioOutOutputs(AudioOutOutputParam* param, std::uint32_t num) 
     }
 
     for (std::uint32_t i = 0; i < num; i++) {
-        queueAudio(*getPort(param[i].handle), param[i].ptr);
+        if (auto* port = getPort(param[i].handle)) queueAudio(*port, param[i].ptr);
     }
 
     const std::uint64_t done = sceKernelGetProcessTime();
     for (std::uint32_t i = 0; i < num; i++) {
-        getPort(param[i].handle)->lastOutputTime = done;
+        if (auto* port = getPort(param[i].handle)) {
+            port->lastOutputTime = done;
+            if (param[i].ptr != nullptr) port->lastDataOutputTime = done;
+        }
     }
 
     return static_cast<int>(first.samplesNum);
@@ -423,6 +460,19 @@ int APS5_VABI sceAudioOutSetVolume(int handle, std::uint32_t flag, int* vol) {
         }
         port->volume[i] = vol[srcIdx];
     }
+    return 0;
+}
+
+int APS5_VABI sceAudioOutGetLastOutputTime(int handle, std::uint64_t* outputTime) {
+    if (outputTime == nullptr) {
+        return -2144993276;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Port* port = getPort(handle);
+    if (port == nullptr) {
+        return -2144993277;
+    }
+    *outputTime = port->lastDataOutputTime;
     return 0;
 }
 
@@ -464,6 +514,25 @@ int APS5_VABI sceAudioOutGetPortState(int handle, AudioOutPortState* state) {
         default:
             throw std::runtime_error("sceAudioOutGetPortState: unknown port type");
     }
+    return 0;
+}
+
+int APS5_VABI sceAudioOutSetMixLevelPadSpk(int handle, int mixLevel) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Port* port = getPort(handle);
+    if (port == nullptr) {
+        return -2144993277;
+    }
+    if (port->type != PORT_TYPE_PADSPK) {
+        return -2144993270;
+    }
+    if (mixLevel > DEFAULT_VOLUME) {
+        return -2144993260;
+    }
+    if (mixLevel < 0) {
+        throw std::runtime_error("sceAudioOutSetMixLevelPadSpk: negative mix level not supported");
+    }
+    port->mixLevel = mixLevel;
     return 0;
 }
 

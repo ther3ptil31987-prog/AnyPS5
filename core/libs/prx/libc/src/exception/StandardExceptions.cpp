@@ -1,6 +1,7 @@
 #include "prx/libc/include/exceptions/Runtime.hpp"
 #include <limits>
 #include <regex>
+#include <stdexcept>
 
 namespace LibcException {
 struct TypeRecord { const void* const* vtable; const char* name; const TypeRecord* base; };
@@ -110,12 +111,22 @@ ExceptionObject* Assign(ExceptionObject* object, const ExceptionObject* source) 
 }
 
 extern "C" {
+LibcException::TypeRecord _ZTISt8ios_base_nid_postfix {LibcException::ClassTypeVtable + 2, "St8ios_base", nullptr};
 LibcException::TypeRecord _ZTISt9exception_nid_postfix {LibcException::ClassTypeVtable + 2, "St9exception", nullptr};
 LibcException::ExceptionVtable _ZTVSt9exception_nid_postfix {0, &_ZTISt9exception_nid_postfix, LibcException::DestroyPlain, LibcException::DeletePlain, LibcException::PlainWhat};
 void APS5_VABI _ZNSt9exceptionD1Ev_nid_postfix(LibcException::ExceptionObject* self) { LibcException::DestroyPlain(self); }
 void APS5_VABI _ZNSt9exceptionD2Ev_nid_postfix(LibcException::ExceptionObject* self) { LibcException::DestroyPlain(self); }
 void APS5_VABI _ZNSt9exceptionD0Ev_nid_postfix(LibcException::ExceptionObject* self) { LibcException::DeletePlain(self); }
 const char* APS5_VABI _ZNKSt9exception4whatEv_nid_postfix(const LibcException::ExceptionObject* self) { return LibcException::PlainWhat(self); }
+[[noreturn]] void APS5_VABI _ZNKSt9exception8_DoraiseEv_nid_postfix(const LibcException::ExceptionObject* self) {
+    if (!self) throw std::invalid_argument("exception object is null");
+    LibcException::ThrowPlain(_ZTVSt9exception_nid_postfix);
+}
+
+[[noreturn]] void APS5_VABI _ZNKSt9exception6_RaiseEv_nid_postfix(const LibcException::ExceptionObject* self) {
+    if (!self) throw std::invalid_argument("exception object is null");
+    LibcException::ThrowPlain(_ZTVSt9exception_nid_postfix);
+}
 void APS5_VABI _ZNSt9exceptionC1Ev_nid_postfix(LibcException::ExceptionObject* self) { self->vtable = &_ZTVSt9exception_nid_postfix.destroy; }
 void APS5_VABI _ZNSt9exceptionC2Ev_nid_postfix(LibcException::ExceptionObject* self) { self->vtable = &_ZTVSt9exception_nid_postfix.destroy; }
 

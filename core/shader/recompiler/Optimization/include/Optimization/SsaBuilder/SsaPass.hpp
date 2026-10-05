@@ -20,7 +20,7 @@ public:
 private:
     [[nodiscard]] IrValue* AddPhiOperands(Variable variable, IrValue& phi, IrBlock* block);
     [[nodiscard]] IrValue* TryRemoveTrivialPhi(IrValue& phi, Variable variable);
-    [[nodiscard]] IrValue* MakeUndef(Variable variable);
+    [[nodiscard]] IrValue* MakeInitialValue(Variable variable);
 
     IrProgram& _program;
     DefTable _definitions;

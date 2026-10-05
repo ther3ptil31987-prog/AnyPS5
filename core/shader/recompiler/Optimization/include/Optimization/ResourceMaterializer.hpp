@@ -13,6 +13,7 @@ struct ResourceSpecialization {
         std::uint32_t packedStride = 0;
         IrBufferFormat descriptorFormat = IrBufferFormat::Invalid;
         std::uint32_t descriptorSwizzle = ShaderImageIdentitySwizzle;
+        bool empty = false;
 
         bool operator==(const Buffer& other) const;
     };
@@ -28,6 +29,9 @@ struct ResourceSpecialization {
         std::uint32_t indirectSearchIterations = 0;
         bool cube = false;
         bool fmask = false;
+        bool depthBits = false;
+        bool depthUnorm16 = false;
+        IrBufferFormat packedFormat = IrBufferFormat::Invalid;
 
         bool operator==(const Image& other) const;
     };
@@ -40,12 +44,20 @@ struct ResourceSpecialization {
     std::vector<std::uint32_t> boundDescriptors;
 };
 
+// Why a bindless image table (a T# loaded from a table buffer at a runtime key) was not bound;
+// counted on the [bindless] line (APS5_PROFILE_DRAW).
+enum class BindlessRejection { Capacity, MaterialScan, NoEntry, Storage, NonUniform, ImageSlots, Count };
+
 class ResourceMaterializer {
 public:
     void Apply(IrProgram& program, const ResourceSpecialization& specialization) const;
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
     void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) const;
-
+    // APS5_PROFILE_DRAW: the time Materialize spent building specializations, over every call.
+    static std::uint64_t SpecializationNanoseconds();
+    // The slots every bindless image table binds (APS5_BINDLESS_SLOTS, default 16, 1..48).
+    static std::uint32_t BindlessSlots();
+    static void CountBindlessRejection(BindlessRejection reason);
 };
 
 }

@@ -19,7 +19,6 @@ int APS5_VABI sceAgcCreateInterpolantMapping(ShaderRegister* regs, const Shader*
 
     if (ps == nullptr || ps->num_input_semantics == 0) {
         FillIdentityInterpolants(regs, 0);
-        APS5_LOG_CHARS_OUT("OK identity ps_inputs=0");
         return 0;
     }
 
@@ -52,7 +51,6 @@ int APS5_VABI sceAgcCreateInterpolantMapping(ShaderRegister* regs, const Shader*
     }
 
     FillIdentityInterpolants(regs, ps->num_input_semantics);
-    APS5_LOG_OUT("OK ps_inputs=%u gs_outputs=%u", ps->num_input_semantics, gs->num_output_semantics);
     return 0;
 }
 

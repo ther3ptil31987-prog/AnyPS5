@@ -35,7 +35,7 @@ std::size_t RvaToOffset(const std::vector<std::uint8_t>& pe, std::uint32_t rva, 
 
 }
 
-void PeNidPatcher::PatchNids(std::vector<std::uint8_t>& pe, const std::string& libraryName) const {
+void PeNidPatcher::PatchNids(std::vector<std::uint8_t>& pe, const std::string& libraryName, const std::unordered_set<std::string>& excludedExports) const {
     using namespace Internal;
 
     if (pe.size() < 0x40) throw std::runtime_error("file too small");
@@ -100,7 +100,7 @@ void PeNidPatcher::PatchNids(std::vector<std::uint8_t>& pe, const std::string& l
         names[i] = name;
     }
 
-    const auto nidMap = ResolveNids(names, libraryName);
+    const auto nidMap = ResolveNids(names, libraryName, excludedExports);
 
     const std::size_t edataSectionOffset = FindSectionOffsetByRva(pe, exportDir.VirtualAddress, peHeaderOffset, numberOfSections, sizeOfOptionalHeader);
     const auto edataSection = Read<PeSectionHeader>(pe, edataSectionOffset);

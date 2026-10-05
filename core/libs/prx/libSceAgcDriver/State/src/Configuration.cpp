@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <stdexcept>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
@@ -11,14 +12,11 @@ int APS5_VABI sceAgcDriverSetHsOffchipParam(uint64_t value0, uint64_t value1, ui
  (void)value0;
  (void)value1;
  (void)value2;
- NotImplemented_nid_no_patch(__func__);
  return 0;
 }
 
 int APS5_VABI sceAgcDriverSetTFRing(const volatile void* base, uint32_t size) {
- (void)base;
- (void)size;
- NotImplemented_nid_no_patch(__func__);
+ if (base == nullptr || size == 0) throw std::invalid_argument("sceAgcDriverSetTFRing: empty ring");
  return 0;
 }
 

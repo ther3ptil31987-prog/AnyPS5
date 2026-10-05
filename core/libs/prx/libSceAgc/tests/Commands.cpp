@@ -7,15 +7,27 @@
 #include <array>
 #include <cstdio>
 #include <stdexcept>
+#include <cstring>
 #include <string>
 
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbResetQueue(CommandBuffer* buf, std::uint32_t op, std::uint32_t state);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetFlip(CommandBuffer* buf, std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument);
 extern "C" int APS5_VABI sceAgcSuspendPoint();
+extern "C" int APS5_VABI sceAgcInit(std::uint32_t* state, std::uint32_t version);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbDrawIndexAuto(CommandBuffer* buf, std::uint32_t indexCount, std::uint64_t modifier);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbDrawIndexIndirect(CommandBuffer* buf, std::uint32_t dataOffsetInBytes, std::uint64_t modifier);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbDrawIndexIndirectMulti(CommandBuffer* buf, std::uint32_t dataOffsetInBytes, std::uint32_t countIndirect, std::uint32_t maxCountOrCount, const volatile void* countAddress, std::uint32_t strideInBytes, std::uint64_t modifier);
 extern "C" int APS5_VABI sceAgcWaitRegMemPatchReference(std::uint32_t* cmd, std::uint64_t reference);
 extern "C" int APS5_VABI sceAgcGetDataPacketPayloadAddressUnk(std::uint32_t** addr, std::uint32_t* cmd, int type);
 extern "C" std::uint32_t* APS5_VABI sceAgcCbSetShRegisterRangeDirect(CommandBuffer* buf, std::uint32_t offset, const std::uint32_t* values, std::uint32_t numValues);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbContextStateAnotherOp(CommandBuffer* buf, std::uint32_t operation);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbPushMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbPopMarker(CommandBuffer* buf);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
+extern "C" std::uint32_t* APS5_VABI sceAgcAcbPushMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
+extern "C" std::uint32_t* APS5_VABI sceAgcAcbPopMarker(CommandBuffer* buf);
+extern "C" std::uint32_t* APS5_VABI sceAgcAcbSetMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexBuffer(CommandBuffer* buf, std::uint64_t indexAddress);
 
 namespace {
 
@@ -51,6 +63,16 @@ bool APS5_VABI grow(CommandBuffer* buffer, std::uint32_t count, void* userData) 
     return true;
 }
 
+bool APS5_VABI growReserved(CommandBuffer* buffer, std::uint32_t count, void* userData) {
+    auto& storage = *static_cast<Storage*>(userData);
+    check(count == 5 + 4, "incorrect callback allocation including reserved words");
+    buffer->bottom = storage.words.data();
+    buffer->top = storage.words.data() + storage.words.size();
+    buffer->cursor_up = buffer->bottom;
+    buffer->cursor_down = buffer->top;
+    return true;
+}
+
 void testPackets() {
     Storage storage;
     sceAgcDcbResetQueue(&storage.buffer, 0, 3);
@@ -65,10 +87,160 @@ void testPackets() {
     CommandBuffer empty{nullptr, nullptr, nullptr, nullptr, grow, &destination, 0};
     Agc::Command::Emit(&empty, 0x15u, {1, 1, 1, 0x41u}, __func__);
     check(empty.cursor_up == destination.words.data() + 5, "guest ABI allocation callback failed");
+    Storage reservedDestination;
+    CommandBuffer reserved{nullptr, nullptr, nullptr, nullptr, growReserved, &reservedDestination, 4};
+    Agc::Command::Emit(&reserved, 0x15u, {1, 1, 1, 0x41u}, __func__);
+    check(reserved.cursor_up == reservedDestination.words.data() + 5, "buffer with less room than its reserved words did not grow");
     Storage exhausted;
     exhausted.buffer.cursor_down = exhausted.words.data() + 2;
     expectFailure([&] { Agc::Command::WriteNop(&exhausted.buffer, 3, __func__); });
     check(exhausted.buffer.cursor_up == exhausted.words.data(), "failed allocation advanced cursor");
+}
+
+struct ContextGrowth {
+    Storage destination;
+    std::uint32_t* expectedCursor;
+    std::uint32_t expectedCount;
+    std::uint32_t calls = 0;
+    bool success = true;
+};
+
+bool APS5_VABI growContext(CommandBuffer* buffer, std::uint32_t count, void* userData) {
+    auto& growth = *static_cast<ContextGrowth*>(userData);
+    check(++growth.calls == 1, "unexpected repeated context allocation callback");
+    check(buffer->cursor_up == growth.expectedCursor, "context callback at wrong packet boundary");
+    check(count == growth.expectedCount, "incorrect context reservation size");
+    if (!growth.success) {
+        return false;
+    }
+    buffer->bottom = growth.destination.buffer.bottom;
+    buffer->top = growth.destination.buffer.top;
+    buffer->cursor_up = growth.destination.buffer.cursor_up;
+    buffer->cursor_down = growth.destination.buffer.cursor_down;
+    return true;
+}
+
+void testIndexedIndirectDraws() {
+    Storage storage;
+    const auto* single = sceAgcDcbDrawIndexIndirect(&storage.buffer, 0x40, 0);
+    const std::array<std::uint32_t, 5> expectedSingle{0xc0032500u, 0x40, 0x280, 0x280, 0};
+    check(single == storage.words.data() && std::equal(expectedSingle.begin(), expectedSingle.end(), single), "indexed indirect draw packet mismatch");
+    alignas(4) std::uint32_t count = 0;
+    const auto* multi = sceAgcDcbDrawIndexIndirectMulti(&storage.buffer, 0x80, 1, 8, &count, 20, 0);
+    const auto address = reinterpret_cast<std::uintptr_t>(&count);
+    const std::array<std::uint32_t, 10> expectedMulti{0xc0083800u, 0x80, 0x280, 0x280, 0x40000280u, 8, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 20, 0};
+    check(multi == storage.words.data() + expectedSingle.size() && std::equal(expectedMulti.begin(), expectedMulti.end(), multi), "indexed indirect multi draw packet mismatch");
+    check(storage.buffer.cursor_up == storage.words.data() + expectedSingle.size() + expectedMulti.size(), "incorrect indexed indirect cursor advance");
+    const auto before = storage.words;
+    expectFailure([&] { sceAgcDcbDrawIndexIndirect(&storage.buffer, 2, 0); });
+    expectFailure([&] { sceAgcDcbDrawIndexIndirectMulti(&storage.buffer, 0, 1, 8, &count, 16, 0); });
+    expectFailure([&] { sceAgcDcbDrawIndexIndirectMulti(&storage.buffer, 0, 0, 8, &count, 20, 0); });
+    check(storage.words == before, "invalid indexed indirect draw modified packet memory");
+}
+
+void testMarkers() {
+    Storage dcb;
+    Storage acb;
+    const auto* dcbPush = sceAgcDcbPushMarker(&dcb.buffer, "frame", 0xff0000u);
+    const auto* acbPush = sceAgcAcbPushMarker(&acb.buffer, "frame", 0x00ff00u);
+    check(acbPush == acb.words.data() && acbPush[0] == Agc::Command::Header(0x10, 3, 0x0bu << 2u), "ACB push marker header mismatch");
+    check(std::strcmp(reinterpret_cast<const char*>(acbPush + 1), "frame") == 0, "ACB push marker text mismatch");
+    const auto* acbPop = sceAgcAcbPopMarker(&acb.buffer);
+    check(acbPop == acb.words.data() + 3 && acbPop[0] == Agc::Command::Header(0x10, 2, 0x0cu << 2u) && acbPop[1] == 0, "ACB pop marker mismatch");
+    sceAgcDcbPopMarker(&dcb.buffer);
+    const auto* acbSet = sceAgcAcbSetMarker(&acb.buffer, nullptr, 0);
+    const auto* dcbSet = sceAgcDcbSetMarker(&dcb.buffer, nullptr, 0);
+    check(acbSet == acb.words.data() + 5 && dcbSet == dcb.words.data() + 5, "set marker did not return its push packet");
+    check(acbSet[0] == Agc::Command::Header(0x10, 2, 0x0bu << 2u) && acbSet[1] == 0 && acbSet[2] == Agc::Command::Header(0x10, 2, 0x0cu << 2u), "ACB set marker is not a push and pop pair");
+    check(dcbPush == dcb.words.data() && dcb.words == acb.words, "ACB and DCB markers differ");
+    check(acb.buffer.cursor_up == acb.words.data() + 9, "incorrect ACB marker cursor advance");
+    expectFailure([] { sceAgcAcbPushMarker(nullptr, "frame", 0); });
+    expectFailure([] { sceAgcAcbPopMarker(nullptr); });
+    expectFailure([] { sceAgcAcbSetMarker(nullptr, "frame", 0); });
+}
+
+void testIndexBuffer() {
+    Storage storage;
+    alignas(4) std::uint16_t indices[2]{};
+    const auto address = reinterpret_cast<std::uintptr_t>(indices);
+    const auto* bound = sceAgcDcbSetIndexBuffer(&storage.buffer, address);
+    check(bound[1] == static_cast<std::uint32_t>(address) && bound[2] == static_cast<std::uint32_t>(address >> 32u), "index buffer address mismatch");
+    const auto* unbound = sceAgcDcbSetIndexBuffer(&storage.buffer, 0);
+    check(unbound == bound + 3 && unbound[0] == bound[0] && unbound[1] == 0 && unbound[2] == 0, "index buffer was not unbound");
+    const auto before = storage.words;
+    try {
+        sceAgcDcbSetIndexBuffer(&storage.buffer, 0x1001);
+    } catch (const std::runtime_error& error) {
+        check(std::string(error.what()).find("0x1001") != std::string::npos, "misaligned index buffer error omits the address");
+        check(storage.words == before, "misaligned index buffer modified packet memory");
+        return;
+    }
+    throw std::runtime_error("misaligned index buffer was accepted");
+}
+
+void testContextState() {
+    const std::array<std::array<std::uint32_t, 6>, 4> sizes{{{5}, {5, 8, 9, 3, 2}, {3, 5, 8, 9, 2}, {5, 8, 9, 3, 2, 5}}};
+    const std::array<std::array<std::uint32_t, 4>, 4> reservations{{{5}, {22, 3, 2}, {3, 22, 2}, {22, 3, 2, 5}}};
+    const std::array<std::uint32_t, 4> totals{5, 27, 27, 32};
+    for (std::uint32_t operation = 0; operation < sizes.size(); ++operation) {
+        for (std::uint32_t capacity = 0; capacity <= totals[operation]; ++capacity) {
+            Storage source;
+            source.words.fill(0xdeadbeefu);
+            std::uint32_t split = 0;
+            std::uint32_t requested = 0;
+            for (const auto count : reservations[operation]) {
+                if (count > capacity - split) {
+                    requested = count;
+                    break;
+                }
+                split += count;
+            }
+            ContextGrowth growth{{}, source.words.data() + split, requested + 2};
+            growth.destination.words.fill(0xdeadbeefu);
+            source.buffer.cursor_down = source.words.data() + capacity + 2;
+            source.buffer.reserved_dw = 2;
+            source.buffer.callback = growContext;
+            source.buffer.user_data = &growth;
+            auto* first = sceAgcDcbContextStateAnotherOp(&source.buffer, operation);
+            check(first == (split == 0 ? growth.destination.words.data() : source.words.data()), "incorrect first context packet address");
+            check(growth.calls == (requested == 0 ? 0u : 1u), "incorrect context callback count");
+            auto* end = requested == 0 ? source.words.data() + totals[operation] : growth.destination.words.data() + totals[operation] - split;
+            check(source.buffer.cursor_up == end, "incorrect context cursor advance");
+            check(*end == 0xdeadbeefu && source.words[split] == 0xdeadbeefu, "context allocation overwrote adjacent memory");
+            std::uint32_t offset = 0;
+            for (const auto count : sizes[operation]) {
+                if (count == 0) {
+                    break;
+                }
+                const auto* packet = offset < split ? source.words.data() + offset : growth.destination.words.data() + offset - split;
+                const auto header = 0xc0001000u | ((count - 2u) << 16u) | (offset == 0 ? 0x68u : 0u);
+                check(packet[0] == header, "incorrect context packet header");
+                for (std::uint32_t i = 1; i < count; ++i) {
+                    check(packet[i] == (offset == 0 && i == 1 ? operation : 0u), "incorrect context packet payload");
+                }
+                offset += count;
+            }
+        }
+    }
+    expectFailure([] { sceAgcDcbContextStateAnotherOp(nullptr, 0); });
+    Storage invalid;
+    expectFailure([&] { sceAgcDcbContextStateAnotherOp(&invalid.buffer, 4); });
+    check(invalid.buffer.cursor_up == invalid.words.data(), "invalid context operation advanced cursor");
+    invalid.buffer.cursor_up = invalid.words.data() + 1;
+    invalid.buffer.cursor_down = invalid.words.data();
+    expectFailure([&] { sceAgcDcbContextStateAnotherOp(&invalid.buffer, 0); });
+    invalid.buffer.cursor_up = invalid.words.data();
+    expectFailure([&] { sceAgcDcbContextStateAnotherOp(&invalid.buffer, 1); });
+    ContextGrowth growth{{}, invalid.words.data(), 22};
+    invalid.buffer.callback = growContext;
+    invalid.buffer.user_data = &growth;
+    growth.success = false;
+    expectFailure([&] { sceAgcDcbContextStateAnotherOp(&invalid.buffer, 1); });
+    growth.calls = 0;
+    growth.success = true;
+    growth.destination.buffer.cursor_down = growth.destination.words.data() + 21;
+    expectFailure([&] { sceAgcDcbContextStateAnotherOp(&invalid.buffer, 1); });
+    check(invalid.buffer.cursor_up == growth.destination.words.data(), "failed reservation advanced cursor");
 }
 
 void testFlip() {
@@ -163,6 +335,10 @@ void testMemory() {
 }
 
 void testDefaults() {
+    std::uint32_t state = 0x12345678;
+    check(sceAgcInit(&state, 8) == 0 && state == 0x12345678, "AGC initialization failed or modified caller state");
+    expectFailure([] { sceAgcInit(nullptr, 8); });
+    expectFailure([&] { sceAgcInit(&state, 14); });
     for (std::uint32_t version = 0; version < 14; ++version) {
         for (const bool internal : {false, true}) {
             auto* first = Agc::Command::GetRegisterDefaults(version, internal, __func__);
@@ -178,6 +354,10 @@ void testDefaults() {
 int main() {
     try {
         testPackets();
+        testIndexedIndirectDraws();
+        testMarkers();
+        testIndexBuffer();
+        testContextState();
         testFlip();
         testRegisters();
         testRegisterRange();
