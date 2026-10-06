@@ -120,6 +120,20 @@ bool TranslationContext::imageLoad(const RdnaInstruction& inst) {
     return true;
 }
 
+bool TranslationContext::imageMsaaLoad(const RdnaInstruction& inst) {
+    MemoryInfo memory = imageMemoryInfoFromInstruction(inst);
+    memory.dataDwords = 1u;
+    memory.componentCount = 1u;
+    IrValue* resource = getImageResource(memory);
+    IrValue& exec = ir.GetExec();
+    for (std::uint32_t fragment = 0u; fragment < 4u; ++fragment) {
+        IrValue* address = makeImageAddress(inst, inst.source0, fragment);
+        IrValue& result = ir.Emit(IrOpcode::ImageRead, IrOpcodeType(IrOpcode::ImageRead), {resource, address, &exec}, addMemoryInfo(memory, inst.programCounter));
+        writeImageComponents(offsetOperand(inst.destination, fragment), &result, memory, 4u);
+    }
+    return true;
+}
+
 bool TranslationContext::imageStore(const RdnaInstruction& inst) {
     const MemoryInfo memory = imageMemoryInfoFromInstruction(inst);
     IrValue* resource = getImageResource(memory);

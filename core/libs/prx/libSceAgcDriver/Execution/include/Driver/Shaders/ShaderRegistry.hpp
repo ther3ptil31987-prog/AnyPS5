@@ -38,6 +38,7 @@ struct ShaderSnapshot {
 using ShaderRegistry = std::map<std::uint64_t, std::shared_ptr<const ShaderSnapshot>>;
 
 bool FailureMemo();
+std::shared_ptr<const ShaderSnapshot> ReadRawComputeShader(std::uint64_t address);
 
 std::uint64_t NullPixelProgramAddress();
 

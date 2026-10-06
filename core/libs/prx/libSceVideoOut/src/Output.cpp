@@ -80,6 +80,15 @@ int APS5_VABI sceVideoOutClose(int handle) try {
     LibcAwaitExit_nid_postfix();
 }
 
+int APS5_VABI sceVideoOutAllowOutputResolutionWqhdDetection(int handle) try {
+    if (!VideoOutDriver::Get().IsOpen(handle)) {
+        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
+    }
+    return 0;
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
+}
+
 int APS5_VABI sceVideoOutSetFlipRate(int handle, int rate) try {
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {

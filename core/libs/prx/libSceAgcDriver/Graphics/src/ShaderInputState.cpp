@@ -118,8 +118,9 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     const auto shaderControl = read(context, dbShaderControl, RegisterBank::Context);
     // Bits 9 and 11 are EXEC_ON_HIER_FAIL and ALPHA_TO_MASK_DISABLE on GFX10; neither changes what the
     // recompiled pixel shader computes.
-    if (((shaderControl >> 13u) & 0x3u) != 0) {
-        throw std::runtime_error("AGC graphics: DB_SHADER_CONTROL.CONSERVATIVE_Z_EXPORT is unsupported");
+    const auto conservativeZExport = (shaderControl >> 13u) & 0x3u;
+    if (conservativeZExport == 3u) {
+        throw std::runtime_error("AGC graphics: DB_SHADER_CONTROL.CONSERVATIVE_Z_EXPORT uses the reserved value 3");
     }
     const auto colFormat = nullProgram ? readOr(context, spiShaderColFormat, RegisterBank::Context, 0u) : read(context, spiShaderColFormat, RegisterBank::Context);
     std::array<std::uint8_t, 8> targetOutputMode{};
@@ -152,6 +153,7 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
         .sampleMaskExportEnable = sampleMaskExportEnable,
         .earlyZ = zOrder == 1u && !pixelKillEnable && !depthExportEnable && !sampleMaskExportEnable,
         .executeOnNoop = ((shaderControl >> 10u) & 0x1u) != 0,
+        .conservativeZExport = static_cast<ShaderRecompiler::ConservativeZExport>(conservativeZExport),
         .targetOutputMode = targetOutputMode,
         .targetExportMapping = exportMappings
     };

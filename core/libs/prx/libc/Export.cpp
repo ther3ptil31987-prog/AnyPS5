@@ -30,27 +30,12 @@ extern "C" {
         return 0;
     }
 
-APS5_EXPORT("Pu0Ecyk-7FU", libcUnknown_Pu0Ecyk_M7FU);
-int APS5_VABI libcUnknown_Pu0Ecyk_M7FU() {
- NotImplemented_nid_no_patch(__func__);
- return 0;
-}
-
 // Dead import of Cyberpunk 2077 (PPSA04029): no call sites, but the
 // Windows loader resolves imports strictly, so it must be present.
 APS5_EXPORT("u2tMGOLaqnE", libcUnknown_u2tMGOLaqnE);
 int APS5_VABI libcUnknown_u2tMGOLaqnE() {
  NotImplemented_nid_no_patch(__func__);
  return 0;
-}
-
-// Live float->float import of Cyberpunk 2077 (unnamed); callers pass one
-// float in xmm0 and consume the result, so return 0.0f instead of integer 0.
-APS5_EXPORT("DQbtGaBKlaw", libcCyberUnknown17);
-float APS5_VABI libcCyberUnknown17(float x) {
- (void)x;
- NotImplemented_nid_no_patch("DQbtGaBKlaw");
- return 0.0f;
 }
 
 // Live Cyberpunk 2077 import used in an fopen/fseek/ftell-like file-size
@@ -70,18 +55,6 @@ int APS5_VABI libcCyberUnknown19(void) {
 }
 
 
-APS5_EXPORT("2gbcltk3swE", libcCyberUnknown00);
-std::uint64_t APS5_VABI libcCyberUnknown00(void) {
-    NotImplemented_nid_no_patch("2gbcltk3swE");
-    return 0;
-}
-
-APS5_EXPORT("DiGVep5yB5w", libcCyberUnknown01);
-std::uint64_t APS5_VABI libcCyberUnknown01(void) {
-    NotImplemented_nid_no_patch("DiGVep5yB5w");
-    return 0;
-}
-
 APS5_EXPORT("Ye20uNnlglA", libcCyberUnknown02);
 std::uint64_t APS5_VABI libcCyberUnknown02(void) {
     NotImplemented_nid_no_patch("Ye20uNnlglA");
@@ -94,21 +67,9 @@ std::uint64_t APS5_VABI libcCyberUnknown03(void) {
     return 0;
 }
 
-APS5_EXPORT("79s2tnYQI6I", libcCyberUnknown04);
-std::uint64_t APS5_VABI libcCyberUnknown04(void) {
-    NotImplemented_nid_no_patch("79s2tnYQI6I");
-    return 0;
-}
-
 APS5_EXPORT("7yMFgcS8EPA", libcCyberUnknown05);
 std::uint64_t APS5_VABI libcCyberUnknown05(void) {
     NotImplemented_nid_no_patch("7yMFgcS8EPA");
-    return 0;
-}
-
-APS5_EXPORT("Cj+Fw5q1tUo", libcCyberUnknown06);
-std::uint64_t APS5_VABI libcCyberUnknown06(void) {
-    NotImplemented_nid_no_patch("Cj+Fw5q1tUo");
     return 0;
 }
 

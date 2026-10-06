@@ -36,9 +36,10 @@ static constexpr std::uint32_t AUDIO_OUT2_SAMPLE_RATE = 48000;
 // The grain a push carries, in samples per channel: a context's num_grains (Demon's Souls: 256, 5.33 ms).
 static constexpr std::uint32_t AUDIO_OUT2_DEFAULT_GRAIN = 256;
 static constexpr std::uint32_t AUDIO_OUT2_OUTPUT_CHANNELS = 2;
-static constexpr std::uint32_t AUDIO_OUT2_PORT_CHANNELS_MAX = 8;
+static constexpr std::uint32_t AUDIO_OUT2_PORT_CHANNELS_MAX = 12;
 
 struct AudioOut2Context;
+struct AudioOut2StereoFold;
 
 struct AudioOut2Port {
     bool used = false;
@@ -49,8 +50,9 @@ struct AudioOut2Port {
     std::uint32_t flags = 0;
     std::uint32_t channels = 0;
     bool int16 = false;
+    const AudioOut2StereoFold* fold = nullptr;
     const void* data = nullptr;
-    float volume[AUDIO_OUT2_PORT_CHANNELS_MAX] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    float volume[AUDIO_OUT2_PORT_CHANNELS_MAX] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     std::uint64_t dataSets = 0;
     std::uint64_t attributeTraces = 0;
 };

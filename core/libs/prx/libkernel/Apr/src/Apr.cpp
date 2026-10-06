@@ -4,6 +4,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/Apr/include/AprCommandBuffer.hpp"
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
@@ -16,7 +17,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -161,8 +164,61 @@ void _writeAddress(const Apr::WriteAddressCommand& command) {
 
 std::array<std::atomic<std::uint32_t>, 256> g_counters{};
 
+std::mutex g_counterWrites;
+
 std::uint32_t _counter(std::uint32_t index) {
     return g_counters[index % g_counters.size()].load(std::memory_order_acquire);
+}
+
+struct CounterField {
+    std::uint32_t bits;
+    std::uint32_t shift;
+};
+
+CounterField _counterField(Apr::CounterAccess access) {
+    const auto value = static_cast<std::uint32_t>(access);
+    if (value == 0) return {64, 0};
+    if (value == 1) return {32, 0};
+    if (value < 4) return {16, (value - 2) * 16};
+    if (value < 8) return {8, (value - 4) * 8};
+    throw std::runtime_error("APR: counter access " + std::to_string(value) + " not implemented");
+}
+
+std::uint64_t _fieldMask(std::uint32_t bits) {
+    return bits == 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << bits) - 1u;
+}
+
+std::uint64_t _readCounter(std::uint32_t index, Apr::CounterAccess access) {
+    const auto field = _counterField(access);
+    if (field.bits == 64) return _counter(index) | static_cast<std::uint64_t>(_counter(index + 1u)) << 32u;
+    return (_counter(index) >> field.shift) & _fieldMask(field.bits);
+}
+
+std::uint64_t _applyCounterOperation(Apr::CounterOperation operation, std::uint64_t current, std::uint64_t value) {
+    switch (operation) {
+        case Apr::CounterOperation::Store: return value;
+        case Apr::CounterOperation::AtomicOr: return current | value;
+        case Apr::CounterOperation::AtomicAndComplement: return current & ~value;
+        case Apr::CounterOperation::AtomicXor: return current ^ value;
+        case Apr::CounterOperation::AtomicAdd: return current + value;
+    }
+    throw std::runtime_error("APR: counter operation " + std::to_string(static_cast<std::uint32_t>(operation)) + " not implemented");
+}
+
+void _writeCounter(const Apr::WriteCounterCommand& command) {
+    const auto field = _counterField(command.access);
+    const std::lock_guard lock(g_counterWrites);
+    const std::uint64_t current = _readCounter(command.counter, command.access);
+    const std::uint64_t next = _applyCounterOperation(command.operation, current, command.value) & _fieldMask(field.bits);
+    auto& low = g_counters[command.counter % g_counters.size()];
+    if (field.bits == 64) {
+        g_counters[(command.counter + 1u) % g_counters.size()].store(static_cast<std::uint32_t>(next >> 32u), std::memory_order_release);
+        low.store(static_cast<std::uint32_t>(next), std::memory_order_release);
+        return;
+    }
+    const auto mask = static_cast<std::uint32_t>(_fieldMask(field.bits) << field.shift);
+    const auto bits = static_cast<std::uint32_t>(next << field.shift);
+    low.store((low.load(std::memory_order_relaxed) & ~mask) | bits, std::memory_order_release);
 }
 
 bool _waitSatisfied(std::uint32_t compare, std::uint64_t value, std::uint64_t reference) {
@@ -186,9 +242,281 @@ TCommand _read(const Apr::CommandBufferObject& buffer, std::uint32_t cursor) {
     return command;
 }
 
+constexpr std::uint64_t AmmRangeBytes = 32ull << 30;
+constexpr int GuestMapFixed = 0x10;
+
+struct AmmPage {
+    std::uint64_t physical;
+    std::int32_t type;
+    std::int32_t protection;
+    bool pooled;
+};
+
+struct AmmState {
+    std::mutex lock;
+    std::uintptr_t base = 0;
+    std::map<std::uint64_t, std::uint64_t> pool;
+    std::map<std::uintptr_t, AmmPage> pages;
+    std::map<std::uint64_t, std::uint32_t> pooledUses;
+    std::set<std::uintptr_t> prt;
+    std::atomic<std::uint32_t> lastSubmit{0};
+};
+
+AmmState& _amm() {
+    static AmmState state;
+    return state;
+}
+
+std::uintptr_t _ammBase(AmmState& state) {
+    if (state.base == 0) {
+        void* address = nullptr;
+        if (DoReserveVirtual(&address, 2 * AmmRangeBytes, 0, 0x200000) != 0) throw std::runtime_error("AMM: cannot reserve the virtual address range");
+        state.base = reinterpret_cast<std::uintptr_t>(address);
+    }
+    return state.base;
+}
+
+void _ammCheckRange(AmmState& state, std::uint64_t address, std::uint64_t size) {
+    const auto base = _ammBase(state);
+    if (address < base || size > 2 * AmmRangeBytes || address - base > 2 * AmmRangeBytes - size) throw std::runtime_error("AMM: range outside the AMM virtual address range");
+}
+
+int _ammHostProtection(std::int32_t protection) {
+    int host = protection & 0x33;
+    if ((protection & 0x140) != 0) host |= 1;
+    if ((protection & 0x280) != 0) host |= 3;
+    if ((host & 2) != 0) host |= 1;
+    return host;
+}
+
+void _returnPoolPages(AmmState& state, std::uint64_t offset, std::uint64_t bytes) {
+    auto next = state.pool.lower_bound(offset);
+    if (next != state.pool.end() && next->first == offset + bytes) {
+        bytes += next->second;
+        next = state.pool.erase(next);
+    }
+    if (next != state.pool.begin()) {
+        const auto previous = std::prev(next);
+        if (previous->first + previous->second == offset) {
+            previous->second += bytes;
+            return;
+        }
+    }
+    state.pool.emplace(offset, bytes);
+}
+
+std::uint64_t _takePoolPages(AmmState& state, std::uint64_t bytes) {
+    for (auto it = state.pool.begin(); it != state.pool.end(); ++it) {
+        if (it->second < bytes) continue;
+        const auto offset = it->first;
+        const auto remaining = it->second - bytes;
+        state.pool.erase(it);
+        if (remaining != 0) state.pool.emplace(offset + bytes, remaining);
+        return offset;
+    }
+    throw std::runtime_error("AMM: no free run of " + std::to_string(bytes) + " bytes in the direct memory given to the mapper");
+}
+
+void _addPage(AmmState& state, std::uint64_t address, const AmmPage& page) {
+    state.pages[address] = page;
+    if (page.pooled) ++state.pooledUses[page.physical];
+}
+
+void _forgetPages(AmmState& state, std::uint64_t address, std::uint64_t size, bool release) {
+    for (auto it = state.pages.lower_bound(address); it != state.pages.end() && it->first < address + size;) {
+        if (it->second.pooled) {
+            const auto uses = state.pooledUses.find(it->second.physical);
+            if (--uses->second == 0 && release) {
+                state.pooledUses.erase(uses);
+                _returnPoolPages(state, it->second.physical, PS5_PAGE_SIZE);
+            }
+        }
+        it = state.pages.erase(it);
+    }
+}
+
+std::vector<AmmPage> _mappedPages(AmmState& state, std::uint64_t address, std::uint64_t size) {
+    std::vector<AmmPage> pages;
+    for (std::uint64_t offset = 0; offset < size; offset += PS5_PAGE_SIZE) {
+        const auto found = state.pages.find(address + offset);
+        if (found == state.pages.end()) throw std::runtime_error("AMM: range is not fully mapped");
+        pages.push_back(found->second);
+    }
+    return pages;
+}
+
+void _reserve(std::uint64_t address, std::uint64_t size) {
+    void* target = reinterpret_cast<void*>(address);
+    if (DoReserveVirtual(&target, size, GuestMapFixed, 0) != 0) throw std::runtime_error("AMM: cannot return the range to the reservation");
+}
+
+void _mapRun(std::uint64_t address, std::uint64_t physical, std::uint64_t size, std::int32_t protection) {
+    void* target = reinterpret_cast<void*>(address);
+    if (DoMapDirect(&target, size, _ammHostProtection(protection), GuestMapFixed, static_cast<std::int64_t>(physical), 0) != 0) throw std::runtime_error("AMM: map failed");
+}
+
+void _mapPages(AmmState& state, std::uint64_t address, const std::vector<AmmPage>& pages) {
+    for (std::size_t first = 0; first < pages.size();) {
+        std::size_t last = first + 1;
+        while (last < pages.size() && pages[last].physical == pages[last - 1].physical + PS5_PAGE_SIZE && pages[last].protection == pages[first].protection) ++last;
+        _mapRun(address + first * PS5_PAGE_SIZE, pages[first].physical, (last - first) * PS5_PAGE_SIZE, pages[first].protection);
+        first = last;
+    }
+    for (std::size_t index = 0; index < pages.size(); ++index) _addPage(state, address + index * PS5_PAGE_SIZE, pages[index]);
+}
+
+void _clearPrt(AmmState& state, std::uint64_t address, std::uint64_t size) {
+    state.prt.erase(state.prt.lower_bound(address), state.prt.lower_bound(address + size));
+}
+
+void _requirePrt(AmmState& state, std::uint64_t address, std::uint64_t size) {
+    for (std::uint64_t offset = 0; offset < size; offset += PS5_PAGE_SIZE) {
+        if (!state.prt.contains(address + offset)) throw std::runtime_error("AMM: range is not a PRT range");
+    }
+}
+
+void _zeroPrt(std::uint64_t address, std::uint64_t size) {
+    constexpr int GpuRead = 0x10;
+    void* target = reinterpret_cast<void*>(address);
+    if (DoMapAnon(&target, size, GpuRead, GuestMapFixed) != 0) throw std::runtime_error("AMM: cannot map the unbacked PRT pages");
+}
+
+void _ammUnmap(const Apr::AmmUnmapCommand& command) {
+    auto& state = _amm();
+    const std::lock_guard lock(state.lock);
+    _ammCheckRange(state, command.address, command.size);
+    _forgetPages(state, command.address, command.size, true);
+    _clearPrt(state, command.address, command.size);
+    _reserve(command.address, command.size);
+}
+
+void _ammMapAsPrt(const Apr::AmmUnmapCommand& command) {
+    auto& state = _amm();
+    const std::lock_guard lock(state.lock);
+    _ammCheckRange(state, command.address, command.size);
+    _forgetPages(state, command.address, command.size, true);
+    _zeroPrt(command.address, command.size);
+    for (std::uint64_t offset = 0; offset < command.size; offset += PS5_PAGE_SIZE) state.prt.insert(command.address + offset);
+}
+
+void _ammUnmapToPrt(const Apr::AmmUnmapCommand& command) {
+    auto& state = _amm();
+    const std::lock_guard lock(state.lock);
+    _ammCheckRange(state, command.address, command.size);
+    _requirePrt(state, command.address, command.size);
+    _forgetPages(state, command.address, command.size, true);
+    _zeroPrt(command.address, command.size);
+}
+
+void _ammAllocatePrt(const Apr::AmmProtectCommand& command) {
+    auto& state = _amm();
+    const std::lock_guard lock(state.lock);
+    _ammCheckRange(state, command.address, command.size);
+    _requirePrt(state, command.address, command.size);
+    for (std::uint64_t offset = 0; offset < command.size;) {
+        const auto address = command.address + offset;
+        const bool backed = state.pages.contains(address);
+        std::uint64_t end = offset + PS5_PAGE_SIZE;
+        while (end < command.size && state.pages.contains(command.address + end) == backed) end += PS5_PAGE_SIZE;
+        const auto bytes = end - offset;
+        if (backed) {
+            for (std::uint64_t page = 0; page < bytes; page += PS5_PAGE_SIZE) {
+                auto& entry = state.pages[address + page];
+                entry.type = command.type;
+                entry.protection = command.protection;
+            }
+            if (DoMprotect(reinterpret_cast<void*>(address), bytes, _ammHostProtection(command.protection)) != 0) throw std::runtime_error("AMM: protection change failed");
+        } else {
+            std::vector<AmmPage> pages;
+            try {
+                for (std::uint64_t page = 0; page < bytes; page += PS5_PAGE_SIZE) pages.push_back({_takePoolPages(state, PS5_PAGE_SIZE), command.type, command.protection, true});
+            } catch (...) {
+                for (const auto& page : pages) _returnPoolPages(state, page.physical, PS5_PAGE_SIZE);
+                throw;
+            }
+            _mapPages(state, address, pages);
+        }
+        offset = end;
+    }
+}
+
+void _ammMap(const Apr::AmmMapCommand& command, bool direct) {
+    auto& state = _amm();
+    const std::lock_guard lock(state.lock);
+    _ammCheckRange(state, command.address, command.size);
+    _forgetPages(state, command.address, command.size, true);
+    _clearPrt(state, command.address, command.size);
+    const auto physical = direct ? command.directOffset : _takePoolPages(state, command.size);
+    try {
+        _mapRun(command.address, physical, command.size, command.protection);
+    } catch (...) {
+        if (!direct) _returnPoolPages(state, physical, command.size);
+        throw;
+    }
+    for (std::uint64_t offset = 0; offset < command.size; offset += PS5_PAGE_SIZE) _addPage(state, command.address + offset, {physical + offset, command.type, command.protection, !direct});
+}
+
+void _ammRemap(const Apr::AmmRemapCommand& command, bool alias, bool intoPrt) {
+    auto& state = _amm();
+    const std::lock_guard lock(state.lock);
+    _ammCheckRange(state, command.address, command.size);
+    _ammCheckRange(state, command.source, command.size);
+    if ((alias || intoPrt) && command.address < command.source + command.size && command.source < command.address + command.size) throw std::runtime_error("AMM: remap onto its own source range");
+    if (intoPrt) _requirePrt(state, command.address, command.size);
+    auto pages = _mappedPages(state, command.source, command.size);
+    for (auto& page : pages) page.protection = command.protection;
+    if (!alias) {
+        _forgetPages(state, command.source, command.size, false);
+        _clearPrt(state, command.source, command.size);
+        _reserve(command.source, command.size);
+    }
+    _forgetPages(state, command.address, command.size, true);
+    if (!intoPrt) _clearPrt(state, command.address, command.size);
+    _mapPages(state, command.address, pages);
+}
+
+void _ammProtect(const Apr::AmmProtectCommand& command, bool type) {
+    auto& state = _amm();
+    const std::lock_guard lock(state.lock);
+    _ammCheckRange(state, command.address, command.size);
+    auto pages = _mappedPages(state, command.address, command.size);
+    for (std::size_t index = 0; index < pages.size(); ++index) {
+        auto& page = pages[index];
+        page.protection = (page.protection & ~command.mask) | (command.protection & command.mask);
+        if (type) page.type = command.type;
+        state.pages[command.address + index * PS5_PAGE_SIZE] = page;
+    }
+    for (std::size_t first = 0; first < pages.size();) {
+        const int host = _ammHostProtection(pages[first].protection);
+        std::size_t last = first + 1;
+        while (last < pages.size() && _ammHostProtection(pages[last].protection) == host) ++last;
+        if (DoMprotect(reinterpret_cast<void*>(command.address + first * PS5_PAGE_SIZE), (last - first) * PS5_PAGE_SIZE, host) != 0) throw std::runtime_error("AMM: protection change failed");
+        first = last;
+    }
+}
+
+struct ReadCursor {
+    bool valid = false;
+    std::uint32_t fileId = 0;
+    std::uint64_t nextDestination = 0;
+    std::uint64_t nextOffset = 0;
+};
+
+void _readResolved(Apr::Opcode opcode, Apr::ReadFileCommand command, ReadCursor& read) {
+    if (opcode != Apr::Opcode::ReadFile) {
+        if (!read.valid) throw std::runtime_error("APR: gather or scatter read without a preceding read");
+        command.fileId = read.fileId;
+        if (opcode == Apr::Opcode::ReadFileGather) command.destination = read.nextDestination;
+        if (opcode == Apr::Opcode::ReadFileScatter) command.offset = read.nextOffset;
+    }
+    _readFile(command);
+    read = {true, command.fileId, command.destination + command.size, command.offset + command.size};
+}
+
 void _execute(const Apr::CommandBufferObject& buffer) {
     std::uint32_t cursor = 0;
-    for (std::uint32_t index = 0; index < buffer.numCommands; ++index) {
+    ReadCursor read;
+    while (cursor < buffer.offset) {
         if (cursor + sizeof(Apr::CommandHeader) > buffer.offset) throw std::runtime_error("APR: truncated command buffer");
         Apr::CommandHeader header;
         std::memcpy(&header, buffer.base + cursor, sizeof(header));
@@ -199,12 +527,44 @@ void _execute(const Apr::CommandBufferObject& buffer) {
         case Apr::Opcode::PopMarker:
         case Apr::Opcode::SetMarker:
             break;
-        case Apr::Opcode::ReadFile: {
-            Apr::ReadFileCommand command;
-            std::memcpy(&command, buffer.base + cursor, sizeof(command));
-            _readFile(command);
+        case Apr::Opcode::ReadFile:
+        case Apr::Opcode::ReadFileGather:
+        case Apr::Opcode::ReadFileScatter:
+        case Apr::Opcode::ReadFileGatherScatter:
+            _readResolved(header.opcode, _read<Apr::ReadFileCommand>(buffer, cursor), read);
             break;
-        }
+        case Apr::Opcode::ResetGatherScatterState:
+            read = {};
+            break;
+        case Apr::Opcode::AmmMap:
+        case Apr::Opcode::AmmMapDirect:
+            _ammMap(_read<Apr::AmmMapCommand>(buffer, cursor), header.opcode == Apr::Opcode::AmmMapDirect);
+            break;
+        case Apr::Opcode::AmmUnmap:
+            _ammUnmap(_read<Apr::AmmUnmapCommand>(buffer, cursor));
+            break;
+        case Apr::Opcode::AmmRemap:
+        case Apr::Opcode::AmmMultiMap:
+            _ammRemap(_read<Apr::AmmRemapCommand>(buffer, cursor), header.opcode == Apr::Opcode::AmmMultiMap, false);
+            break;
+        case Apr::Opcode::AmmRemapIntoPrt:
+            _ammRemap(_read<Apr::AmmRemapCommand>(buffer, cursor), false, true);
+            break;
+        case Apr::Opcode::AmmMapAsPrt:
+            _ammMapAsPrt(_read<Apr::AmmUnmapCommand>(buffer, cursor));
+            break;
+        case Apr::Opcode::AmmUnmapToPrt:
+            _ammUnmapToPrt(_read<Apr::AmmUnmapCommand>(buffer, cursor));
+            break;
+        case Apr::Opcode::AmmAllocatePaForPrt:
+            _ammAllocatePrt(_read<Apr::AmmProtectCommand>(buffer, cursor));
+            break;
+        case Apr::Opcode::AmmModifyProtect:
+        case Apr::Opcode::AmmModifyMtypeProtect:
+            _ammProtect(_read<Apr::AmmProtectCommand>(buffer, cursor), header.opcode == Apr::Opcode::AmmModifyMtypeProtect);
+            break;
+        case Apr::Opcode::MapEnd:
+            break;
         case Apr::Opcode::WriteAddress: {
             Apr::WriteAddressCommand command;
             std::memcpy(&command, buffer.base + cursor, sizeof(command));
@@ -212,18 +572,20 @@ void _execute(const Apr::CommandBufferObject& buffer) {
             break;
         }
         case Apr::Opcode::WriteCounter: {
-            const auto command = _read<Apr::WriteCounterCommand>(buffer, cursor);
-            g_counters[command.counter % g_counters.size()].store(command.value, std::memory_order_release);
+            _writeCounter(_read<Apr::WriteCounterCommand>(buffer, cursor));
             break;
         }
         case Apr::Opcode::WaitOnAddress:
         case Apr::Opcode::WaitOnCounter: {
             const auto command = _read<Apr::WaitCommand>(buffer, cursor);
+            const bool counter = header.opcode == Apr::Opcode::WaitOnCounter;
+            const std::uint32_t unused = counter ? 64u - _counterField(command.access).bits : 0u;
             const auto current = [&]() -> std::uint64_t {
-                if (header.opcode == Apr::Opcode::WaitOnCounter) return _counter(command.counter);
+                if (counter) return _readCounter(command.counter, command.access);
                 return std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(command.address)).load(std::memory_order_acquire);
             };
-            while (!_waitSatisfied(command.compare, current() & command.mask, command.reference & command.mask)) std::this_thread::sleep_for(std::chrono::microseconds(50));
+            const std::uint64_t reference = (command.reference & command.mask) << unused;
+            while (!_waitSatisfied(command.compare, (current() & command.mask) << unused, reference)) std::this_thread::sleep_for(std::chrono::microseconds(50));
             break;
         }
         case Apr::Opcode::WriteKernelEventQueue: {
@@ -254,6 +616,41 @@ void _execute(const Apr::CommandBufferObject& buffer) {
 }
 
 extern "C" {
+
+int APS5_VABI sceKernelAllocateDirectMemory(int64_t searchStart, int64_t searchEnd, size_t length, size_t alignment, int memoryType, int64_t* offset);
+
+int AmmGiveDirectMemory_nid_no_patch(std::int64_t searchStart, std::int64_t searchEnd, std::size_t size, std::size_t alignment, int usage, std::int64_t* offset) {
+    if (!offset || (usage != 0 && usage != 1)) return SCE_KERNEL_ERROR_EINVAL;
+    const int result = sceKernelAllocateDirectMemory(searchStart, searchEnd, size, alignment, 0, offset);
+    if (result != 0 || usage == 0) return result;
+    auto& state = _amm();
+    const std::lock_guard lock(state.lock);
+    _returnPoolPages(state, static_cast<std::uint64_t>(*offset), size);
+    return 0;
+}
+
+void AmmVirtualAddressRanges_nid_no_patch(std::uint64_t* start, std::uint64_t* end, std::uint64_t* multimapStart, std::uint64_t* multimapEnd) {
+    auto& state = _amm();
+    const std::lock_guard lock(state.lock);
+    const auto base = _ammBase(state);
+    if (start) *start = base;
+    if (end) *end = base + AmmRangeBytes;
+    if (multimapStart) *multimapStart = base + AmmRangeBytes;
+    if (multimapEnd) *multimapEnd = base + 2 * AmmRangeBytes;
+}
+
+std::uint32_t AmmSubmit_nid_no_patch(void* base, std::uint32_t bytes) {
+    _execute(Apr::CommandBufferObject{static_cast<std::uint8_t*>(base), bytes, bytes, 0, Apr::BufferType::Generic, 0});
+    auto& last = _amm().lastSubmit;
+    std::uint32_t id = last.fetch_add(1) + 1;
+    while (id == 0) id = last.fetch_add(1) + 1;
+    return id;
+}
+
+bool AmmSubmitted_nid_no_patch(std::uint32_t id) {
+    return id != 0 && id <= _amm().lastSubmit.load();
+}
+
 
 int APS5_VABI sceKernelAprResolveFilepathsToIds(const char** paths, uint32_t count, uint32_t* ids, uint32_t* error_index) {
     if (!paths || !ids) return _fail(GUEST_EINVAL);

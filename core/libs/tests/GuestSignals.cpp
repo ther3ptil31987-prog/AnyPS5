@@ -8,12 +8,17 @@ Handler APS5_VABI signal_nid_postfix(int, Handler);
 int APS5_VABI raise_nid_postfix(int);
 int APS5_VABI sigprocmask_nid_postfix(int, const void*, void*);
 int* APS5_VABI __error_nid_postfix();
+int APS5_VABI _is_signal_return_nid_postfix(std::uint64_t);
 }
 struct GuestSignalSet {
     std::uint32_t bits[4];
 };
 volatile std::sig_atomic_t received = 0;
-void APS5_VABI Callback(int value) { received = value; }
+volatile std::uintptr_t handlerReturn = 0;
+void APS5_VABI Callback(int value) {
+    received = value;
+    handlerReturn = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
+}
 static void Require(bool value) { if (!value) std::abort(); }
 int main() {
     const auto invalid = reinterpret_cast<Handler>(static_cast<std::uintptr_t>(-1));
@@ -22,6 +27,9 @@ int main() {
     Require(*__error_nid_postfix() == 22);
     Require(signal_nid_postfix(15, Callback) != invalid);
     Require(raise_nid_postfix(15) == 0 && received == 15);
+    Require(handlerReturn != 0 && _is_signal_return_nid_postfix(handlerReturn) == 0);
+    Require(_is_signal_return_nid_postfix(reinterpret_cast<std::uintptr_t>(Callback)) == 0);
+    Require(_is_signal_return_nid_postfix(0) == 0);
     received = 0;
     Require(raise_nid_postfix(15) == 0 && received == 15);
     Require(signal_nid_postfix(15, ignore) != invalid);

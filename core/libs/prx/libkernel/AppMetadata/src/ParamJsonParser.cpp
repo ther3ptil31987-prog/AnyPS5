@@ -1,6 +1,7 @@
 #include "prx/libkernel/AppMetadata/include/ParamJsonParser.hpp"
 
 #include <cstdint>
+#include <charconv>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -21,6 +22,7 @@ struct JsonValue {
     JsonType type = JsonType::Null;
     bool boolValue = false;
     double numberValue = 0.0;
+    std::string numberText;
     std::string stringValue;
     JsonArray arrayValue;
     JsonObject objectValue;
@@ -193,7 +195,8 @@ JsonValue parseJsonNumber(const std::string& text, std::size_t& position) {
     }
     JsonValue value;
     value.type = JsonType::Number;
-    value.numberValue = std::stod(text.substr(start, position - start));
+    value.numberText = text.substr(start, position - start);
+    value.numberValue = std::stod(value.numberText);
     return value;
 }
 
@@ -246,12 +249,21 @@ ParsedParamJson parseParamJson(const std::filesystem::path& paramJsonPath) {
     if (localizedParametersValue->type != JsonType::Object) throw std::runtime_error("param.json localizedParameters is not an object");
     if (localizedParametersValue->objectValue.empty()) throw std::runtime_error("param.json localizedParameters is empty");
     std::string selectedLanguage;
-    const JsonValue* defaultLanguageValue = findObjectMember(root, "defaultLanguage");
+    const JsonValue* defaultLanguageValue = findObjectMember(*localizedParametersValue, "defaultLanguage");
+    if (defaultLanguageValue == nullptr) defaultLanguageValue = findObjectMember(root, "defaultLanguage");
     if (defaultLanguageValue != nullptr) selectedLanguage = asString(*defaultLanguageValue, "defaultLanguage");
     const JsonValue* languageObject = nullptr;
     if (!selectedLanguage.empty()) languageObject = findObjectMember(*localizedParametersValue, selectedLanguage);
     if (languageObject == nullptr) languageObject = findObjectMember(*localizedParametersValue, "en-US");
-    if (languageObject == nullptr) languageObject = &localizedParametersValue->objectValue.front().second;
+    if (languageObject == nullptr) {
+        for (const auto& member : localizedParametersValue->objectValue) {
+            if (member.second.type == JsonType::Object) {
+                languageObject = &member.second;
+                break;
+            }
+        }
+    }
+    if (languageObject == nullptr) throw std::runtime_error("param.json localizedParameters has no language entry");
     const JsonValue* titleValue = findObjectMember(*languageObject, "titleName");
     if (titleValue == nullptr) throw std::runtime_error("param.json localized entry is missing titleName");
     const std::string title = asString(*titleValue, "titleName");
@@ -261,7 +273,14 @@ ParsedParamJson parseParamJson(const std::filesystem::path& paramJsonPath) {
     result.titleId = titleId;
     if (const JsonValue* downloadData = findObjectMember(root, "downloadDataSize")) {
         if (downloadData->type != JsonType::Number || downloadData->numberValue < 0) throw std::runtime_error("param.json downloadDataSize is not a size");
-        result.downloadDataSizeMiB = static_cast<std::uint64_t>(downloadData->numberValue);
+        if (downloadData->numberText.find_first_of("-.eE") == std::string::npos) {
+            const auto& number = downloadData->numberText;
+            const auto parsed = std::from_chars(number.data(), number.data() + number.size(), result.downloadDataSizeMiB);
+            if (parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size()) throw std::runtime_error("param.json downloadDataSize exceeds uint64 range");
+        } else {
+            if (downloadData->numberValue >= 0x1p64) throw std::runtime_error("param.json downloadDataSize exceeds uint64 range");
+            result.downloadDataSizeMiB = static_cast<std::uint64_t>(downloadData->numberValue);
+        }
     }
     return result;
 }

@@ -12,6 +12,16 @@
 #include <unistd.h>
 #endif
 
+extern "C" int APS5_VABI sceKernelDebugOutText(int channel, const char* text) {
+    if (channel < 0) return static_cast<int>(0x80020016u);
+    if (!text) return static_cast<int>(0x8002000eu);
+    static std::mutex outputMutex;
+    const std::lock_guard lock(outputMutex);
+    if (std::fprintf(stderr, "[debug:%d] %s", channel, text) < 0 || std::fflush(stderr) != 0)
+        return static_cast<int>(0x80020005u);
+    return 0;
+}
+
 extern "C" int APS5_VABI sceKernelSendNotificationRequest(int device, const void* request, std::size_t size, int flags) {
     constexpr auto invalidArgument = static_cast<int>(0x80020016u);
     constexpr auto badAddress = static_cast<int>(0x8002000eu);

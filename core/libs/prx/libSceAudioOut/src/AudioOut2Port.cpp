@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -26,6 +27,7 @@ static constexpr std::uint32_t ATTRIBUTE_VOLUME = 1;
 static constexpr std::uint32_t FORMAT_CHANNELS_SHIFT = 8;
 static constexpr std::uint32_t FORMAT_CHANNELS_MASK = 0xFu;
 static constexpr std::uint32_t FORMAT_TYPE_MASK = 0x7Fu;
+static constexpr std::uint32_t FORMAT_FIELDS_MASK = 0xFFFu;
 
 static std::mutex g_portsLock;
 // Grows on demand: the title opens its bed ports plus max_object_ports object ports at once.
@@ -37,9 +39,28 @@ static AudioOut2Port* FromHandle(AudioOut2PortHandle handle) {
     return &g_ports[index];
 }
 
-// 8-channel order FL FR C LFE RL RR SL SR (a swapped rear/side pair order sums the same): the rear
-// and side pairs fold into the front at -3 dB, the centre into both sides, and the LFE is dropped.
-static constexpr float DOWNMIX_GAIN = 0.7071f;
+static constexpr float FOLD_GAIN = 0.7071f;
+static constexpr float FOLD_GAIN_TWICE = FOLD_GAIN * FOLD_GAIN;
+
+struct AudioOut2StereoFold {
+    std::uint32_t channels;
+    float left[AUDIO_OUT2_PORT_CHANNELS_MAX];
+    float right[AUDIO_OUT2_PORT_CHANNELS_MAX];
+};
+
+static constexpr AudioOut2StereoFold STEREO_FOLDS[] = {
+    {1, {1.0f}, {1.0f}},
+    {2, {1.0f, 0.0f}, {0.0f, 1.0f}},
+    {6, {1.0f, 0.0f, FOLD_GAIN, 0.0f, FOLD_GAIN, 0.0f}, {0.0f, 1.0f, FOLD_GAIN, 0.0f, 0.0f, FOLD_GAIN}},
+    {8, {1.0f, 0.0f, FOLD_GAIN, 0.0f, FOLD_GAIN, 0.0f, FOLD_GAIN, 0.0f}, {0.0f, 1.0f, FOLD_GAIN, 0.0f, 0.0f, FOLD_GAIN, 0.0f, FOLD_GAIN}},
+    {12, {1.0f, 0.0f, FOLD_GAIN, 0.0f, FOLD_GAIN, 0.0f, FOLD_GAIN, 0.0f, FOLD_GAIN, 0.0f, FOLD_GAIN_TWICE, 0.0f},
+        {0.0f, 1.0f, FOLD_GAIN, 0.0f, 0.0f, FOLD_GAIN, 0.0f, FOLD_GAIN, 0.0f, FOLD_GAIN, 0.0f, FOLD_GAIN_TWICE}},
+};
+
+static const AudioOut2StereoFold* StereoFoldFor(std::uint32_t channels) {
+    const auto found = std::find_if(std::begin(STEREO_FOLDS), std::end(STEREO_FOLDS), [channels](const AudioOut2StereoFold& fold) { return fold.channels == channels; });
+    return found == std::end(STEREO_FOLDS) ? nullptr : found;
+}
 
 static void ReadFrame(const AudioOut2Port& port, std::uint32_t frame, float* in) {
     const auto first = static_cast<std::size_t>(frame) * port.channels;
@@ -57,22 +78,16 @@ static void AccumulatePadPort(const AudioOut2Port& port, AudioOut2Route route, f
 }
 
 static void AccumulatePort(const AudioOut2Port& port, float* out, std::uint32_t frames) {
-    const auto ch = port.channels;
-    const float* volume = port.volume;
+    const auto& fold = *port.fold;
     float in[AUDIO_OUT2_PORT_CHANNELS_MAX];
     for (std::uint32_t frame = 0; frame < frames; frame++) {
         ReadFrame(port, frame, in);
         float left = 0.0f;
         float right = 0.0f;
-        if (ch == 1) {
-            left = right = in[0] * volume[0];
-        } else if (ch < 8) {
-            left = in[0] * volume[0];
-            right = in[1] * volume[1];
-        } else {
-            const float centre = in[2] * volume[2] * DOWNMIX_GAIN;
-            left = in[0] * volume[0] + centre + (in[4] * volume[4] + in[6] * volume[6]) * DOWNMIX_GAIN;
-            right = in[1] * volume[1] + centre + (in[5] * volume[5] + in[7] * volume[7]) * DOWNMIX_GAIN;
+        for (std::uint32_t c = 0; c < port.channels; c++) {
+            const float sample = in[c] * port.volume[c];
+            if (fold.left[c] != 0.0f) left += sample * fold.left[c];
+            if (fold.right[c] != 0.0f) right += sample * fold.right[c];
         }
         out[frame * AUDIO_OUT2_OUTPUT_CHANNELS] += left;
         out[frame * AUDIO_OUT2_OUTPUT_CHANNELS + 1] += right;
@@ -144,7 +159,8 @@ int APS5_VABI sceAudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut2
     entry.flags = params->flags;
     entry.channels = (params->data_format >> FORMAT_CHANNELS_SHIFT) & FORMAT_CHANNELS_MASK;
     const auto sampleType = params->data_format & FORMAT_TYPE_MASK;
-    if (entry.channels == 0 || entry.channels > AUDIO_OUT2_PORT_CHANNELS_MAX || sampleType > 1) {
+    entry.fold = StereoFoldFor(entry.channels);
+    if (entry.fold == nullptr || sampleType > 1 || (params->data_format & ~FORMAT_FIELDS_MASK) != 0) {
         entry = AudioOut2Port{};
         throw std::runtime_error("sceAudioOut2PortCreate: data format 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%x", params->data_format); return std::string(text); }() + " is not implemented");
     }

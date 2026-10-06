@@ -6,6 +6,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -47,10 +48,35 @@ struct Ngs2Atrac9 {
 
 struct Ngs2Voice;
 
+struct Ngs2FilterHistory {
+    double x1 = 0.0;
+    double x2 = 0.0;
+    double y1 = 0.0;
+    double y2 = 0.0;
+};
+
+struct Ngs2Filter {
+    bool enabled = false;
+    std::uint64_t bypassMask = 0;
+    double b0 = 1.0;
+    double b1 = 0.0;
+    double b2 = 0.0;
+    double a1 = 0.0;
+    double a2 = 0.0;
+    std::vector<Ngs2FilterHistory> history;
+};
+
 struct Ngs2Port {
     Ngs2Voice* dest = nullptr;
     float volume = 1.0f;
     std::int32_t matrix = -1;
+};
+
+struct Ngs2UserFx2 {
+    std::vector<std::uint8_t> param;
+    std::vector<std::uint8_t> work;
+    std::vector<std::uint8_t> state;
+    std::uint32_t flags = 0;
 };
 
 struct Ngs2Voice {
@@ -73,7 +99,9 @@ struct Ngs2Voice {
     std::uint32_t callbackFlags = 0;
     std::vector<Ngs2Port> ports;
     std::vector<std::vector<float>> matrices;
+    std::vector<Ngs2Filter> filters;
     std::uint32_t outputId = 0;
+    std::vector<Ngs2UserFx2> userFx;
     std::vector<float> samples;
     bool rendering = false;
     bool rendered = false;
@@ -88,9 +116,12 @@ struct Ngs2Rack {
     Ngs2System* system = nullptr;
     std::uint32_t rackId = 0;
     std::uint32_t maxChannels = 0;
+    std::uint32_t maxFilters = 0;
     Ngs2ContextBufferInfo bufferInfo{};
     Ngs2BufferAllocator allocator{};
     std::vector<Ngs2Voice> voices;
+    std::vector<Ngs2CustomUserFx2ModuleOption> userFx;
+    std::vector<std::vector<std::uint8_t>> userFxCommon;
 };
 
 struct Ngs2System {
@@ -99,12 +130,20 @@ struct Ngs2System {
     Ngs2BufferAllocator allocator{};
     std::uint32_t uid = 0;
     std::int64_t renderCount = 0;
+    std::uintptr_t userData = 0;
     std::vector<Ngs2Rack*> racks;
 };
 
 std::string Ngs2Hex(std::uint32_t value);
 std::recursive_mutex& Ngs2Mutex();
 Ngs2System* Ngs2FindSystem(Ngs2Handle handle);
+
+template <typename TParam>
+const TParam& ParamAs(const Ngs2VoiceParamHeader& param) {
+    if (param.size < sizeof(TParam)) throw std::invalid_argument("NGS2: voice param " + Ngs2Hex(param.id) + " is too small");
+    return reinterpret_cast<const TParam&>(param);
+}
+
 Ngs2Rack* Ngs2FindRack(Ngs2Handle handle);
 Ngs2Voice* Ngs2FindVoice(Ngs2Handle handle);
 void* Ngs2Place(const Ngs2ContextBufferInfo* bufferInfo, std::size_t size, std::size_t alignment);
@@ -114,6 +153,11 @@ void Ngs2SetupAtrac9(Ngs2Voice& voice, const Ngs2WaveformFormat& format);
 std::size_t Ngs2Atrac9BlockBytes(const Ngs2Voice& voice, const Ngs2WaveformBlock& block);
 void Ngs2RestartAtrac9(Ngs2Voice& voice);
 const float* Ngs2Atrac9Frame(Ngs2Voice& voice, Ngs2Block& block, std::uint32_t frame);
+void Ngs2CheckCustomRack(const Ngs2CustomRackOption& option);
+void Ngs2SetupUserFx(Ngs2Rack& rack, const Ngs2CustomRackOption& option);
+void Ngs2CleanupUserFx(Ngs2Rack& rack);
+void Ngs2ApplyCustomParam(Ngs2Voice& voice, const Ngs2VoiceParamHeader& param);
+void Ngs2ProcessUserFx(Ngs2Voice& voice, std::uint32_t grain, std::uint32_t sampleRate);
 void Ngs2RenderSystem(Ngs2System& system, const Ngs2RenderBufferInfo* bufferInfo, std::uint32_t numBufferInfo);
 
 #endif

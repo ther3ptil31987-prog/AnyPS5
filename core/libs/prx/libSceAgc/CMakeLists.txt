@@ -30,6 +30,7 @@ add_library(libSceAgc SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/DcbState/src/Registers.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/DcbState/src/Workload.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/PacketInfo.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/Platform.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/RegisterDefaults.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/ShaderFusion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/Suspend.cpp
@@ -44,6 +45,7 @@ add_library(libSceAgc SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Patch/src/Branch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Predication/src/Predication.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/CreateShader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/GsOversubscription.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/InterpolantMapping.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/LinkShaders.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/PrimState.cpp
@@ -67,7 +69,41 @@ add_test_executable(agc_command_tests EXCLUDE_FROM_ALL tests/Commands.cpp)
 target_include_directories(agc_command_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_command_tests PRIVATE libSceAgc libc)
 configure_windows_unwind(agc_command_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_command_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_initialization COMMAND agc_command_tests defaults)
+    if(WIN32)
+        set_tests_properties(agc_initialization PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
 configure_windows_unwind(libSceAgc)
+
+add_test_executable(agc_platform_tests EXCLUDE_FROM_ALL tests/Platform.cpp)
+target_include_directories(agc_platform_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_platform_tests PRIVATE libSceAgc libc)
+configure_windows_unwind(agc_platform_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_platform_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_platform_tests COMMAND agc_platform_tests)
+    if(WIN32)
+        set_tests_properties(agc_platform_tests PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_packet_info_tests EXCLUDE_FROM_ALL tests/PacketInfo.cpp)
+target_include_directories(agc_packet_info_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_packet_info_tests PRIVATE libSceAgc libc)
+configure_windows_unwind(agc_packet_info_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_packet_info_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_packet_info_tests COMMAND agc_packet_info_tests)
+    if(WIN32)
+        set_tests_properties(agc_packet_info_tests PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
 
 add_test_executable(agc_register_command_tests EXCLUDE_FROM_ALL
         tests/RegisterCommands.cpp
@@ -84,6 +120,19 @@ if(BUILD_TESTING)
     add_test(NAME agc_register_command_tests COMMAND agc_register_command_tests)
     if(WIN32)
         set_tests_properties(agc_register_command_tests PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_payload_range_tests EXCLUDE_FROM_ALL tests/PayloadRange.cpp)
+target_include_directories(agc_payload_range_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_payload_range_tests PRIVATE libSceAgc libc)
+configure_windows_unwind(agc_payload_range_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_payload_range_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_payload_range_tests COMMAND agc_payload_range_tests)
+    if(WIN32)
+        set_tests_properties(agc_payload_range_tests PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -106,6 +155,26 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+add_test_executable(agc_predication_tests EXCLUDE_FROM_ALL
+        tests/Predication.cpp
+        Command/src/Packet.cpp
+        Command/src/Control.cpp
+        DcbState/src/Predication.cpp
+        DcbDraw/src/IndexBuffer.cpp
+        Predication/src/Predication.cpp
+)
+target_include_directories(agc_predication_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_predication_tests PRIVATE libc)
+configure_windows_unwind(agc_predication_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_predication_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_predication_tests COMMAND agc_predication_tests)
+    if(WIN32)
+        set_tests_properties(agc_predication_tests PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_shader_fusion_tests EXCLUDE_FROM_ALL tests/ShaderFusion.cpp)
 target_include_directories(agc_shader_fusion_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_fusion_tests PRIVATE libSceAgc libc)
@@ -121,6 +190,34 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+add_test_executable(agc_context_state_size_tests EXCLUDE_FROM_ALL tests/ContextStateSize.cpp)
+target_include_directories(agc_context_state_size_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_context_state_size_tests PRIVATE libSceAgc libc)
+configure_windows_unwind(agc_context_state_size_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_context_state_size_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_context_state_size_tests COMMAND agc_context_state_size_tests)
+    if(WIN32)
+        set_tests_properties(agc_context_state_size_tests PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_interpolant_mapping_tests EXCLUDE_FROM_ALL tests/InterpolantMapping.cpp)
+target_include_directories(agc_interpolant_mapping_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_interpolant_mapping_tests PRIVATE libSceAgc libc)
+set_target_properties(agc_interpolant_mapping_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_interpolant_mapping_tests)
+
+if(BUILD_TESTING)
+    set_target_properties(agc_interpolant_mapping_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_interpolant_mapping COMMAND agc_interpolant_mapping_tests)
+    if(WIN32)
+        set_tests_properties(agc_interpolant_mapping PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 if(BUILD_TESTING)
     add_test_executable(guest_shader_link_tests ${LIBS_INCLUDE_DIR}/tests/GuestShaderLink.cpp)
     target_include_directories(guest_shader_link_tests PRIVATE ${LIBS_INCLUDE_DIR})
@@ -129,6 +226,22 @@ if(BUILD_TESTING)
     add_test(NAME guest_shader_link COMMAND guest_shader_link_tests)
     if(WIN32)
         set_tests_properties(guest_shader_link PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_gs_oversubscription_tests EXCLUDE_FROM_ALL
+        tests/GsOversubscription.cpp
+        Shader/src/GsOversubscription.cpp
+)
+target_include_directories(agc_gs_oversubscription_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_gs_oversubscription_tests PRIVATE libc)
+configure_windows_unwind(agc_gs_oversubscription_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_gs_oversubscription_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_gs_oversubscription_tests COMMAND agc_gs_oversubscription_tests)
+    if(WIN32)
+        set_tests_properties(agc_gs_oversubscription_tests PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -168,6 +281,26 @@ if(BUILD_TESTING)
     add_test(NAME agc_prime_utcl2_tests COMMAND agc_prime_utcl2_tests)
     if(WIN32)
         set_tests_properties(agc_prime_utcl2_tests PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_cond_exec_patch_tests EXCLUDE_FROM_ALL
+        tests/CondExecPatch.cpp
+        Command/src/Packet.cpp
+        Command/src/Memory.cpp
+        Command/src/Control.cpp
+        DcbFlow/src/Sync.cpp
+        Patch/src/CondExec.cpp
+)
+target_include_directories(agc_cond_exec_patch_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_cond_exec_patch_tests PRIVATE libc)
+configure_windows_unwind(agc_cond_exec_patch_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_cond_exec_patch_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_cond_exec_patch_tests COMMAND agc_cond_exec_patch_tests)
+    if(WIN32)
+        set_tests_properties(agc_cond_exec_patch_tests PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

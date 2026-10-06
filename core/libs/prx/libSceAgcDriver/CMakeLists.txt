@@ -200,6 +200,20 @@ target_link_libraries(libSceAgcDriver PRIVATE
 
 set_target_properties(libSceAgcDriver PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(libSceAgcDriver)
+
+if(BUILD_TESTING)
+    add_test_executable(agc_profile_output_tests tests/ProfileOutput.cpp)
+    target_include_directories(agc_profile_output_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_profile_output_tests PRIVATE libc)
+    configure_windows_unwind(agc_profile_output_tests)
+    add_test(NAME agc_profile_output COMMAND agc_profile_output_tests)
+    set_tests_properties(agc_profile_output PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_profile_output PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 if(WIN32)
     set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp PROPERTIES COMPILE_DEFINITIONS _WIN32_WINNT=0x0602)
 endif()
@@ -214,6 +228,7 @@ add_test_executable(agc_driver_tests EXCLUDE_FROM_ALL
 
 target_include_directories(agc_driver_tests PRIVATE
         ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler
 )
 
 target_link_libraries(agc_driver_tests PRIVATE
@@ -299,6 +314,20 @@ if(BUILD_TESTING)
     add_test(NAME agc_dcc_key_sharing COMMAND agc_dcc_key_sharing_tests)
     if(WIN32)
         set_tests_properties(agc_dcc_key_sharing PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_display_buffer_dcc_tests EXCLUDE_FROM_ALL tests/DisplayBufferDcc.cpp)
+target_include_directories(agc_display_buffer_dcc_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_display_buffer_dcc_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_display_buffer_dcc_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_display_buffer_dcc_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_display_buffer_dcc_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_display_buffer_dcc COMMAND agc_display_buffer_dcc_tests)
+    if(WIN32)
+        set_tests_properties(agc_display_buffer_dcc PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -661,6 +690,15 @@ if(BUILD_TESTING)
         set_tests_properties(linear_display_buffer PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test_executable(guest_agc_driver_resources_tests ${LIBS_INCLUDE_DIR}/tests/GuestAgcDriverResources.cpp)
+    target_include_directories(guest_agc_driver_resources_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_agc_driver_resources_tests PRIVATE libSceAgcDriver libc)
+    configure_windows_unwind(guest_agc_driver_resources_tests)
+    add_test(NAME guest_agc_driver_resources COMMAND guest_agc_driver_resources_tests)
+    if(WIN32)
+        set_tests_properties(guest_agc_driver_resources PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test_executable(guest_rendering_wait_tests ${LIBS_INCLUDE_DIR}/tests/GuestRenderingWait.cpp)
     target_include_directories(guest_rendering_wait_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_rendering_wait_tests PRIVATE libSceAgcDriver libc)
@@ -750,6 +788,14 @@ if(BUILD_TESTING)
         set_tests_properties(scalar_bitcount64 PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test_executable(scalar_scratch_load_tests ${LIBS_INCLUDE_DIR}/tests/ScalarScratchLoad.cpp)
+    target_link_libraries(scalar_scratch_load_tests PRIVATE shader_recompiler_agc_driver libc)
+    configure_windows_unwind(scalar_scratch_load_tests)
+    add_test(NAME scalar_scratch_load COMMAND scalar_scratch_load_tests)
+    if(WIN32)
+        set_tests_properties(scalar_scratch_load PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test_executable(image_sample_gather_tests ${LIBS_INCLUDE_DIR}/tests/ImageSampleGather.cpp)
     target_link_libraries(image_sample_gather_tests PRIVATE shader_recompiler_agc_driver libc)
     configure_windows_unwind(image_sample_gather_tests)
@@ -782,6 +828,19 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+add_test_executable(agc_vop1_sdwa_move_decode_tests EXCLUDE_FROM_ALL tests/Vop1SdwaMoveDecode.cpp)
+target_link_libraries(agc_vop1_sdwa_move_decode_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_vop1_sdwa_move_decode_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_vop1_sdwa_move_decode_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_vop1_sdwa_move_decode_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_vop1_sdwa_move_decode COMMAND agc_vop1_sdwa_move_decode_tests)
+    if(WIN32)
+        set_tests_properties(agc_vop1_sdwa_move_decode PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_pixel_position_export_tests EXCLUDE_FROM_ALL tests/PixelPositionExport.cpp)
 target_link_libraries(agc_pixel_position_export_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_pixel_position_export_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -792,6 +851,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_pixel_position_export PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1")
     if(WIN32)
         set_tests_properties(agc_pixel_position_export PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(image_msaa_load_tests ${LIBS_INCLUDE_DIR}/tests/ImageMsaaLoad.cpp)
+    target_link_libraries(image_msaa_load_tests PRIVATE shader_recompiler_agc_driver libc)
+    configure_windows_unwind(image_msaa_load_tests)
+    add_test(NAME image_msaa_load COMMAND image_msaa_load_tests)
+    if(WIN32)
+        set_tests_properties(image_msaa_load PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

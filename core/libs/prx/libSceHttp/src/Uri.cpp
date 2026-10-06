@@ -1,4 +1,5 @@
 #include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -195,6 +196,26 @@ int APS5_VABI sceHttpUriEscape(char* out, size_t* require, size_t prepare, const
         }
     }
     return copyOut(escaped, out, require, prepare);
+}
+
+int APS5_VABI sceHttpUriUnescape(char* out, size_t* require, size_t prepare, const char* in) {
+    if (!in) return ERROR_INVALID_VALUE;
+
+    const std::string_view input(in);
+    std::string decoded;
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '%' && input.size() - i >= 3) {
+            unsigned int value = 0;
+            const auto result = std::from_chars(input.data() + i + 1, input.data() + i + 3, value, 16);
+            if (result.ec == std::errc{} && result.ptr == input.data() + i + 3) {
+                decoded.push_back(static_cast<char>(value));
+                i += 2;
+                continue;
+            }
+        }
+        decoded.push_back(input[i]);
+    }
+    return copyOut(decoded, out, require, prepare);
 }
 
 int APS5_VABI sceHttpUriParse(SceHttpUriElement* out, const char* src_url, void* pool, size_t* require, size_t prepare) {

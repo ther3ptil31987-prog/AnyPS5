@@ -43,4 +43,79 @@ int APS5_VABI sceAgcDriverUnregisterResource(uint32_t resource_handle) {
     return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
 }
 
+int APS5_VABI sceAgcDriverRegisterGdsResource(uint32_t* resource_handle, uint32_t owner_handle, uint32_t gds_offset, uint32_t gds_size, const char* name, uint32_t type, uint64_t user_data) {
+    (void)resource_handle;
+    (void)owner_handle;
+    (void)gds_offset;
+    (void)gds_size;
+    (void)name;
+    (void)type;
+    (void)user_data;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverUnregisterAllResourcesForOwner(uint32_t owner_handle) {
+    (void)owner_handle;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverUnregisterWorkloadStream(uint32_t stream_id) {
+    (void)stream_id;
+    return 0;
+}
+
+int APS5_VABI sceAgcDriverGetDefaultOwner(uint32_t* owner_handle) {
+    (void)owner_handle;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverGetOwnerName(uint32_t owner_handle, const char** name) {
+    (void)owner_handle;
+    (void)name;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverGetResourceName(uint32_t resource_handle, const char** name) {
+    (void)resource_handle;
+    (void)name;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverGetResourceType(uint32_t resource_handle, uint32_t* type) {
+    (void)resource_handle;
+    (void)type;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverGetResourceUserData(uint32_t resource_handle, uint64_t* user_data) {
+    (void)resource_handle;
+    (void)user_data;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverSetResourceUserData(uint32_t resource_handle, uint64_t user_data) {
+    (void)resource_handle;
+    (void)user_data;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverGetResourceBaseAddressAndSizeInBytes(uint32_t resource_handle, void** memory, size_t* size) {
+    (void)resource_handle;
+    (void)memory;
+    (void)size;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverGetResourceShaderGuid(uint32_t resource_handle, void* guid) {
+    (void)resource_handle;
+    (void)guid;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverFindResourcesPublic(const void* callback, void* user_data) {
+    (void)callback;
+    (void)user_data;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
 }

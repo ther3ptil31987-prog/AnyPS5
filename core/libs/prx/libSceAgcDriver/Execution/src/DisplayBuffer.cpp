@@ -1,6 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +31,25 @@ std::uint32_t tileOffset(std::uint32_t x, std::uint32_t y) {
     return ((y << 4u) & 0x0070u) ^ ((y << 5u) & 0x0f00u) ^ ((y << 9u) & 0x1000u) ^ ((y << 8u) & 0x4000u) ^ ((x << 2u) & 0x000cu) ^ ((x << 5u) & 0x0380u) ^ ((x << 4u) & 0x0400u) ^ ((x << 6u) & 0x0800u) ^ ((x << 9u) & 0xa000u);
 }
 
+void decodeTexel(const std::byte* texel, std::byte* pixel, bool rgba, bool tenBit) {
+    if (tenBit) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, texel, 4);
+        const auto red = static_cast<std::byte>((word >> 2u) & 0xffu);
+        const auto green = static_cast<std::byte>((word >> 12u) & 0xffu);
+        const auto blue = static_cast<std::byte>((word >> 22u) & 0xffu);
+        pixel[0] = rgba ? blue : red;
+        pixel[1] = green;
+        pixel[2] = rgba ? red : blue;
+        pixel[3] = std::byte{0xff};
+        return;
+    }
+    pixel[0] = texel[rgba ? 2 : 0];
+    pixel[1] = texel[1];
+    pixel[2] = texel[rgba ? 0 : 2];
+    pixel[3] = texel[3];
+}
+
 }
 
 std::size_t DisplayBufferSize(const DisplayBuffer& buffer) {
@@ -40,6 +62,8 @@ std::size_t DisplayBufferSize(const DisplayBuffer& buffer) {
     require(buffer.address != 0 && (buffer.address & 65535u) == 0, "VideoOut: display buffer requires 64 KiB alignment");
     require(buffer.tilingMode <= 1, "VideoOut: unsupported display tiling mode");
     require(buffer.tilingMode != 0 || buffer.pitchInPixel == 0, "VideoOut: tiled display pitch is unsupported");
+    require(buffer.dccAddress == 0 || buffer.tilingMode == 0, "VideoOut: a linear display buffer cannot carry DCC metadata");
+    require(buffer.dccAddress != 0 || buffer.dccClearColor == 0, "VideoOut: a DCC clear color needs DCC metadata");
     const auto pitch = buffer.pitchInPixel == 0 ? buffer.width : buffer.pitchInPixel;
     require(pitch >= buffer.width && pitch <= 16384, "VideoOut: invalid linear display pitch");
     const auto size = buffer.tilingMode == 1 ? static_cast<std::uint64_t>(pitch) * buffer.height * 4u
@@ -64,26 +88,33 @@ std::vector<std::byte> DecodeDisplayBuffer(const DisplayBuffer& buffer, std::spa
             const auto tiled = buffer.tilingMode == 1 ? (static_cast<std::size_t>(y) * pitch + x) * 4u
                 : (static_cast<std::size_t>(y / 128u) * blocksPerRow + x / 128u) * 65536u + tileOffset(x, y);
             const auto linear = (static_cast<std::size_t>(y) * buffer.width + x) * 4;
-            if (tenBit) {
-                std::uint32_t word = 0;
-                std::memcpy(&word, source.data() + tiled, 4);
-                const auto red = static_cast<std::byte>((word >> 2u) & 0xffu);
-                const auto green = static_cast<std::byte>((word >> 12u) & 0xffu);
-                const auto blue = static_cast<std::byte>((word >> 22u) & 0xffu);
-                pixels[linear] = rgba ? blue : red;
-                pixels[linear + 1] = green;
-                pixels[linear + 2] = rgba ? red : blue;
-                pixels[linear + 3] = std::byte{0xff};
-                continue;
-            }
-            pixels[linear] = source[tiled + (rgba ? 2 : 0)];
-            pixels[linear + 1] = source[tiled + 1];
-            pixels[linear + 2] = source[tiled + (rgba ? 0 : 2)];
-            pixels[linear + 3] = source[tiled + 3];
+            decodeTexel(source.data() + tiled, pixels.data() + linear, rgba, tenBit);
         }
     }
     timing.Mark("detile_convert");
     return pixels;
+}
+
+std::array<std::byte, 4> DisplayBufferClearPixel(const DisplayBuffer& buffer, Graphics::DccKeys keys) {
+    static_cast<void>(DisplayBufferSize(buffer));
+    require(buffer.dccAddress != 0, "VideoOut: a display buffer without DCC metadata has no fast-clear value");
+    std::array<std::byte, 4> texel{};
+    if (keys == Graphics::DccKeys::ClearRegister) {
+        if ((buffer.dccClearColor >> 32u) != 0) {
+            char message[160];
+            std::snprintf(message, sizeof(message), "VideoOut: DCC register clear color 0x%016llx of display buffer 0x%llx does not fit its 32-bit texel", static_cast<unsigned long long>(buffer.dccClearColor), static_cast<unsigned long long>(buffer.address));
+            throw std::runtime_error(message);
+        }
+        const auto word = static_cast<std::uint32_t>(buffer.dccClearColor);
+        std::memcpy(texel.data(), &word, texel.size());
+    } else if (!Graphics::IsDccClear(keys) || !Graphics::FillDccClear(DisplayTexelFormat(buffer.pixelFormat), keys, true, texel)) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "VideoOut: display buffer 0x%llx (format 0x%016llx) reads %s DCC keys at 0x%llx: only uncompressed keys or a uniform clear code that the display format encodes can be presented", static_cast<unsigned long long>(buffer.address), static_cast<unsigned long long>(buffer.pixelFormat), Graphics::DccKeysName(keys), static_cast<unsigned long long>(buffer.dccAddress));
+        throw std::runtime_error(message);
+    }
+    std::array<std::byte, 4> pixel{};
+    decodeTexel(texel.data(), pixel.data(), baseFormat(buffer.pixelFormat) == PixelFormatR8G8B8A8, (buffer.pixelFormat & PixelFormatUnormBit) != 0);
+    return pixel;
 }
 
 std::vector<std::byte> ReadDisplayBuffer(const DisplayBuffer& buffer) {

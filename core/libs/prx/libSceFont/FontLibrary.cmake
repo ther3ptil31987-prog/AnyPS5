@@ -7,8 +7,10 @@ function(add_sce_font_library target)
             ${fontDir}/src/Render.cpp
             ${fontDir}/src/State.cpp
             ${fontDir}/src/Style.cpp
+            ${fontDir}/src/SystemFont.cpp
             ${fontDir}/src/Text.cpp
             ${fontDir}/src/Unimplemented.cpp
+            ${fontDir}/src/WritingLine.cpp
     )
     target_include_directories(${target} PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(${target} PRIVATE freetype libc)

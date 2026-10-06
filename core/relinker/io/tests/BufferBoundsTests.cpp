@@ -11,6 +11,8 @@ namespace {
 
 using Bytes = std::vector<std::uint8_t>;
 
+static_assert(Io::AlignUp(std::uint64_t{17}, std::uint64_t{16}) == 32);
+
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -71,12 +73,51 @@ void writeBounds(const TWrite& write, const std::string& name) {
     invalidRanges<TValue>(bytes, [&](Bytes& buffer, std::size_t offset) { write(buffer, offset, value); }, name);
 }
 
+template<typename TError, typename TOperation>
+void requireThrows(const TOperation& operation, const std::string& message) {
+    try {
+        operation();
+    } catch (const TError&) {
+        return;
+    }
+    throw std::runtime_error(message);
+}
+
+template<typename TValue>
+void alignmentBounds() {
+    constexpr auto maximum = std::numeric_limits<TValue>::max();
+    require(Io::AlignUp(TValue{0}, TValue{16}) == 0, "AlignUp changed zero");
+    require(Io::AlignUp(TValue{17}, TValue{16}) == 32, "AlignUp failed to round up");
+    require(Io::AlignUp(TValue{7}, TValue{3}) == 9, "AlignUp requires a power-of-two alignment");
+    require(Io::AlignUp(maximum, TValue{1}) == maximum, "AlignUp changed an aligned maximum");
+    require(Io::AlignUp(static_cast<TValue>(maximum - 15), TValue{16}) == maximum - 15, "AlignUp changed an aligned value near the maximum");
+    require(Io::AlignUp(static_cast<TValue>(maximum - 1), maximum) == maximum, "AlignUp overflowed for a representable result");
+    requireThrows<std::overflow_error>([&] { Io::AlignUp(maximum, TValue{16}); }, "AlignUp accepted an overflowing result");
+    requireThrows<std::invalid_argument>([] { Io::AlignUp(TValue{1}, TValue{0}); }, "AlignUp accepted zero alignment");
+}
+
 }
 
 int main() {
     try {
         const Io::ByteReader reader;
         const Io::ByteWriter writer;
+        alignmentBounds<std::uint32_t>();
+        alignmentBounds<std::uint64_t>();
+        alignmentBounds<std::int32_t>();
+        alignmentBounds<std::int64_t>();
+        requireThrows<std::invalid_argument>([] { Io::AlignUp(-1, 16); }, "AlignUp accepted a negative value");
+        requireThrows<std::invalid_argument>([] { Io::AlignUp(1, -1); }, "AlignUp accepted negative alignment");
+        require(Io::AlignUp64(std::numeric_limits<std::uint64_t>::max() - 1, std::numeric_limits<std::uint64_t>::max()) == std::numeric_limits<std::uint64_t>::max(), "AlignUp64 overflowed for a representable result");
+        requireThrows<std::overflow_error>([] { Io::AlignUp64(std::numeric_limits<std::uint64_t>::max(), 16); }, "AlignUp64 accepted an overflowing result");
+        Bytes aligned{1, 2, 3};
+        const auto original = aligned;
+        requireThrows<std::invalid_argument>([&] { Io::AlignBuffer(aligned, 0); }, "AlignBuffer accepted zero alignment");
+        require(aligned == original, "AlignBuffer modified the buffer on failure");
+        Io::AlignBuffer(aligned, 4);
+        require(aligned == Bytes({1, 2, 3, 0}), "AlignBuffer failed to preserve bytes and zero-fill padding");
+        Io::AlignBuffer(aligned, 4);
+        require(aligned == Bytes({1, 2, 3, 0}), "AlignBuffer changed an aligned buffer");
         readBounds<std::uint16_t>([&](const Bytes& bytes, std::size_t offset) { return reader.ReadU16(bytes, offset); }, "ByteReader::ReadU16");
         readBounds<std::uint32_t>([&](const Bytes& bytes, std::size_t offset) { return reader.ReadU32(bytes, offset); }, "ByteReader::ReadU32");
         readBounds<std::uint64_t>([&](const Bytes& bytes, std::size_t offset) { return reader.ReadU64(bytes, offset); }, "ByteReader::ReadU64");

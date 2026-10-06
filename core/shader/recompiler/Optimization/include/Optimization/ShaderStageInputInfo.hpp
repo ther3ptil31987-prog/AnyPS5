@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILIER_OPTIMIZATION_INCLUDE_OPTIMIZATION_SHADERSTAGEINPUTINFO_HPP
 
 #include "IntermediateRepresentation/IrMetadata.hpp"
+#include "Recompiler.hpp"
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -183,6 +184,7 @@ struct ShaderPixelInputInfo {
     bool psSampleShading = false;
     bool psEarlyZ = false;
     bool psExecuteOnNoop = false;
+    ConservativeZExport psConservativeZExport = ConservativeZExport::AnyZ;
     ShaderStageRuntime stage;
 
     bool HasPositionInput() const {

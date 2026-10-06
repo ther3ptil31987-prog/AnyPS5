@@ -42,6 +42,27 @@ static std::atomic<get_thread_atexit_count_func_t> threadAtexitCount{nullptr};
 static std::atomic<thread_atexit_report_func_t> threadAtexitReport{nullptr};
 static thread_local PthreadPrivate* currentThread = nullptr;
 static thread_local bool threadFinishing = false;
+
+static void SetStackFromHost(PthreadPrivate* thread) {
+#ifdef _WIN32
+    ULONG_PTR low = 0;
+    ULONG_PTR high = 0;
+    GetCurrentThreadStackLimits(&low, &high);
+    if (high <= low) throw std::runtime_error("Cannot query the host thread stack");
+    thread->stackAddress = reinterpret_cast<void*>(low);
+    thread->stackSize = static_cast<std::size_t>(high - low);
+#else
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) throw std::runtime_error("Cannot query the host thread stack");
+    void* address = nullptr;
+    std::size_t size = 0;
+    const int result = pthread_attr_getstack(&attr, &address, &size);
+    pthread_attr_destroy(&attr);
+    if (result != 0 || size == 0) throw std::runtime_error("Cannot query the host thread stack");
+    thread->stackAddress = address;
+    thread->stackSize = size;
+#endif
+}
 #ifndef _WIN32
 static thread_local std::unique_ptr<PthreadPrivate> adoptedThread;
 // pthread_exit force-unwinds through guest frames, whose personality resolves to
@@ -96,6 +117,7 @@ static void RunThread(std::unique_ptr<ThreadArgs> args) {
     const auto entry = args->entry;
     void* arg = args->arg;
     PthreadPrivate* self = args->self;
+    if (!self->stackAddress) SetStackFromHost(self);
     currentThread = self;
     args.reset();
     finishThread(self, entry(arg));
@@ -327,6 +349,7 @@ Pthread APS5_VABI scePthreadSelf() {
         adopted->threadId = std::this_thread::get_id();
         adopted->_detached = true;
         adopted->references.store(1, std::memory_order_relaxed);
+        SetStackFromHost(adopted.get());
         currentThread = adopted.release();
     }
 #else
@@ -335,6 +358,7 @@ Pthread APS5_VABI scePthreadSelf() {
         adoptedThread->_detached = true;
         adoptedThread->_adopted = true;
         adoptedThread->threadId = std::this_thread::get_id();
+        SetStackFromHost(adoptedThread.get());
         currentThread = adoptedThread.get();
     }
 #endif
@@ -353,6 +377,10 @@ int APS5_VABI scePthreadCancel(Pthread thread) {
 
 int APS5_VABI scePthreadEqual(Pthread thread1, Pthread thread2) {
     return thread1 == thread2 ? 1 : 0;
+}
+
+KernelCpumask APS5_VABI sceKernelGetAvailableCpumask(void) {
+    return DEFAULT_THREAD_AFFINITY;
 }
 
 int APS5_VABI scePthreadGetaffinity(Pthread thread, KernelCpumask* mask) {

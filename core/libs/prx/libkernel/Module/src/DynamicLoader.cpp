@@ -1,10 +1,12 @@
 #include "prx/libc/include/General.hpp"
 #include <nid/NidCompute.hpp>
 #include <array>
+#include <filesystem>
 #include <cstdio>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 #ifdef _WIN32
 #define NOMINMAX
@@ -37,6 +39,7 @@ struct Module {
 std::mutex modulesMutex;
 std::map<std::uintptr_t, std::shared_ptr<Module>> modules;
 std::uintptr_t nextHandle = 0x20000000;
+std::map<const void*, std::uintptr_t> imageIds;
 void* Symbol(Module& module, const char* name) {
 #ifdef _WIN32
     return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module.native), name));
@@ -47,7 +50,14 @@ void* Symbol(Module& module, const char* name) {
 void* FindSymbol(Module& module, const char* name) {
     if (auto* symbol = Symbol(module, name)) return symbol;
     const auto nid = Nid::ComputeNid(name, "");
+#ifdef _WIN32
     return Symbol(module, nid.c_str());
+#else
+    if (auto* symbol = Symbol(module, nid.c_str())) return symbol;
+    constexpr char guestSuffix[] = "#guest";
+    if (auto* symbol = Symbol(module, (std::string(name) + guestSuffix).c_str())) return symbol;
+    return Symbol(module, (nid + guestSuffix).c_str());
+#endif
 }
 }
 
@@ -57,6 +67,13 @@ char* APS5_VABI dlerror_nid_postfix() {
     pendingError = false;
     return loaderError.data();
 }
+static std::filesystem::path RelinkedModulePath(const std::filesystem::path& path) {
+    auto relinked = path;
+    relinked += ".guest.prx";
+    std::error_code error;
+    return std::filesystem::is_regular_file(relinked, error) ? relinked : path;
+}
+
 void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
     if ((flags & ~0x103) || (flags & 3) == 0 || (flags & 3) == 3) {
         Error("dlopen: unsupported flags"); return nullptr;
@@ -70,7 +87,7 @@ void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
             module->owned = false;
         } else {
             if (!*path) { Error("dlopen: empty module path"); return nullptr; }
-            const auto resolved = ResolvePath_nid_no_patch(path);
+            const auto resolved = RelinkedModulePath(ResolvePath_nid_no_patch(path));
             module->native = LoadLibraryExW(resolved.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         }
         if (!module->native) {
@@ -79,7 +96,7 @@ void* APS5_VABI dlopen_nid_postfix(const char* path, int flags) {
             Error(message); return nullptr;
         }
 #else
-        const auto resolved = path ? ResolvePath_nid_no_patch(path).string() : std::string{};
+        const auto resolved = path ? RelinkedModulePath(ResolvePath_nid_no_patch(path)).string() : std::string{};
         const int nativeFlags = ((flags & 3) == 1 ? RTLD_LAZY : RTLD_NOW) |
             ((flags & 0x100) ? RTLD_GLOBAL : RTLD_LOCAL);
         module->native = ::dlopen(path ? resolved.c_str() : nullptr, nativeFlags);
@@ -122,5 +139,14 @@ int APS5_VABI dlclose_nid_postfix(void* handle) {
     // Unload outside the registry lock: module destructors may call loader APIs.
     module.reset();
     return 0;
+}
+std::int32_t ModuleIdForImage_nid_no_patch(const void* native) {
+    std::lock_guard lock(modulesMutex);
+    for (const auto& [handle, module] : modules) {
+        if (module->native == native) return static_cast<std::int32_t>(handle);
+    }
+    const auto [found, inserted] = imageIds.emplace(native, nextHandle);
+    if (inserted) ++nextHandle;
+    return static_cast<std::int32_t>(found->second);
 }
 }

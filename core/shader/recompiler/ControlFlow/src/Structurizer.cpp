@@ -517,7 +517,7 @@ std::uint32_t exitTailSelectionMerge(const ControlFlowGraph& graph, const BasicB
     }
     const auto body = trueInBody ? trueTarget : falseTarget;
     const auto tail = trueInBody ? falseTarget : trueTarget;
-    if (tail == loop->mergeBlock || tail == loop->continueBlock || !isInsideLoopConstruct(graph, *loop, tail) || !graph.Dominates(block.id, body) || !graph.Dominates(block.id, tail)) {
+    if (tail == loop->mergeBlock || tail == loop->continueBlock || body == loop->continueBlock || !isInsideLoopConstruct(graph, *loop, tail) || !graph.Dominates(block.id, body) || !graph.Dominates(block.id, tail)) {
         return InvalidControlFlowId;
     }
     std::vector<std::uint32_t> pending{tail};
@@ -889,6 +889,33 @@ void setBranch(BasicBlock& block, std::uint32_t target) {
     block.terminator.trueBlock = target;
 }
 
+std::uint32_t appendAssignmentBlock(ControlFlowGraph& graph, std::uint32_t positionBlock, std::uint32_t target, std::uint32_t variable, std::int32_t value) {
+    const auto assignment = appendRouteBlock(graph, positionBlock);
+    auto& block = graph.FindBlock(assignment);
+    setBranch(block, target);
+    block.terminator.gotoVariable = variable;
+    block.terminator.gotoValue = value;
+    return assignment;
+}
+
+std::uint32_t appendJunction(ControlFlowGraph& graph, const std::vector<std::uint32_t>& targets, std::uint32_t firstVariable) {
+    auto next = targets.back();
+    for (auto index = static_cast<std::uint32_t>(targets.size() - 1u); index-- > 0u;) {
+        const auto dispatch = appendRouteBlock(graph, targets[index]);
+        auto& block = graph.FindBlock(dispatch);
+        block.successors = {targets[index], next};
+        block.terminator.kind = TerminatorKind::ConditionalBranch;
+        block.terminator.condition = BranchCondition::GotoVariable;
+        block.terminator.trueBlock = targets[index];
+        block.terminator.falseBlock = next;
+        block.terminator.gotoVariable = firstVariable + index;
+        next = dispatch;
+    }
+    const auto junction = appendRouteBlock(graph, targets.front());
+    setBranch(graph.FindBlock(junction), next);
+    return junction;
+}
+
 std::optional<ControlFlowGraph> routeThroughJunction(const ControlFlowGraph& graph, std::uint32_t header, std::uint32_t merge, const std::vector<std::uint32_t>& region, const std::vector<std::uint32_t>& entered, const std::vector<Edge>& entryEdges, SplitBudget& budget, const std::function<void(ControlFlowGraph&)>& recompute, std::string& refusal) {
     std::vector<Edge> routed = entryEdges;
     std::vector<std::uint32_t> sources = {header};
@@ -930,31 +957,12 @@ std::optional<ControlFlowGraph> routeThroughJunction(const ControlFlowGraph& gra
     auto candidate = graph;
     const auto variableCount = static_cast<std::uint32_t>(targets.size() - 1u);
     const auto firstVariable = budget.nextGotoVariable;
-    auto next = targets.back();
-    for (auto index = variableCount; index-- > 0u;) {
-        const auto dispatch = appendRouteBlock(candidate, targets[index]);
-        auto& block = candidate.FindBlock(dispatch);
-        block.successors = {targets[index], next};
-        block.terminator.kind = TerminatorKind::ConditionalBranch;
-        block.terminator.condition = BranchCondition::GotoVariable;
-        block.terminator.trueBlock = targets[index];
-        block.terminator.falseBlock = next;
-        block.terminator.gotoVariable = firstVariable + index;
-        next = dispatch;
-    }
-    const auto junction = appendRouteBlock(candidate, targets.front());
-    setBranch(candidate.FindBlock(junction), next);
-
+    const auto junction = appendJunction(candidate, targets, firstVariable);
     for (const auto& [source, target] : routed) {
         const auto targetIndex = static_cast<std::uint32_t>(std::distance(targets.begin(), std::find(targets.begin(), targets.end(), target)));
         auto entry = junction;
         for (auto index = std::min(targetIndex + 1u, variableCount); index-- > 0u;) {
-            const auto assignment = appendRouteBlock(candidate, target);
-            auto& block = candidate.FindBlock(assignment);
-            setBranch(block, entry);
-            block.terminator.gotoVariable = firstVariable + index;
-            block.terminator.gotoValue = index == targetIndex ? 1 : 0;
-            entry = assignment;
+            entry = appendAssignmentBlock(candidate, target, entry, firstVariable + index, index == targetIndex ? 1 : 0);
         }
         redirectEdge(candidate.FindBlock(source), target, entry);
     }
@@ -969,6 +977,87 @@ std::optional<ControlFlowGraph> routeThroughJunction(const ControlFlowGraph& gra
         return std::nullopt;
     }
     budget.nextGotoVariable += variableCount;
+    return candidate;
+}
+
+std::uint32_t nextGotoVariable(const ControlFlowGraph& graph) {
+    std::uint32_t next = 0;
+    for (const auto& block : graph.blocks) {
+        if (block.terminator.gotoVariable != InvalidControlFlowId) {
+            next = std::max(next, block.terminator.gotoVariable + 1u);
+        }
+    }
+    return next;
+}
+
+std::optional<ControlFlowGraph> routeLoopExits(const ControlFlowGraph& graph, const NaturalLoop& loop, const std::function<void(ControlFlowGraph&)>& recompute, std::string& refusal) {
+    std::vector<Edge> exits;
+    for (const auto member : loop.blocks) {
+        const auto& block = graph.FindBlock(member);
+        for (const auto successor : block.successors) {
+            if (contains(loop.blocks, successor)) {
+                continue;
+            }
+            if (block.terminator.kind != TerminatorKind::Branch && block.terminator.kind != TerminatorKind::ConditionalBranch) {
+                refusal = "block " + std::to_string(member) + " ends in an indirect or unsupported branch";
+                return std::nullopt;
+            }
+            exits.emplace_back(member, successor);
+        }
+    }
+
+    const auto order = reversePostOrder(graph);
+    const auto orderOf = [&](std::uint32_t blockId) {
+        return std::distance(order.begin(), std::find(order.begin(), order.end(), blockId));
+    };
+    std::vector<std::uint32_t> targets;
+    for (const auto& edge : exits) {
+        addUnique(targets, edge.second);
+    }
+    std::sort(targets.begin(), targets.end(), [&](std::uint32_t lhs, std::uint32_t rhs) { return orderOf(lhs) < orderOf(rhs); });
+    const auto latchExit = std::find_if(exits.begin(), exits.end(), [&](const Edge& edge) { return edge.first == loop.latchBlock; });
+    const auto fallback = latchExit != exits.end() ? latchExit->second : targets.back();
+    targets.erase(std::find(targets.begin(), targets.end(), fallback));
+    targets.push_back(fallback);
+
+    auto candidate = graph;
+    const auto firstVariable = nextGotoVariable(graph);
+    const auto variableCount = static_cast<std::uint32_t>(targets.size() - 1u);
+    const auto junction = appendJunction(candidate, targets, firstVariable);
+
+    auto entry = loop.headerBlock;
+    for (auto index = variableCount; index-- > 0u;) {
+        entry = appendAssignmentBlock(candidate, loop.headerBlock, entry, firstVariable + index, 0);
+    }
+    for (const auto predecessor : graph.FindBlock(loop.headerBlock).predecessors) {
+        if (!contains(loop.blocks, predecessor)) {
+            redirectEdge(candidate.FindBlock(predecessor), loop.headerBlock, entry);
+        }
+    }
+    if (candidate.entryBlock == loop.headerBlock) {
+        candidate.entryBlock = entry;
+    }
+
+    for (const auto& [source, target] : exits) {
+        const auto index = static_cast<std::uint32_t>(std::distance(targets.begin(), std::find(targets.begin(), targets.end(), target)));
+        const auto exit = index == variableCount ? junction : appendAssignmentBlock(candidate, target, junction, firstVariable + index, 1);
+        redirectEdge(candidate.FindBlock(source), target, exit);
+    }
+    rebuildPredecessors(candidate);
+    recompute(candidate);
+    if (candidate.irreducible || candidate.unsupported) {
+        refusal = "routing its exits through one block would make the graph irreducible";
+        return std::nullopt;
+    }
+    if (loopEdges(candidate) != loopEdges(graph)) {
+        refusal = "routing its exits through one block would change the natural loops";
+        return std::nullopt;
+    }
+    const auto routed = std::find_if(candidate.naturalLoops.begin(), candidate.naturalLoops.end(), [&](const NaturalLoop& value) { return value.headerBlock == loop.headerBlock; });
+    if (routed == candidate.naturalLoops.end() || routed->mergeBlock != junction) {
+        refusal = "routing its exits through one block does not make that block its merge";
+        return std::nullopt;
+    }
     return candidate;
 }
 
@@ -1269,7 +1358,7 @@ void Structurizer::detectNaturalLoops(ControlFlowGraph& graph) const {
 
         if (!loop.exitBlocks.empty()) {
             std::uint32_t merge = loop.exitBlocks.front();
-            for (std::size_t i = 1; i < loop.exitBlocks.size(); ++i) {
+            for (std::size_t i = 1; i < loop.exitBlocks.size() && merge != InvalidControlFlowId; ++i) {
                 merge = graph.FindNearestCommonPostDominator(merge, loop.exitBlocks[i]);
             }
             loop.mergeBlock = merge;
@@ -1403,9 +1492,25 @@ void Structurizer::canonicalizeNaturalLoops(ControlFlowGraph& graph) const {
             changed = true;
             break;
         }
-        if (!changed) {
+        if (changed) {
+            continue;
+        }
+
+        const NaturalLoop* unmerged = nullptr;
+        for (const auto& loop : graph.naturalLoops) {
+            if (loop.exitBlocks.size() > 1u && loop.mergeBlock == InvalidControlFlowId && (unmerged == nullptr || loop.blocks.size() < unmerged->blocks.size())) {
+                unmerged = &loop;
+            }
+        }
+        if (unmerged == nullptr) {
             return;
         }
+        std::string refusal;
+        auto routed = routeLoopExits(graph, *unmerged, [this](ControlFlowGraph& candidate) { recomputeAnalyses(candidate); }, refusal);
+        if (!routed) {
+            throw std::runtime_error("loop at block " + std::to_string(unmerged->headerBlock) + " has exits with no common post-dominator: " + refusal);
+        }
+        graph = std::move(*routed);
     }
 
     throw std::runtime_error("CFG loop canonicalization exceeded rewrite budget");
@@ -1415,13 +1520,7 @@ void Structurizer::splitSharedMergeBlocks(ControlFlowGraph& graph) const {
     const auto originalBlockCount = static_cast<std::uint32_t>(graph.blocks.size());
     const auto splitBudget = std::max<std::uint32_t>(16u, originalBlockCount * 4u);
     const auto programWords = estimatedSpirvWords(graph, allBlockIds(originalBlockCount));
-    std::uint32_t nextGotoVariable = 0;
-    for (const auto& block : graph.blocks) {
-        if (block.terminator.gotoVariable != InvalidControlFlowId) {
-            nextGotoVariable = std::max(nextGotoVariable, block.terminator.gotoVariable + 1u);
-        }
-    }
-    SplitBudget budget{programWords, std::max(CloneWordLimit, programWords / CloneBudgetDivisor), std::max(CloneWordLimit, programWords), nextGotoVariable};
+    SplitBudget budget{programWords, std::max(CloneWordLimit, programWords / CloneBudgetDivisor), std::max(CloneWordLimit, programWords), nextGotoVariable(graph)};
     for (std::uint32_t splits = 0; splits < splitBudget; ++splits) {
         if (!splitOneLoopMerge(graph) && !splitOneSelectionMerge(graph, budget, [this](ControlFlowGraph& candidate) { recomputeAnalyses(candidate); }) && !splitOneReturnJoin(graph)) {
             return;

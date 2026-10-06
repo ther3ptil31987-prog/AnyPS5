@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <exception>
 #include <fstream>
+#include <initializer_list>
 #include <map>
 #include <span>
 #include <sstream>
@@ -70,6 +71,15 @@ void verifyStructured(const std::string& prefix, const ControlFlowGraph& graph) 
                 const bool loopExit = std::any_of(loopExits.begin(), loopExits.end(), [&](const auto& exits) { return successor == exits.first || successor == exits.second; });
                 require(loopExit, prefix + "block " + std::to_string(member) + " of the selection at block " + std::to_string(block.id) + " branches to block " + std::to_string(successor) + " outside the construct");
             }
+        }
+    }
+    for (const auto& loop : graph.blocks) {
+        if (!loop.terminator.loopHeader) continue;
+        const auto continueBlock = loop.terminator.continueBlock;
+        for (const auto member : constructBlocks(graph, loop.id, loop.terminator.mergeBlock)) {
+            const auto& terminator = graph.FindBlock(member).terminator;
+            if (terminator.loopHeader || graph.Dominates(continueBlock, member)) continue;
+            require(terminator.mergeBlock != continueBlock, prefix + "the selection at block " + std::to_string(member) + " in the loop at block " + std::to_string(loop.id) + " merges at the loop's continue block " + std::to_string(continueBlock));
         }
     }
 }
@@ -208,6 +218,80 @@ void verifyProgram(const Program& program) {
     }
 }
 
+const std::vector<std::uint32_t> DwordTableGetpcFirst{
+    0xbe8c1f00u, 0x800cff0cu, 0x00000058u, 0x820d800du, 0x83928202u, 0xd4c40016u, 0x02000500u, 0x8f128212u, 0xf4000386u, 0x24000000u,
+    0xbf8cc07fu, 0x7d820003u, 0x808c0e0cu, 0x828d800du, 0xbefd210cu, 0x7e020281u, 0xbf820003u, 0x7e020282u, 0xbf820001u, 0x7e020283u,
+    0xe0700000u, 0x80000100u, 0xbf810000u, 0x00000020u, 0x00000018u, 0x00000010u};
+const std::vector<std::uint32_t> DwordTableIndexFirst{
+    0x816ac102u, 0x83ea826au, 0x7e020280u, 0x8f6a826au, 0xbe8e1f00u, 0x800ebc0eu, 0x820f800fu, 0xf4000487u, 0xd4000008u, 0x8aea167eu,
+    0xbf8cc07fu, 0x808e120eu, 0x828f800fu, 0xbefd210eu, 0x7e020281u, 0xbf820003u, 0x7e020282u, 0xbf820001u, 0x7e020283u, 0xe0700000u,
+    0x80000100u, 0xbf810000u, 0x00000018u, 0x00000010u, 0x00000008u};
+const std::vector<std::uint32_t> LongBranchVcc{
+    0x7e020281u, 0xbeea1f00u, 0x806a906au, 0x826b806bu, 0xbefd216au, 0x7e020282u, 0xe0700000u, 0x80000100u, 0xbf810000u};
+const std::vector<std::uint32_t> LongBranchBack{
+    0xbe880380u, 0x7e020280u, 0x4a020281u, 0x80089008u, 0xbf0ac008u, 0xbf840004u, 0xbe901f00u, 0x80909410u, 0x82918011u, 0xbefd2110u,
+    0xe0700000u, 0x80000100u, 0xbf810000u};
+
+std::vector<std::uint32_t> patched(std::vector<std::uint32_t> code, std::size_t word, std::initializer_list<std::uint32_t> replacement) {
+    std::copy(replacement.begin(), replacement.end(), code.begin() + static_cast<std::ptrdiff_t>(word));
+    return code;
+}
+
+std::string refusal(std::span<const std::uint32_t> code) {
+    try {
+        static_cast<void>(GraphBuilder{}.Build(RdnaInstructionDecoder{}.Decode(code)));
+    } catch (const std::exception& error) {
+        return error.what();
+    }
+    return {};
+}
+
+void verifyJumpTable(const std::string& name, std::span<const std::uint32_t> code, std::uint32_t loadPc, const std::vector<std::uint64_t>& values, const std::vector<std::uint32_t>& targets) {
+    const auto graph = GraphBuilder{}.Build(RdnaInstructionDecoder{}.Decode(code));
+    require(graph.codeTableLoads.size() == 1u && graph.codeTableLoads.front().programCounter == loadPc && graph.codeTableLoads.front().values == values, name + ": wrong code table");
+    std::vector<std::uint32_t> lowered;
+    for (const auto& block : graph.blocks) {
+        if (block.terminator.indirectPcSgpr != InvalidControlFlowId) lowered.insert(lowered.end(), block.terminator.indirectTargetProgramCounters.begin(), block.terminator.indirectTargetProgramCounters.end());
+    }
+    std::sort(lowered.begin(), lowered.end());
+    require(lowered == targets, name + ": the jump does not reach exactly the table targets");
+}
+
+void verifyLongBranch(const std::string& name, std::span<const std::uint32_t> code, std::uint32_t branchPc, std::uint32_t target) {
+    const auto decoded = RdnaInstructionDecoder{}.Decode(code);
+    const auto graph = GraphBuilder{}.Build(decoded);
+    const auto source = std::find_if(graph.blocks.begin(), graph.blocks.end(), [&](const BasicBlock& block) { return block.instructionEnd != block.instructionBegin && decoded.instructions[block.instructionEnd - 1u].programCounter == branchPc; });
+    require(source != graph.blocks.end() && source->terminator.kind == TerminatorKind::Branch && graph.FindBlock(source->terminator.trueBlock).startProgramCounter == target, name + ": the jump does not branch to " + std::to_string(target));
+}
+
+void verifyNullSwappc() {
+    const std::array<std::uint32_t, 2> jump{0xbefd210cu, 0xbf810000u};
+    const auto swappc = RdnaInstructionDecoder{}.Decode(jump).instructions.front();
+    require(swappc.op == RdnaOpcode::SSetpcB64 && swappc.opcodeId == 0x21u && swappc.destination.kind == RdnaOperandKind::Null &&
+        swappc.source0.kind == RdnaOperandKind::ScalarRegister && swappc.source0.reg == 12u, "s_swappc_b64 null, s[12:13] does not decode as s_setpc_b64 s[12:13]");
+    const std::array<std::uint32_t, 3> front{0x7e020281u, 0xbefd2106u, 0xbf810000u};
+    require(DecodeRdnaFrontProgram(front).code.size() == 2u, "a front program ending in s_swappc_b64 null, s[6:7] does not end there");
+    verifyJumpTable("dword jump table after its base", DwordTableGetpcFirst, 0x20u, {0x20u, 0x18u, 0x10u}, {0x3cu, 0x44u, 0x4cu});
+    verifyJumpTable("dword jump table after its index", DwordTableIndexFirst, 0x1cu, {0x18u, 0x10u, 0x08u}, {0x38u, 0x40u, 0x48u});
+    verifyLongBranch("long branch through vcc", LongBranchVcc, 0x10u, 0x18u);
+    verifyLongBranch("backward long branch", LongBranchBack, 0x24u, 0x08u);
+    const std::array<std::uint32_t, 3> call{0xbe8c1f00u, 0xbe8e210cu, 0xbf810000u};
+    const std::vector<std::tuple<std::string_view, std::vector<std::uint32_t>, std::string_view>> refused{
+        {"s_swappc_b64 with a return address", {call.begin(), call.end()}, "unsupported SOP1 opcode 33"},
+        {"index rewritten after the bound", patched(DwordTableGetpcFirst, 5, {0xbe9203ffu, 0x00000040u}), "unsupported dynamic s_setpc_b64"},
+        {"index scaled for two-dword entries", patched(DwordTableGetpcFirst, 7, {0x8f128312u}), "unsupported dynamic s_setpc_b64"},
+        {"entry rewritten after the load", patched(DwordTableGetpcFirst, 11, {0xbe8e0380u}), "unsupported dynamic s_setpc_b64"},
+        {"base rewritten after the load", patched(DwordTableGetpcFirst, 11, {0xbe8d0380u}), "unsupported dynamic s_setpc_b64"},
+        {"borrow other than zero", patched(DwordTableGetpcFirst, 13, {0x828d810du}), "unsupported dynamic s_setpc_b64"},
+        {"long branch with a register high half", patched(LongBranchVcc, 3, {0x826b046bu}), "unsupported dynamic s_setpc_b64"},
+        {"branch into a long branch", patched(LongBranchVcc, 0, {0xbf850001u}), "does not start in its block"},
+    };
+    for (const auto& [name, code, message] : refused) {
+        const auto error = refusal(code);
+        require(error.find(message) != std::string::npos, std::string(name) + ": expected a refusal with '" + std::string(message) + "', got '" + error + "'");
+    }
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -279,6 +363,71 @@ latch:
   buffer_store_dword v1, off, s[0:3], 0
   s_endpgm)",
          Store({0xbe880380u, 0x7e020280u, 0x7d880008u, 0xbf860004u, 0x7d880088u, 0xbf870003u, 0x4a020281u, 0xbf820002u, 0x4a020282u, 0x4a020283u, 0x80089008u, 0xbf0ac008u, 0xbf85fff5u}), Split::Clone},
+        {"loop exit to the end of the program beside a kill exit", R"(
+  v_mov_b32 v1, 0
+  s_mov_b64 s[20:21], exec
+  v_cmp_gt_u32 vcc, 4, v0
+  s_andn2_b64 s[20:21], s[20:21], vcc
+  s_cbranch_scc0 kill
+  s_mov_b32 s8, 0
+loop:
+  v_add_nc_u32 v1, 1, v1
+  v_cmp_eq_u32 vcc, s8, v0
+  s_andn2_b64 s[20:21], s[20:21], vcc
+  s_cbranch_scc0 kill
+  s_add_u32 s8, s8, 1
+  s_cmp_lt_u32 s8, 4
+  s_cbranch_scc1 loop
+  s_mov_b64 exec, s[20:21]
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm
+kill:
+  s_mov_b64 exec, 0
+  s_endpgm)",
+         {0x7e020280u, 0xbe94047eu, 0x7d880084u, 0x8a946a14u, 0xbf84000cu, 0xbe880380u, 0x4a020281u, 0x7d840008u, 0x8a946a14u, 0xbf840007u,
+          0x80088108u, 0xbf0a8408u, 0xbf85fff9u, 0xbefe0414u, 0xe0700000u, 0x80000100u, 0xbf810000u, 0xbefe0480u, 0xbf810000u},
+         Split::Route, 0},
+        {"inner loop exit to a return after the outer loop", R"(
+  v_mov_b32 v1, 0
+  s_mov_b32 s8, 0
+outer:
+  s_mov_b32 s9, 0
+inner:
+  v_add_nc_u32 v1, 1, v1
+  s_cmp_eq_u32 s9, s2
+  s_cbranch_scc1 early_exit
+  s_add_u32 s9, s9, 1
+  s_cmp_lt_u32 s9, 4
+  s_cbranch_scc1 inner
+  s_add_u32 s8, s8, 1
+  s_cmp_lt_u32 s8, 4
+  s_cbranch_scc1 outer
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm
+early_exit:
+  v_add_nc_u32 v1, 2, v1
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         {0x7e020280u, 0xbe880380u, 0xbe890380u, 0x4a020281u, 0xbf060209u, 0xbf850009u, 0x80098109u, 0xbf0a8409u, 0xbf85fffau, 0x80088108u,
+          0xbf0a8408u, 0xbf85fff6u, 0xe0700000u, 0x80000100u, 0xbf810000u, 0x4a020282u, 0xe0700000u, 0x80000100u, 0xbf810000u},
+         Split::Route, 0},
+        {"loop exit tail beside the continue block", R"(
+  v_mov_b32 v1, 0
+  s_mov_b32 s8, 0
+loop:
+  v_add_nc_u32 v1, 1, v1
+  s_cmp_eq_u32 s8, s2
+  s_cbranch_scc0 latch
+  v_add_nc_u32 v1, 2, v1
+  s_branch done
+latch:
+  s_add_u32 s8, s8, 1
+  s_cmp_lt_u32 s8, 4
+  s_cbranch_scc1 loop
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0x7e020280u, 0xbe880380u, 0x4a020281u, 0xbf060208u, 0xbf840002u, 0x4a020282u, 0xbf820003u, 0x80088108u, 0xbf0a8408u, 0xbf85fff8u}), Split::None},
         {"shared early exit", R"(
   v_mov_b32 v1, 0
   v_cmp_gt_u32 vcc, 16, v0
@@ -656,6 +805,92 @@ test:
          {0xbe880380u, 0x7e020280u, 0xbf06c002u, 0xbf840006u, 0x4a020081u, 0xe0700000u, 0x80000100u, 0xbf810000u, 0x4a020282u, 0x80089008u,
           0xbf0ac008u, 0xbf85fffcu, 0xe0700000u, 0x80000100u, 0xbf810000u},
          Split::None},
+        {"dword jump table after its base", R"(
+  s_getpc_b64 s[12:13]
+base:
+  s_add_u32 s12, s12, table - base
+  s_addc_u32 s13, s13, 0
+  s_min_u32 s18, s2, 2
+  v_cmp_gt_u32 s[22:23], v0, s2
+  s_lshl_b32 s18, s18, 2
+  s_load_dword s14, s[12:13], s18
+  s_waitcnt lgkmcnt(0)
+  v_cmp_lt_u32 vcc, s3, v0
+  s_sub_u32 s12, s12, s14
+  s_subb_u32 s13, s13, 0
+  s_swappc_b64 null, s[12:13]
+case0:
+  v_mov_b32 v1, 1
+  s_branch done
+case1:
+  v_mov_b32 v1, 2
+  s_branch done
+case2:
+  v_mov_b32 v1, 3
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm
+table:
+  .long table - case0, table - case1, table - case2)",
+         DwordTableGetpcFirst, Split::None},
+        {"dword jump table after its index", R"(
+  s_add_i32 vcc_lo, s2, -1
+  s_min_u32 vcc_lo, vcc_lo, 2
+  v_mov_b32 v1, 0
+  s_lshl_b32 vcc_lo, vcc_lo, 2
+  s_getpc_b64 s[14:15]
+base:
+  s_add_u32 s14, s14, table - base - 8
+  s_addc_u32 s15, s15, 0
+  s_load_dword s18, s[14:15], vcc_lo offset:8
+  s_andn2_b64 vcc, exec, s[22:23]
+  s_waitcnt lgkmcnt(0)
+  s_sub_u32 s14, s14, s18
+  s_subb_u32 s15, s15, 0
+  s_swappc_b64 null, s[14:15]
+case0:
+  v_mov_b32 v1, 1
+  s_branch done
+case1:
+  v_mov_b32 v1, 2
+  s_branch done
+case2:
+  v_mov_b32 v1, 3
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm
+table:
+  .long table - 8 - case0, table - 8 - case1, table - 8 - case2)",
+         DwordTableIndexFirst, Split::None},
+        {"long branch through vcc", R"(
+  v_mov_b32 v1, 1
+  s_getpc_b64 vcc
+base:
+  s_add_u32 vcc_lo, vcc_lo, target - base
+  s_addc_u32 vcc_hi, vcc_hi, 0
+  s_swappc_b64 null, vcc
+  v_mov_b32 v1, 2
+target:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         LongBranchVcc, Split::None},
+        {"backward long branch", R"(
+  s_mov_b32 s8, 0
+  v_mov_b32 v1, 0
+loop:
+  v_add_nc_u32 v1, 1, v1
+  s_add_u32 s8, s8, 16
+  s_cmp_lt_u32 s8, 64
+  s_cbranch_scc0 done
+  s_getpc_b64 s[16:17]
+base:
+  s_sub_u32 s16, s16, base - loop
+  s_subb_u32 s17, s17, 0
+  s_swappc_b64 null, s[16:17]
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         LongBranchBack, Split::None},
     };
     int failures = 0;
     for (const auto& program : programs) {
@@ -665,6 +900,12 @@ test:
             std::fprintf(stderr, "%s\n%.*s\n", error.what(), static_cast<int>(program.source.size()), program.source.data());
             ++failures;
         }
+    }
+    try {
+        verifyNullSwappc();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        ++failures;
     }
     if (failures != 0) return 1;
     std::puts("Control flow structurization tests passed");

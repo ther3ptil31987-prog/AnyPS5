@@ -14,13 +14,6 @@ static void AjmStub(const char* name) {
 
 extern "C" {
 
-int APS5_VABI sceAjmBatchCancel(uint32_t context, uint32_t batch) {
- (void)context;
- (void)batch;
- AjmStub(__func__);
- return 0;
-}
-
 int APS5_VABI sceAjmBatchJobControl(AjmBatchInfo* info, uint32_t instance, uint64_t flags, const void* sideband_input, size_t sideband_input_size, void* sideband_output, size_t sideband_output_size) {
  (void)info;
  (void)instance;

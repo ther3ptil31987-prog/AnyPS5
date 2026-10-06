@@ -16,9 +16,14 @@ uint32_t* APS5_VABI sceAgcDcbContextStateOp(CommandBuffer* buf, uint32_t operati
 }
 
 uint64_t APS5_VABI sceAgcDcbContextStateOpGetSize(uint32_t operation) {
- (void)operation;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+    Agc::Command::Require(operation <= 3, __func__, "invalid context state operation");
+    if (operation == 0) {
+        return 5 * sizeof(std::uint32_t);
+    }
+    if (operation == 3) {
+        return 32 * sizeof(std::uint32_t);
+    }
+    return 27 * sizeof(std::uint32_t);
 }
 
 APS5_EXPORT("qj7QZpgr9Uw", sceAgcDcbContextStateAnotherOp);

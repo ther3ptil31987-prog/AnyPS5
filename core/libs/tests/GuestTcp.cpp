@@ -27,6 +27,7 @@ int main() {
     Require(listener >= 0);
     std::array<std::uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
     Require(bind_nid_postfix(listener, address.data(), address.size()) == 0);
+    Require(bind_nid_postfix(listener, address.data(), address.size()) == -1 && *__error_nid_postfix() == 22);
     Require(listen_nid_postfix(listener, 4) == 0);
     std::uint32_t address_size = address.size();
     Require(getsockname_nid_postfix(listener, address.data(), &address_size) == 0);
@@ -34,6 +35,7 @@ int main() {
 
     const int client = socket_nid_postfix(2, 1, 0);
     Require(client >= 0);
+    Require(accept_nid_postfix(client, nullptr, nullptr) == -1 && *__error_nid_postfix() == 22);
     Require(connect_nid_postfix(client, address.data(), address.size()) == 0);
     std::array<std::uint8_t, 16> peer{};
     address_size = peer.size();

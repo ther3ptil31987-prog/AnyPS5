@@ -15,6 +15,23 @@ int APS5_VABI scePthreadMutexInit(PthreadMutex* mutex, const PthreadMutexattr* a
 int APS5_VABI scePthreadMutexDestroy(PthreadMutex* mutex);
 int APS5_VABI scePthreadMutexLock(PthreadMutex* mutex);
 int APS5_VABI scePthreadMutexUnlock(PthreadMutex* mutex);
+int APS5_VABI scePthreadAttrInit(PthreadAttr* attr);
+int APS5_VABI scePthreadAttrDestroy(PthreadAttr* attr);
+int APS5_VABI scePthreadAttrGet(Pthread thread, PthreadAttr* attr);
+int APS5_VABI scePthreadAttrGetstackaddr(const PthreadAttr* attr, void** stack_addr);
+int APS5_VABI scePthreadAttrGetstacksize(const PthreadAttr* attr, size_t* stack_size);
+}
+
+static bool StackContains(Pthread thread, const void* address) {
+    PthreadAttr attr = nullptr;
+    if (scePthreadAttrInit(&attr) != 0 || scePthreadAttrGet(thread, &attr) != 0) return false;
+    void* stack = nullptr;
+    size_t size = 0;
+    const bool queried = scePthreadAttrGetstackaddr(&attr, &stack) == 0 && scePthreadAttrGetstacksize(&attr, &size) == 0;
+    scePthreadAttrDestroy(&attr);
+    const auto begin = reinterpret_cast<std::uintptr_t>(stack);
+    const auto value = reinterpret_cast<std::uintptr_t>(address);
+    return queried && stack != nullptr && size != 0 && value >= begin && value - begin < size;
 }
 
 static constexpr int SCE_OK = 0;
@@ -28,6 +45,7 @@ static void Require(bool value) { if (!value) std::abort(); }
 struct WorkerContext {
     Pthread thread = nullptr;
     Pthread selfFromWorker = nullptr;
+    bool workerStackReported = false;
     PthreadMutex* mutex = nullptr;
     int unlockResult = 0;
 };
@@ -35,6 +53,8 @@ struct WorkerContext {
 static void* APS5_VABI Worker(void* arg) {
     auto& context = *static_cast<WorkerContext*>(arg);
     context.selfFromWorker = scePthreadSelf();
+    int local = 0;
+    context.workerStackReported = StackContains(context.selfFromWorker, &local);
     context.unlockResult = scePthreadMutexUnlock(context.mutex);
     scePthreadExit(reinterpret_cast<void*>(WorkerRetval));
     return nullptr;
@@ -44,6 +64,8 @@ int main() {
     const Pthread mainSelf = scePthreadSelf();
     Require(mainSelf != nullptr);
     Require(scePthreadSelf() == mainSelf);
+    int local = 0;
+    Require(StackContains(mainSelf, &local));
     Require(scePthreadJoin(mainSelf, nullptr) == SCE_KERNEL_ERROR_EINVAL);
     Require(scePthreadDetach(mainSelf) == SCE_KERNEL_ERROR_EINVAL);
 
@@ -69,6 +91,7 @@ int main() {
     Require(context.selfFromWorker == context.thread);
     Require(context.selfFromWorker != mainSelf);
     Require(context.unlockResult == SCE_KERNEL_ERROR_EPERM);
+    Require(context.workerStackReported);
 
     Require(scePthreadMutexUnlock(&mutex) == SCE_OK);
     Require(scePthreadMutexDestroy(&mutex) == SCE_OK);

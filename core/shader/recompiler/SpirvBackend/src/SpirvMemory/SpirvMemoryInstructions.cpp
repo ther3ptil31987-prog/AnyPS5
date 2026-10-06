@@ -1130,6 +1130,9 @@ std::uint32_t AddressAtomic(SpirvValueEmitContext& ctx, const IrValue& inst) {
                     return increment ? AtomicIncrement(state, current, value) : AtomicDecrement(state, current, value);
                 });
             }
+            if (inst.Opcode() == IrOpcode::AddressAtomicUSubSat32) {
+                return AtomicUpdate(state, pointer, mem.kind, [&](std::uint32_t current) { return AtomicUSubSat(state, current, value); });
+            }
             const AtomicFloatBits bits{state, wide};
             const auto update = [&](auto&& replacement) { return AtomicUpdateTyped(state, pointer, mem.kind, scalarType, replacement); };
             switch (inst.Opcode()) {
@@ -1322,6 +1325,12 @@ std::uint32_t AtomicDecrement(SpirvEmitterState& state, std::uint32_t old, std::
     const auto wrap = Binary(state, spv::OpLogicalOr, TypeBool(state), zero, above);
     const auto next = Binary(state, spv::OpISub, TypeU32(state), old, ConstantU32(state, 1u));
     return Select(state, TypeU32(state), wrap, limit, next);
+}
+
+std::uint32_t AtomicUSubSat(SpirvEmitterState& state, std::uint32_t old, std::uint32_t value) {
+    const auto fits = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), old, value);
+    const auto difference = Binary(state, spv::OpISub, TypeU32(state), old, value);
+    return Select(state, TypeU32(state), fits, difference, ConstantU32(state, 0u));
 }
 
 std::uint32_t AtomicFloatMinMax(SpirvEmitterState& state, std::uint32_t old, std::uint32_t source, bool maxValue) {
@@ -1828,11 +1837,7 @@ std::uint32_t EmitBufferAtomicDec32(SpirvValueEmitContext& ctx, const IrValue& i
 }
 
 std::uint32_t EmitBufferAtomicUSubSat32(SpirvValueEmitContext& ctx, const IrValue& inst) {
-    return EmitAtomicUpdate(ctx, inst, BufferMemory(ctx, inst), [](SpirvEmitterState& state, std::uint32_t old, std::uint32_t value) {
-        const auto fits = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), old, value);
-        const auto difference = Binary(state, spv::OpISub, TypeU32(state), old, value);
-        return Select(state, TypeU32(state), fits, difference, ConstantU32(state, 0u));
-    });
+    return EmitAtomicUpdate(ctx, inst, BufferMemory(ctx, inst), AtomicUSubSat);
 }
 
 std::uint32_t EmitBufferAtomicIAdd64(SpirvValueEmitContext& ctx, const IrValue& inst) {

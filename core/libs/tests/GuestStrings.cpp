@@ -8,6 +8,7 @@ extern "C" {
 char* APS5_VABI basename_nid_postfix(const char*);
 int* APS5_VABI __error_nid_postfix();
 std::size_t APS5_VABI strnlen_nid_postfix(const char*, std::size_t);
+std::size_t APS5_VABI strnlen_s_nid_postfix(const char*, std::size_t);
 char* APS5_VABI strncat_nid_postfix(char*, const char*, std::size_t);
 char* APS5_VABI strpbrk_nid_postfix(const char*, const char*);
 std::size_t APS5_VABI strcspn_nid_postfix(const char*, const char*);
@@ -88,6 +89,8 @@ int main() {
     Require(strnlen_nid_postfix(bounded, 0) == 0);
     Require(strnlen_nid_postfix(bounded, sizeof(bounded)) == 3);
     Require(strnlen_nid_postfix("a", 8) == 1);
+    Require(strnlen_s_nid_postfix(nullptr, 8) == 0);
+    Require(strnlen_s_nid_postfix("abc", 8) == 3 && strnlen_s_nid_postfix("abcdef", 4) == 4);
     char truncated[] = "abXX";
     Require(strlcat_nid_postfix(truncated, "cd", 2) == 4);
     Require(std::strcmp(truncated, "abXX") == 0);

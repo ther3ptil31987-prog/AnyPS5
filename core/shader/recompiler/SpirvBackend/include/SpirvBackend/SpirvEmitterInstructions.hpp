@@ -195,6 +195,7 @@ std::uint32_t EmitFPRcp64(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitFPRsq64(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitFPSqrt64(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitFPTrigPreop64(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
+std::uint32_t EmitFPDot2F32F16(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2);
 std::uint32_t EmitConvertF32F64(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitConvertF64F32(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitConvertF64S32(SpirvEmitterState& state, std::uint32_t arg0);

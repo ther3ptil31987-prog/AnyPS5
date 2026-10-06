@@ -18,4 +18,14 @@ if(BUILD_TESTING)
         set_tests_properties(guest_ime_parameters PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceIme>")
     endif()
+
+    add_test_executable(guest_ime_keyboard_tests ${LIBS_INCLUDE_DIR}/tests/GuestImeKeyboard.cpp)
+    target_include_directories(guest_ime_keyboard_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_ime_keyboard_tests PRIVATE libSceIme libc)
+    configure_windows_unwind(guest_ime_keyboard_tests)
+    add_test(NAME guest_ime_keyboard COMMAND guest_ime_keyboard_tests)
+    if(WIN32)
+        set_tests_properties(guest_ime_keyboard PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceIme>")
+    endif()
 endif()

@@ -8,18 +8,15 @@
 extern "C" {
 
 bool APS5_VABI sceAgcDriverIsCaptureInProgress(void) {
- NotImplemented_nid_no_patch(__func__);
- return false;
+    return false;
 }
 
 bool APS5_VABI sceAgcDriverIsTraceInProgress(void) {
- NotImplemented_nid_no_patch(__func__);
- return false;
+    return false;
 }
 
 bool APS5_VABI sceAgcDriverIsSubmitValidationEnabled(void) {
- NotImplemented_nid_no_patch(__func__);
- return false;
+    return false;
 }
 
 int APS5_VABI sceAgcDriverRequestCaptureStart(const char* path) {

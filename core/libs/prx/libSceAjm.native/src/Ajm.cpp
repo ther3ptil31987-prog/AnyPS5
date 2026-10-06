@@ -16,6 +16,7 @@ extern "C" {
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,7 +26,9 @@ extern "C" {
 // memory follow the SDK layouts.
 namespace {
 
+constexpr int SCE_AJM_ERROR_INVALID_CONTEXT = static_cast<int>(0x80930002);
 constexpr int SCE_AJM_ERROR_INVALID_INSTANCE = static_cast<int>(0x80930003);
+constexpr int SCE_AJM_ERROR_INVALID_BATCH = static_cast<int>(0x80930004);
 constexpr int SCE_AJM_ERROR_INVALID_PARAMETER = static_cast<int>(0x80930005);
 constexpr int SCE_AJM_ERROR_OUT_OF_RESOURCES = static_cast<int>(0x80930007);
 
@@ -127,6 +130,8 @@ std::map<std::uint32_t, std::unique_ptr<Instance>> g_instances;
 std::atomic<std::uint32_t> g_nextContext{1};
 std::atomic<std::uint32_t> g_nextInstance{1};
 std::atomic<std::uint32_t> g_nextBatch{1};
+std::mutex g_batchLock;
+std::set<std::uint32_t> g_batches;
 
 enum class JobKind : std::uint32_t {
     Initialize = 1,
@@ -486,6 +491,134 @@ bool ParseMp3Frame(const std::uint8_t* data, std::size_t size, Mp3Frame& frame) 
     frame.channels = ((header >> 6u) & 3u) == 3u ? 1u : 2u;
     frame.bytes = (mpeg1 ? 144u : 72u) * frame.bitrate / frame.sampleRate + ((header >> 9u) & 1u);
     return true;
+}
+
+constexpr std::uint32_t MP3_OFL_NONE = 0;
+constexpr std::uint32_t MP3_OFL_LAME = 1;
+constexpr std::uint32_t MP3_OFL_VBRI = 2;
+constexpr std::uint32_t MP3_OFL_FGH = 3;
+constexpr std::uint32_t MP3_OFL_VBRI_AND_FGH = 4;
+
+std::uint32_t ReadBigEndian(const std::uint8_t* data, std::size_t bytes) {
+    std::uint32_t value = 0;
+    for (std::size_t i = 0; i < bytes; ++i) value = (value << 8u) | data[i];
+    return value;
+}
+
+int ParseMp3Header(const std::uint8_t* stream, std::uint32_t streamSize, int parseOfl, AjmDecMp3ParseFrame* frame);
+
+void ParseMp3Ofl(const std::uint8_t* stream, std::uint32_t streamSize, std::uint32_t header, AjmDecMp3ParseFrame* frame) {
+    const std::size_t end = std::min<std::size_t>(streamSize, frame->frame_size);
+    if (end <= 4) return;
+    const std::size_t available = end - 4;
+    std::size_t bit = 0;
+    const auto readBits = [&](std::uint32_t count) {
+        std::uint32_t value = 0;
+        for (std::uint32_t i = 0; i < count; ++i, ++bit) value = (value << 1u) | (bit / 8 < available ? (stream[4 + bit / 8] >> (7 - bit % 8)) & 1u : 0u);
+        return value;
+    };
+    const bool mpeg1 = ((header >> 19u) & 3u) == 3u;
+    const bool mono = ((header >> 6u) & 3u) == 3u;
+    bit += mpeg1 ? (mono ? 18 : 20) : (mono ? 9 : 10);
+    std::uint32_t mainDataBits = 0;
+    for (std::uint32_t granule = 0; granule < (mpeg1 ? 2u : 1u); ++granule) {
+        for (std::uint32_t channel = 0; channel < frame->num_channels; ++channel) {
+            mainDataBits += readBits(12);
+            bit += mpeg1 ? 47 : 51;
+        }
+    }
+    bit += mainDataBits;
+    std::size_t at = 4 + std::min<std::size_t>((bit + 7) / 8, available);
+
+    if (at + 8 <= end && (std::memcmp(stream + at, "Xing", 4) == 0 || std::memcmp(stream + at, "Info", 4) == 0)) {
+        const std::uint8_t flags = stream[at + 7];
+        std::size_t field = at + 8;
+        std::uint32_t frames = 0;
+        if (flags & 0x01u) {
+            if (field + 4 > end) return;
+            frames = ReadBigEndian(stream + field, 4);
+            frame->num_frames = frames;
+            field += 4;
+        }
+        if (flags & 0x02u) {
+            field += 4;
+            if (field > end) return;
+        }
+        if (flags & 0x04u) {
+            field += 100;
+            if (field > end) return;
+        }
+        if (flags & 0x08u) {
+            field += 4;
+            if (field > end) return;
+        }
+        if (field + 0x18 <= end && std::memcmp(stream + field, "LAME", 4) == 0) {
+            const std::uint32_t delay = (std::uint32_t{stream[field + 0x15]} << 4u) | (stream[field + 0x16] >> 4u);
+            const std::uint32_t padding = ((std::uint32_t{stream[field + 0x16]} & 0x0Fu) << 8u) | stream[field + 0x17];
+            if ((flags & 0x01u) && frames > 0) frame->total_samples = frames * frame->samples_per_channel - (delay + padding);
+            frame->encoder_delay = frame->samples_per_channel + delay + 529;
+            frame->ofl_type = MP3_OFL_LAME;
+        }
+    } else if (at != 36 && end >= 40 && std::memcmp(stream + 36, "VBRI", 4) == 0) {
+        NotImplemented_nid_no_patch("sceAjmDecMp3ParseFrame (VBRI header outside MPEG-1 stereo)");
+    } else if (at + 26 <= end && std::memcmp(stream + at, "VBRI", 4) == 0) {
+        frame->encoder_delay = ReadBigEndian(stream + at + 6, 2);
+        frame->ofl_type = MP3_OFL_VBRI;
+        if (frame->frame_size <= streamSize) {
+            AjmDecMp3ParseFrame next{};
+            if (ParseMp3Header(stream + frame->frame_size, streamSize - static_cast<std::uint32_t>(frame->frame_size), 1, &next) == 0 && next.ofl_type == MP3_OFL_FGH) {
+                frame->encoder_delay += next.encoder_delay;
+                frame->total_samples = next.total_samples;
+                frame->ofl_type = MP3_OFL_VBRI_AND_FGH;
+            }
+        }
+    } else if (at + 10 <= end) {
+        while (at + 9 < end && stream[at] != 0xB4u) ++at;
+        if (at + 9 >= end) return;
+        std::uint8_t crc = 0xFF;
+        for (std::size_t i = 0; i < 9; ++i) {
+            for (int shift = 7; shift >= 0; --shift) {
+                const bool same = ((crc >> 7u) & 1u) == ((stream[at + i] >> shift) & 1u);
+                crc = static_cast<std::uint8_t>(same ? (crc << 1u) ^ 0x45u : crc << 1u);
+            }
+        }
+        if (stream[at + 9] != crc) return;
+        frame->encoder_delay = ReadBigEndian(stream + at + 1, 2);
+        frame->total_samples = ReadBigEndian(stream + at + 3, 4);
+        frame->ofl_type = MP3_OFL_FGH;
+    }
+}
+
+int ParseMp3Header(const std::uint8_t* stream, std::uint32_t streamSize, int parseOfl, AjmDecMp3ParseFrame* frame) {
+    if (!stream || streamSize < 4 || !frame) return SCE_AJM_ERROR_INVALID_PARAMETER;
+    static constexpr std::uint32_t sampleRates[4][4] = {{11025, 12000, 8000, 0}, {0, 0, 0, 0}, {22050, 24000, 16000, 0}, {44100, 48000, 32000, 0}};
+    static constexpr std::uint32_t kbps[4][16] = {
+        {0, 8, 16, 24, 32, 40, 48, 56, 64, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0},
+        {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0},
+    };
+    const std::uint32_t header = (std::uint32_t{stream[0]} << 24u) | (std::uint32_t{stream[1]} << 16u) | (std::uint32_t{stream[2]} << 8u) | stream[3];
+    const std::uint32_t version = (header >> 19u) & 3u;
+    const std::uint32_t sampleRate = sampleRates[version][(header >> 10u) & 3u];
+    const std::uint32_t bitrate = kbps[version][(header >> 12u) & 15u] * 1000u;
+    const bool valid = (header >> 21u) == 0x7FFu && sampleRate != 0 && bitrate != 0;
+    AJM_TRACE("[ajm] parse mp3 frame %02x %02x %02x %02x (%u bytes, parse ofl %d) -> %s, %u Hz, %u bps\n", stream[0], stream[1], stream[2], stream[3], streamSize, parseOfl, valid ? "ok" : "invalid", sampleRate, bitrate);
+    if (!valid) return SCE_AJM_ERROR_INVALID_PARAMETER;
+    if (parseOfl && ((header >> 17u) & 3u) != 1u) NotImplemented_nid_no_patch("sceAjmDecMp3ParseFrame (original file length lookup outside layer III)");
+    if (parseOfl && ((header >> 16u) & 1u) == 0) NotImplemented_nid_no_patch("sceAjmDecMp3ParseFrame (original file length lookup in a CRC-protected frame)");
+    const bool mpeg1 = version == 3;
+    frame->frame_size = (mpeg1 ? 144u : 72u) * bitrate / sampleRate + ((header >> 9u) & 1u);
+    frame->num_channels = ((header >> 6u) & 3u) == 3u ? 1u : 2u;
+    frame->samples_per_channel = mpeg1 ? 1152u : 576u;
+    frame->bitrate = bitrate;
+    frame->sample_rate = sampleRate;
+    frame->encoder_delay = 0;
+    frame->num_frames = 0;
+    frame->total_samples = 0;
+    frame->ofl_type = MP3_OFL_NONE;
+    if (parseOfl) ParseMp3Ofl(stream, streamSize, header, frame);
+    return 0;
 }
 
 void OpenMp3(Instance& instance) {
@@ -866,33 +999,7 @@ int APS5_VABI sceAjmDecAt9ParseConfigData(const void* config_data, AjmDecAt9Conf
 }
 
 int APS5_VABI sceAjmDecMp3ParseFrame(const uint8_t* stream, uint32_t streamSize, int parseOfl, AjmDecMp3ParseFrame* frame) {
-    if (!stream || streamSize < 4 || !frame) return SCE_AJM_ERROR_INVALID_PARAMETER;
-    static constexpr std::uint32_t sampleRates[4][4] = {{11025, 12000, 8000, 0}, {0, 0, 0, 0}, {22050, 24000, 16000, 0}, {44100, 48000, 32000, 0}};
-    static constexpr std::uint32_t kbps[4][16] = {
-        {0, 8, 16, 24, 32, 40, 48, 56, 64, 0, 0, 0, 0, 0, 0, 0},
-        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-        {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0},
-        {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0},
-    };
-    const std::uint32_t header = (std::uint32_t{stream[0]} << 24u) | (std::uint32_t{stream[1]} << 16u) | (std::uint32_t{stream[2]} << 8u) | stream[3];
-    const std::uint32_t version = (header >> 19u) & 3u;
-    const std::uint32_t sampleRate = sampleRates[version][(header >> 10u) & 3u];
-    const std::uint32_t bitrate = kbps[version][(header >> 12u) & 15u] * 1000u;
-    const bool valid = (header >> 21u) == 0x7FFu && sampleRate != 0 && bitrate != 0;
-    AJM_TRACE("[ajm] parse mp3 frame %02x %02x %02x %02x (%u bytes, parse ofl %d) -> %s, %u Hz, %u bps\n", stream[0], stream[1], stream[2], stream[3], streamSize, parseOfl, valid ? "ok" : "invalid", sampleRate, bitrate);
-    if (!valid) return SCE_AJM_ERROR_INVALID_PARAMETER;
-    if (parseOfl) NotImplemented_nid_no_patch("sceAjmDecMp3ParseFrame (original file length lookup)");
-    const bool mpeg1 = version == 3;
-    frame->frame_size = (mpeg1 ? 144u : 72u) * bitrate / sampleRate + ((header >> 9u) & 1u);
-    frame->num_channels = ((header >> 6u) & 3u) == 3u ? 1u : 2u;
-    frame->samples_per_channel = mpeg1 ? 1152u : 576u;
-    frame->bitrate = bitrate;
-    frame->sample_rate = sampleRate;
-    frame->encoder_delay = 0;
-    frame->num_frames = 0;
-    frame->total_samples = 0;
-    frame->ofl_type = 0;
-    return 0;
+    return ParseMp3Header(stream, streamSize, parseOfl, frame);
 }
 
 int APS5_VABI sceAjmBatchInitialize(void* buffer, size_t size, AjmBatchInfo* info) {
@@ -985,16 +1092,30 @@ int APS5_VABI sceAjmBatchStart(uint32_t context, const AjmBatchInfo* info, int p
         cursor += record.bytes;
     }
     if (error) std::memset(error, 0, sizeof(*error));
-    *batch = g_nextBatch.fetch_add(1, std::memory_order_relaxed);
+    const auto id = g_nextBatch.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(g_batchLock);
+        g_batches.insert(id);
+    }
+    *batch = id;
     return 0;
 }
 
 int APS5_VABI sceAjmBatchWait(uint32_t context, uint32_t batch, uint32_t timeout, AjmBatchError* error) {
     (void)context;
-    (void)batch;
     (void)timeout;
+    {
+        std::lock_guard lock(g_batchLock);
+        if (g_batches.erase(batch) == 0) return SCE_AJM_ERROR_INVALID_BATCH;
+    }
     if (error) std::memset(error, 0, sizeof(*error));
     return 0;
+}
+
+int APS5_VABI sceAjmBatchCancel(uint32_t context, uint32_t batch) {
+    if (context == 0 || context >= g_nextContext.load(std::memory_order_relaxed)) return SCE_AJM_ERROR_INVALID_CONTEXT;
+    std::lock_guard lock(g_batchLock);
+    return g_batches.contains(batch) ? 0 : SCE_AJM_ERROR_INVALID_BATCH;
 }
 
 int APS5_VABI sceAjmBatchErrorDump(const AjmBatchInfo* info, AjmBatchError* error) {

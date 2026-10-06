@@ -98,6 +98,12 @@ constexpr std::uint32_t PixelInputVgpr(std::uint32_t inputAddr, PixelInput input
     return vgpr;
 }
 
+enum class ConservativeZExport : std::uint8_t {
+    AnyZ,
+    LessThanZ,
+    GreaterThanZ
+};
+
 struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
@@ -119,6 +125,7 @@ struct ShaderPixelStageInfo {
     bool sampleMaskExportEnable;
     bool earlyZ;
     bool executeOnNoop;
+    ConservativeZExport conservativeZExport;
     std::array<std::uint8_t, 8> targetOutputMode;
     std::array<std::uint8_t, 8> targetExportMapping;
 };
@@ -310,6 +317,7 @@ struct DescriptorBinding {
     // Guest image elements the shader stores to (or updates atomically); the others are only read.
     std::vector<bool> imageWritten;
     std::vector<bool> imageDepthCompare;
+    std::vector<bool> imageAtomic;
     // Guest buffer elements the shader updates atomically (one entry per element of a GuestBuffers
     // binding, empty otherwise). An atomic on a host-imported range is a serialized PCIe round trip
     // (~0.4-0.5 us each on NVIDIA), so a driver may keep these elements in device-local memory.

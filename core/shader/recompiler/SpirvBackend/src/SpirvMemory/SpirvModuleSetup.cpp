@@ -197,6 +197,12 @@ void DefineModule(SpirvEmitterState& state) {
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeOriginUpperLeft);
         if (state.depthVariable != 0) {
             state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDepthReplacing);
+            if (pixel.psConservativeZExport == ConservativeZExport::LessThanZ) {
+                state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDepthLess);
+            }
+            if (pixel.psConservativeZExport == ConservativeZExport::GreaterThanZ) {
+                state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDepthGreater);
+            }
         }
         if (pixel.psEarlyZ && !pixel.psPixelKillEnable && !pixel.psDepthExportEnable && !pixel.psSampleMaskExportEnable) {
             state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeEarlyFragmentTests);

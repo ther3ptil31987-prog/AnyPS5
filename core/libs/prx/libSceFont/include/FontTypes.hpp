@@ -388,6 +388,20 @@ struct FontWritingMetrics {
     FontWritingExtent Extent;
 };
 
+struct FontWritingLineStep {
+    float x;
+    float y;
+    float advanceX;
+    float advanceY;
+    float spacingProgress;
+    void* writingOrderer;
+    struct {
+        float x;
+        float y;
+    } Adjusting;
+    FontWritingMetrics Metrics;
+};
+
 struct FontHorizontalLayout {
     float baselineOffset;
     float lineAdvance;
@@ -428,5 +442,7 @@ static_assert(sizeof(FontWritingProfile) == sizeof(std::uint32_t));
 static_assert(sizeof(FontWritingStep) == 0x48);
 static_assert(sizeof(FontWritingLetterStep) == 0x40);
 static_assert(sizeof(FontWritingMetrics) == 0x18);
+static_assert(sizeof(FontWritingLineStep) == 0x40);
+static_assert(offsetof(FontWritingLineStep, writingOrderer) == 0x18);
 
 #endif

@@ -7,6 +7,10 @@
 extern "C" {
 void APS5_VABI sceImeParamInit(Param* param);
 int APS5_VABI sceImeGetPanelSize(const Param* param, uint32_t* width, uint32_t* height);
+int APS5_VABI sceImeClose_nid_postfix(void);
+int APS5_VABI sceImeSetCaret(const Caret* caret);
+int APS5_VABI sceImeSetText(const char16_t* text, uint32_t length);
+int APS5_VABI sceImeSetTextGeometry(TextAreaMode mode, const TextGeometry* geometry);
 }
 
 static_assert(sizeof(Param) == 96);
@@ -102,8 +106,21 @@ static void CheckErrors() {
     Require(width == 0x12345678 && height == 0x87654321, "outputs changed on error");
 }
 
+static void CheckClosedPanel() {
+    constexpr int notOpened = static_cast<int>(0x80bc0002u);
+    Caret caret{};
+    TextGeometry geometry{};
+    const char16_t text[] = u"text";
+    Require(sceImeSetCaret(&caret) == notOpened, "caret needs an open panel");
+    Require(sceImeSetCaret(nullptr) == notOpened, "caret checks the panel first");
+    Require(sceImeSetText(text, 4) == notOpened, "text needs an open panel");
+    Require(sceImeSetTextGeometry(TextAreaMode::Edit, &geometry) == notOpened, "geometry needs an open panel");
+    Require(sceImeClose_nid_postfix() == notOpened, "closing needs an open panel");
+}
+
 int main() {
     CheckInitialization();
     CheckPanelSizes();
     CheckErrors();
+    CheckClosedPanel();
 }

@@ -80,17 +80,23 @@ int APS5_VABI sceSystemServiceParamGetInt(int paramId, int* value) {
  return SYSTEM_SERVICE_OK;
 }
 
-int APS5_VABI sceSystemServiceParamGetString(int param_id, char* buf, size_t buf_size) {
- (void)param_id;
- (void)buf;
- (void)buf_size;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+int APS5_VABI sceSystemServiceParamGetString(int paramId, char* buf, size_t bufSize) {
+ if (buf == nullptr || bufSize == 0) {
+  return SYSTEM_SERVICE_ERROR_PARAMETER;
+ }
+ if (paramId != SYSTEM_SERVICE_PARAM_ID_SYSTEM_NAME) {
+  NotImplemented_nid_no_patch("sceSystemServiceParamGetString: parameter other than the system name");
+ }
+ if (bufSize < SYSTEM_SERVICE_MAX_SYSTEM_NAME_LENGTH) {
+  NotImplemented_nid_no_patch("sceSystemServiceParamGetString: buffer shorter than 65 bytes");
+ }
+ constexpr char SystemName[] = "PS5";
+ std::memcpy(buf, SystemName, sizeof(SystemName));
+ return SYSTEM_SERVICE_OK;
 }
 
 int APS5_VABI sceSystemServicePowerTick(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return SYSTEM_SERVICE_OK;
 }
 
 int APS5_VABI sceSystemServiceReceiveEvent(SystemServiceEvent* event) {
@@ -102,8 +108,7 @@ int APS5_VABI sceSystemServiceReceiveEvent(SystemServiceEvent* event) {
 
 int APS5_VABI sceSystemServiceReportAbnormalTermination(const void* info) {
  (void)info;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return SYSTEM_SERVICE_OK;
 }
 
 int APS5_VABI sceSystemServiceSetNoticeScreenSkipFlag(void) {
@@ -128,6 +133,31 @@ int APS5_VABI sceSystemServiceReenableMediaPlay() {
 int APS5_VABI sceSystemServiceLaunchPlayerDialog(const void* param) {
  if (param == nullptr) return SYSTEM_SERVICE_ERROR_PARAMETER;
  return SYSTEM_SERVICE_OK;
+}
+
+int APS5_VABI sceSystemServiceDisableMusicPlayer(void) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSystemServiceOpenChallengeActivity(void) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSystemServiceOpenTournamentOccurrence(void) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSystemServiceReenableMusicPlayer(void) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceSystemServiceShowControllerSettings(void) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
 }
 
 }

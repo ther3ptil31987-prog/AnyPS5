@@ -4,6 +4,9 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceHttp/src/HttpErrors.hpp"
 #include <atomic>
+#include <limits>
+#include <stdexcept>
+#include <string_view>
 
 // No network is emulated: contexts, templates and requests can be created, but any request
 // that would touch the network fails with the library's network error.
@@ -169,6 +172,12 @@ int APS5_VABI sceHttpSetRecvTimeOut(int id, uint32_t usec) {
     return 0;
 }
 
+int APS5_VABI sceHttpSetResponseHeaderMaxSize(int id, uint64_t header_size) {
+    (void)id;
+    (void)header_size;
+    return 0;
+}
+
 int APS5_VABI sceHttpSetRequestContentLength(int request_id, uint64_t content_length) {
     (void)request_id;
     (void)content_length;
@@ -239,6 +248,11 @@ int APS5_VABI sceHttpReadData(int request_id, void* data, size_t size) {
     return ERROR_NETWORK;
 }
 
+int APS5_VABI sceHttpRedirectCacheFlush(int http_ctx_id) {
+    (void)http_ctx_id;
+    return 0;
+}
+
 int APS5_VABI sceHttpSetChunkedTransferEnabled(int id, int enable) {
     (void)id;
     (void)enable;
@@ -246,21 +260,77 @@ int APS5_VABI sceHttpSetChunkedTransferEnabled(int id, int enable) {
 }
 
 
-APS5_EXPORT("i9mhafzkEi8", sceHttpUnknown00);
-int APS5_VABI sceHttpUnknown00(void) {
-    NotImplemented_nid_no_patch("i9mhafzkEi8");
+int APS5_VABI sceHttpSetInflateGZIPEnabled(int id, int enable) {
+    (void)id;
+    if (static_cast<uint32_t>(enable) > 1) return ERROR_INVALID_VALUE;
     return 0;
 }
 
-APS5_EXPORT("vO4B-42ef-k", sceHttpUnknown01);
-int APS5_VABI sceHttpUnknown01(void) {
-    NotImplemented_nid_no_patch("vO4B-42ef-k");
-    return 0;
-}
-
-int APS5_VABI sceHttpParseResponseHeader(void) {
+int APS5_VABI sceHttpSetRequestStatusCallback(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
+}
+
+int APS5_VABI sceHttpParseResponseHeader(const char* header, std::size_t headerLen, const char* fieldStr,
+                                       const char** fieldValue, std::size_t* valueLen) {
+    constexpr int invalidResponse = static_cast<int>(0x80432060);
+    constexpr int invalidValue = static_cast<int>(0x804321FE);
+    constexpr int notFound = static_cast<int>(0x80432025);
+    if (!header) return invalidResponse;
+    if (!fieldStr || !fieldValue || !valueLen) return invalidValue;
+
+    std::size_t fieldLen = 0;
+    while (fieldLen < 0xfff && fieldStr[fieldLen] != '\0') ++fieldLen;
+    const std::string_view input(header, headerLen);
+    const auto isSpace = [](char c) { return c == ' ' || (c >= '\t' && c <= '\r'); };
+    const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; };
+    std::size_t start = 0;
+    bool found = false;
+    while (start < headerLen) {
+        if (!isSpace(input[start]) && fieldLen < headerLen - start && input[start + fieldLen] == ':') {
+            std::size_t i = 0;
+            while (i < fieldLen && lower(input[start + i]) == lower(fieldStr[i])) ++i;
+            if (i == fieldLen) {
+                start += fieldLen + 1;
+                found = true;
+                break;
+            }
+        }
+        const auto newline = input.find('\n', start);
+        if (newline == std::string_view::npos) break;
+        start = newline + 1;
+    }
+    if (!found) return notFound;
+
+    while (start < headerLen && isSpace(input[start])) {
+        if (input[start++] == '\n') break;
+    }
+    std::size_t end = headerLen;
+    std::size_t consumed = headerLen;
+    std::size_t scan = start;
+    while (scan < headerLen) {
+        const auto newline = input.find('\n', scan);
+        if (newline == std::string_view::npos) break;
+        const auto next = newline + 1;
+        if (next < headerLen && (input[next] == ' ' || input[next] == '\t')) {
+            scan = next;
+            continue;
+        }
+        end = newline > start && input[newline - 1] == '\r' ? newline - 1 : newline;
+        consumed = next;
+        break;
+    }
+    if (end == start) {
+        *fieldValue = nullptr;
+        *valueLen = 0;
+        return 0;
+    }
+    if (consumed > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::out_of_range("sceHttpParseResponseHeader: consumed byte count exceeds int");
+    }
+    *fieldValue = header + start;
+    *valueLen = end - start;
+    return static_cast<int>(consumed);
 }
 
 int APS5_VABI sceHttpCreateRequest2(int conn_id, const char* method, const char* path, uint64_t content_length) {
@@ -283,6 +353,11 @@ int APS5_VABI sceHttpsLoadCert(int http_ctx_id, int num, void* ca_list, void* ce
     (void)ca_list;
     (void)cert;
     (void)key;
+    return 0;
+}
+
+int APS5_VABI sceHttpsUnloadCert(int http_ctx_id) {
+    (void)http_ctx_id;
     return 0;
 }
 

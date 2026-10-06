@@ -34,7 +34,13 @@ void EmitKillIfPixelValidMaskInactive(SpirvEmitterState& state) {
     const auto active = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, TypeU32(state), maskValue, state.pixelValidMaskVariable);
     state.module.AddFunction(spv::OpINotEqual, TypeBool(state), active, maskValue, ConstantU32(state, 0u));
-    EmitKillIfBoolFalse(state, active);
+    auto keep = active;
+    if (const auto helperVariable = InputVariableForKind(state, StageInputKind::HelperInvocation); helperVariable != 0u) {
+        const auto helper = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeBool(state), helper, helperVariable);
+        keep = Binary(state, spv::OpLogicalOr, TypeBool(state), active, helper);
+    }
+    EmitKillIfBoolFalse(state, keep);
 }
 
 // Block metadata is paired with BlockOrder by position (as IrProgram validation does); terminator
@@ -466,6 +472,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::FPRsq64: return Invoke(EmitFPRsq64, ctx, inst);
         case IrOpcode::FPSqrt64: return Invoke(EmitFPSqrt64, ctx, inst);
         case IrOpcode::FPTrigPreop64: return Invoke(EmitFPTrigPreop64, ctx, inst);
+        case IrOpcode::FPDot2F32F16: return Invoke(EmitFPDot2F32F16, ctx, inst);
         case IrOpcode::ConvertF32F64: return Invoke(EmitConvertF32F64, ctx, inst);
         case IrOpcode::ConvertF64F32: return Invoke(EmitConvertF64F32, ctx, inst);
         case IrOpcode::ConvertF64S32: return Invoke(EmitConvertF64S32, ctx, inst);
@@ -508,6 +515,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::AddressAtomicXor32: return Invoke(EmitAddressAtomic, ctx, inst);
         case IrOpcode::AddressAtomicInc32: return Invoke(EmitAddressAtomic, ctx, inst);
         case IrOpcode::AddressAtomicDec32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicUSubSat32: return Invoke(EmitAddressAtomic, ctx, inst);
         case IrOpcode::AddressAtomicSwap64: return Invoke(EmitAddressAtomic, ctx, inst);
         case IrOpcode::AddressAtomicCmpSwap64: return Invoke(EmitAddressAtomic, ctx, inst);
         case IrOpcode::AddressAtomicIAdd64: return Invoke(EmitAddressAtomic, ctx, inst);

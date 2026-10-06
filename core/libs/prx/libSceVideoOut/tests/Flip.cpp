@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -162,6 +163,38 @@ void testDecode() {
     expectFailure([&] { AgcDriver::ReadDisplayBuffer(buffer); });
     buffer.address = std::numeric_limits<uint64_t>::max() & ~uint64_t{65535};
     expectFailure([&] { AgcDriver::DisplayBufferSize(buffer); });
+    const VideoOutBuffer registered{0, reinterpret_cast<uint64_t>(tiled.data()), 0};
+    BufferAttributeGroup group{};
+    sceVideoOutSetBufferAttribute2(&group.attribute, 0x8000000000000000ull, 0, 259, 137, VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_NONE, 0, 0);
+    group.occupied = true;
+    const auto plain = DescribeVideoOutBuffer(registered, group);
+    group.attribute.option = VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY;
+    const auto strict = DescribeVideoOutBuffer(registered, group);
+    check(strict.address == plain.address && strict.pixelFormat == plain.pixelFormat && strict.width == plain.width && strict.height == plain.height && strict.tilingMode == plain.tilingMode && strict.pitchInPixel == plain.pitchInPixel, "the STRICT_COLORIMETRY option changed the described buffer");
+    for (const uint64_t option : {1ull, 32ull, 40ull}) {
+        group.attribute.option = option;
+        check(expectFailure([&] { DescribeVideoOutBuffer(registered, group); }).find("buffer option " + std::to_string(option)) != std::string::npos, "an unsupported buffer option was accepted");
+    }
+    VideoOutBuffer dccBuffer{0, reinterpret_cast<uint64_t>(tiled.data()), 0x7f0000};
+    sceVideoOutSetBufferAttribute2(&group.attribute, 0x8000000000000000ull, 0, 259, 137, VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_NONE, 0x208, 0x11223344);
+    group.category = VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED;
+    const auto compressed = DescribeVideoOutBuffer(dccBuffer, group);
+    check(compressed.address == dccBuffer.dataAddress && compressed.dccAddress == 0x7f0000 && compressed.dccClearColor == 0x11223344, "DCC metadata or clear color was not described");
+    group.attribute.dcc_control = 0x100024;
+    check(DescribeVideoOutBuffer(dccBuffer, group).dccAddress == 0x7f0000, "independent 128-byte DCC blocks were rejected");
+    group.attribute.dcc_control = 0x209;
+    check(expectFailure([&] { DescribeVideoOutBuffer(dccBuffer, group); }).find("DCC control 0x209") != std::string::npos, "an unknown DCC control bit was accepted");
+    group.attribute.dcc_control = 0x208;
+    group.attribute.tiling_mode = 1;
+    check(expectFailure([&] { DescribeVideoOutBuffer(dccBuffer, group); }).find("linear") != std::string::npos, "a linear DCC buffer was accepted");
+    group.attribute.tiling_mode = 0;
+    dccBuffer.metadataAddress = 0;
+    check(expectFailure([&] { DescribeVideoOutBuffer(dccBuffer, group); }).find("without DCC metadata") != std::string::npos, "a compressed buffer without metadata was accepted");
+    dccBuffer.metadataAddress = 0x7f0000;
+    group.category = VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED;
+    check(expectFailure([&] { DescribeVideoOutBuffer(dccBuffer, group); }).find("DCC metadata 0x7f0000") != std::string::npos, "an uncompressed buffer with DCC metadata was accepted");
+    group.category = 2;
+    check(expectFailure([&] { DescribeVideoOutBuffer(dccBuffer, group); }).find("category 2") != std::string::npos, "an unknown buffer category was accepted");
 }
 
 void testOpenParam() {
@@ -266,6 +299,36 @@ void testPresentation(bool expectUnavailable) {
         attribute.width = 65;
         attribute.height = 33;
         sceVideoOutSubmitChangeBufferAttribute2(handle, 0, &attribute, nullptr);
+    }
+    sceVideoOutUnregisterBuffers(handle, 0);
+    sceVideoOutClose(handle);
+    LibcRunShutdown_nid_postfix();
+}
+
+void testCompressedPresentation() {
+    const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
+    auto cfg = VideoOutDriver::Get().GetConfig(handle);
+    std::vector<std::byte> allocation(6 * 65536 + 65535);
+    const auto storage = alignedBuffer(allocation);
+    fillBuffer(storage, 259, 137);
+    std::vector<std::uint8_t> keys(storage.size() / 256);
+    VideoOutBuffers buffer{storage.data(), keys.data(), {nullptr, nullptr}};
+    VideoOutBufferAttribute2 attribute{};
+    sceVideoOutSetBufferAttribute2(&attribute, 0x8000000000000000ull, 0, 259, 137, 0, 0x208, 0xff102030);
+    sceVideoOutRegisterBuffers2(handle, 0, 0, &buffer, 1, &attribute, VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED, nullptr);
+    int64_t argument = 2000;
+    for (std::uint8_t key : {0x00, 0xff, 0x20, 0xc0}) {
+        std::fill(keys.begin(), keys.end(), key);
+        uint64_t target;
+        {
+            std::lock_guard lock(cfg->mutex);
+            target = cfg->flipStatus.count + 1;
+        }
+        sceVideoOutSubmitFlip(handle, 0, 1, ++argument);
+        std::unique_lock lock(cfg->mutex);
+        check(cfg->vblankCond.wait_for(lock, std::chrono::seconds(15), [&] { return cfg->failure || cfg->flipStatus.count == target; }), "DCC presentation did not complete");
+        if (cfg->failure) std::rethrow_exception(cfg->failure);
+        check(cfg->flipStatus.flipArg == argument && cfg->flipStatus.flipPendingNum == 0, "DCC flip status is wrong");
     }
     sceVideoOutUnregisterBuffers(handle, 0);
     sceVideoOutClose(handle);
@@ -414,6 +477,7 @@ int main(int argc, char** argv) {
         else if (argc == 2 && std::string(argv[1]) == "controls") testControls();
         else if (argc == 2 && std::string(argv[1]) == "present") testPresentation(false);
         else if (argc == 2 && std::string(argv[1]) == "backtoback") testBackToBack();
+        else if (argc == 2 && std::string(argv[1]) == "dcc") testCompressedPresentation();
         else if (argc == 2 && std::string(argv[1]) == "pacing") testReleaseVblank();
         else if (argc == 2 && std::string(argv[1]) == "aftergpu") testFlipAfterGpuWork();
         else if (argc == 2 && std::string(argv[1]) == "unavailable") testPresentation(true);

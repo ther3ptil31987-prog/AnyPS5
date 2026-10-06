@@ -328,7 +328,7 @@ RdnaInstruction DecodeRdnaSop1(std::uint32_t programCounter, std::span<const std
     instruction.programCounter = programCounter;
     instruction.family = RdnaInstructionFamily::SOP1;
     instruction.opcodeId = opcode;
-    instruction.op = decodeSop1Opcode(opcode);
+    instruction.op = opcode == 0x21u && scalarDestination == 125u ? RdnaOpcode::SSetpcB64 : decodeSop1Opcode(opcode);
     instruction.dataDwordCount = scalarDestinationDwordCount(instruction.op);
     SetRdnaRawWords(instruction, code, wordIndex, 1);
 

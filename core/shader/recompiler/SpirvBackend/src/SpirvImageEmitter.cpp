@@ -4,6 +4,8 @@
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaImageOpDecoder.hpp"
+#include <span>
+#include <initializer_list>
 #include <algorithm>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
@@ -804,6 +806,9 @@ void EmitGatherOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     if (setup.layout.clamp != NoImageComponent) {
         ctx.Fail(access.inst, "is a gather with an LOD clamp, which is not implemented");
     }
+    if (setup.dref && (access.image.emulatedCompare & EmulatedCompare::Enabled) != 0u) {
+        ctx.Fail(access.inst, "is a comparison gather of a color texture, which is not implemented");
+    }
     if (dimension == RdnaImageDimension::Dim1D) {
         if (setup.dref || !HasFlag(mem, RdnaImageSampleFlagLevelZero) || HasFlag(mem, RdnaImageSampleFlagOffset) || HasFlag(mem, RdnaImageSampleFlagGatherHorizontal)) {
             ctx.Fail(access.inst, "has an unsupported 1D gather variant");
@@ -892,10 +897,121 @@ TableSelection EmitIndirectImageSelector(SpirvValueEmitContext& ctx, const Image
     return {selected, mapped};
 }
 
+void EmitEmulatedCompareSample(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const SampleSetup& setup) {
+    auto& state = ctx.state;
+    const auto& mem = access.mem;
+    const auto& image = access.image;
+    const auto compare = image.emulatedCompare;
+    if (access.slot != 0) ctx.Fail(access.inst, "compares against a color texture through a bindless image table, which is not implemented");
+    if (HasFlag(mem, RdnaImageSampleFlagDerivative) || HasFlag(mem, RdnaImageSampleFlagLod)) ctx.Fail(access.inst, "compares against a color texture with gradients or an explicit LOD, which is not implemented");
+    if (setup.layout.bias != NoImageComponent || setup.layout.offset != NoImageComponent || setup.layout.clamp != NoImageComponent) ctx.Fail(access.inst, "compares against a color texture with an LOD bias, texel offset or LOD clamp, which is not implemented");
+    if (!HasFlag(mem, RdnaImageSampleFlagLevelZero) && (compare & EmulatedCompare::SingleLevel) == 0u) ctx.Fail(access.inst, "compares against a color texture across mip levels, which is not implemented");
+    const bool arrayed = image.dimension == RdnaImageDimension::Dim2DArray;
+    if (image.dimension != RdnaImageDimension::Dim2D && !arrayed) ctx.Fail(access.inst, "compares against a color texture that is not a 2D or 2D array view, which is not implemented");
+    const auto f32 = TypeF32(state);
+    const auto i32 = TypeI32(state);
+    const auto u32 = TypeU32(state);
+    const auto ext = [&](std::uint32_t type, std::uint32_t op, std::initializer_list<std::uint32_t> args) {
+        const auto value = state.module.AllocateId();
+        std::vector<std::uint32_t> words{spv::OpExtInst, type, value, GlslStd450(state), op};
+        words.insert(words.end(), args.begin(), args.end());
+        state.module.AddFunction(std::span<const std::uint32_t>(words));
+        return value;
+    };
+    const auto extract = [&](std::uint32_t type, std::uint32_t composite, std::uint32_t index) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, type, value, composite, index);
+        return value;
+    };
+    const auto f32Constant = [&](float value) { return ConstantF32(state, std::bit_cast<std::uint32_t>(value)); };
+    const auto descriptor = LoadSampledImageDescriptor(state, mem.resource, access.slot);
+    state.module.EmitCapability(spv::CapabilityImageQuery);
+    const auto size = state.module.AllocateId();
+    state.module.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, image.dimension), size, descriptor, ConstantU32(state, 0u));
+    const auto width = Unary(state, spv::OpBitcast, i32, extract(u32, size, 0u));
+    const auto height = Unary(state, spv::OpBitcast, i32, extract(u32, size, 1u));
+    auto layer = ConstantU32(state, 0u);
+    if (arrayed) {
+        const auto layers = Unary(state, spv::OpBitcast, i32, extract(u32, size, 2u));
+        const auto rounded = Unary(state, spv::OpConvertFToS, i32, ext(f32, GLSLstd450Floor, {Binary(state, spv::OpFAdd, f32, extract(f32, setup.coord, 2u), f32Constant(0.5f))}));
+        layer = Unary(state, spv::OpBitcast, u32, ext(i32, GLSLstd450SClamp, {rounded, ConstantI32(state, 0), Binary(state, spv::OpISub, i32, layers, ConstantI32(state, 1))}));
+    }
+    auto reference = DrefValueF32(ctx, access, setup.layout);
+    if (EmulatedCompare::Reference(compare) == EmulatedCompare::ReferenceUnorm) reference = ext(f32, GLSLstd450FClamp, {reference, f32Constant(0.0f), f32Constant(1.0f)});
+    if (EmulatedCompare::Reference(compare) == EmulatedCompare::ReferenceSnorm) reference = ext(f32, GLSLstd450FClamp, {reference, f32Constant(-1.0f), f32Constant(1.0f)});
+    const auto address = [&](std::uint32_t index, std::uint32_t extent, std::uint32_t mode) {
+        if (mode == EmulatedCompare::AddressWrap) return Binary(state, spv::OpSMod, i32, index, extent);
+        return ext(i32, GLSLstd450SClamp, {index, ConstantI32(state, 0), Binary(state, spv::OpISub, i32, extent, ConstantI32(state, 1))});
+    };
+    const auto inside = [&](std::uint32_t index, std::uint32_t extent) {
+        const auto notBelow = Binary(state, spv::OpSGreaterThanEqual, TypeBool(state), index, ConstantI32(state, 0));
+        const auto below = Binary(state, spv::OpSLessThan, TypeBool(state), index, extent);
+        return Binary(state, spv::OpLogicalAnd, TypeBool(state), notBelow, below);
+    };
+    const auto one = f32Constant(1.0f);
+    const auto zero = f32Constant(0.0f);
+    const auto borderRed = (compare & EmulatedCompare::BorderWhite) != 0u ? one : zero;
+    const auto compareTexel = [&](std::uint32_t x, std::uint32_t y) {
+        const auto modeX = EmulatedCompare::AddressX(compare);
+        const auto modeY = EmulatedCompare::AddressY(compare);
+        const auto ux = Unary(state, spv::OpBitcast, u32, address(x, width, modeX));
+        const auto uy = Unary(state, spv::OpBitcast, u32, address(y, height, modeY));
+        const auto coord = state.module.AllocateId();
+        if (arrayed) state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), coord, ux, uy, layer);
+        else state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2), coord, ux, uy);
+        const auto texel = state.module.AllocateId();
+        state.module.AddFunction(spv::OpImageFetch, ImageVectorType(state, IrTextureNumericClass::Float, 4), texel, descriptor, coord, spv::ImageOperandsLodMask, ConstantU32(state, 0u));
+        auto red = extract(f32, texel, 0u);
+        std::uint32_t inBorder = 0u;
+        if (modeX == EmulatedCompare::AddressBorder) inBorder = Unary(state, spv::OpLogicalNot, TypeBool(state), inside(x, width));
+        if (modeY == EmulatedCompare::AddressBorder) {
+            const auto outsideY = Unary(state, spv::OpLogicalNot, TypeBool(state), inside(y, height));
+            inBorder = inBorder == 0u ? outsideY : Binary(state, spv::OpLogicalOr, TypeBool(state), inBorder, outsideY);
+        }
+        if (inBorder != 0u) red = Select(state, f32, inBorder, borderRed, red);
+        switch (EmulatedCompare::Function(compare)) {
+        case 0u: return zero;
+        case 1u: return Select(state, f32, Binary(state, spv::OpFOrdLessThan, TypeBool(state), reference, red), one, zero);
+        case 2u: return Select(state, f32, Binary(state, spv::OpFOrdEqual, TypeBool(state), reference, red), one, zero);
+        case 3u: return Select(state, f32, Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), reference, red), one, zero);
+        case 4u: return Select(state, f32, Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), reference, red), one, zero);
+        case 5u: return Select(state, f32, Binary(state, spv::OpFOrdNotEqual, TypeBool(state), reference, red), one, zero);
+        case 6u: return Select(state, f32, Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), reference, red), one, zero);
+        default: return one;
+        }
+    };
+    const auto scaledU = Binary(state, spv::OpFMul, f32, extract(f32, setup.coord, 0u), Unary(state, spv::OpConvertSToF, f32, width));
+    const auto scaledV = Binary(state, spv::OpFMul, f32, extract(f32, setup.coord, 1u), Unary(state, spv::OpConvertSToF, f32, height));
+    std::uint32_t result;
+    if ((compare & EmulatedCompare::Linear) == 0u) {
+        result = compareTexel(Unary(state, spv::OpConvertFToS, i32, ext(f32, GLSLstd450Floor, {scaledU})), Unary(state, spv::OpConvertFToS, i32, ext(f32, GLSLstd450Floor, {scaledV})));
+    } else {
+        const auto half = f32Constant(0.5f);
+        const auto centreU = Binary(state, spv::OpFSub, f32, scaledU, half);
+        const auto centreV = Binary(state, spv::OpFSub, f32, scaledV, half);
+        const auto floorU = ext(f32, GLSLstd450Floor, {centreU});
+        const auto floorV = ext(f32, GLSLstd450Floor, {centreV});
+        const auto weightU = Binary(state, spv::OpFSub, f32, centreU, floorU);
+        const auto weightV = Binary(state, spv::OpFSub, f32, centreV, floorV);
+        const auto x0 = Unary(state, spv::OpConvertFToS, i32, floorU);
+        const auto y0 = Unary(state, spv::OpConvertFToS, i32, floorV);
+        const auto x1 = Binary(state, spv::OpIAdd, i32, x0, ConstantI32(state, 1));
+        const auto y1 = Binary(state, spv::OpIAdd, i32, y0, ConstantI32(state, 1));
+        const auto top = ext(f32, GLSLstd450FMix, {compareTexel(x0, y0), compareTexel(x1, y0), weightU});
+        const auto bottom = ext(f32, GLSLstd450FMix, {compareTexel(x0, y1), compareTexel(x1, y1), weightU});
+        result = ext(f32, GLSLstd450FMix, {top, bottom, weightV});
+    }
+    ctx.Define(access.inst, TableResult(ctx, access, ResultVector(ctx, access, result, setup.numericClass, true, false)));
+}
+
 void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const SampleSetup& setup) {
     auto& state = ctx.state;
     const auto& mem = access.mem;
     const auto& image = access.image;
+    if (setup.dref && (image.emulatedCompare & EmulatedCompare::Enabled) != 0u) {
+        EmitEmulatedCompareSample(ctx, access, setup);
+        return;
+    }
     const bool explicitLod = HasFlag(mem, RdnaImageSampleFlagDerivative) || HasFlag(mem, RdnaImageSampleFlagLod) || HasFlag(mem, RdnaImageSampleFlagLevelZero) || state.program.Resources().stage != IrShaderStage::Pixel;
     std::uint32_t opcode = spv::OpImageSampleImplicitLod;
     if (explicitLod) {

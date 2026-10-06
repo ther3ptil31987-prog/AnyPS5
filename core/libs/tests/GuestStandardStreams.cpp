@@ -7,6 +7,9 @@
 #include <filesystem>
 #include <fstream>
 #include <chrono>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 extern "C" {
 FileStream* APS5_VABI freopen_nid_postfix(const char*, const char*, FileStream*);
 int APS5_VABI fseeko_nid_postfix(FileStream*, std::int64_t, int);
@@ -34,6 +37,11 @@ int APS5_VABI feof_nid_postfix(FileStream*);
 int APS5_VABI fileno_nid_postfix(FileStream*);
 void APS5_VABI clearerr_nid_postfix(FileStream*);
 int APS5_VABI setvbuf_nid_postfix(FileStream*, char*, int, std::size_t);
+void APS5_VABI setbuf_nid_postfix(FileStream*, char*);
+FileStream* APS5_VABI fdopen_nid_postfix(int, const char*);
+int APS5_VABI fclose_nid_postfix(FileStream*);
+int APS5_VABI _Getmbcurmax_nid_postfix();
+int APS5_VABI ___mb_cur_max_nid_postfix();
 }
 static void Require(bool value) { if (!value) std::abort(); }
 static int APS5_VABI WriteFormatted(FileStream* stream, const char* format, ...) {
@@ -69,6 +77,33 @@ static int APS5_VABI FormatString(char* buffer, const char* format, ...) {
     return result;
 }
 int main() {
+    Require(_Getmbcurmax_nid_postfix() == 1 && _Getmbcurmax_nid_postfix() == ___mb_cur_max_nid_postfix());
+    Require(fdopen_nid_postfix(-1, "rb") == nullptr && *__error_nid_postfix() == 9);
+    Require(fdopen_nid_postfix(0, nullptr) == nullptr && *__error_nid_postfix() == 22);
+    Require(fdopen_nid_postfix(0, "invalid") == nullptr && *__error_nid_postfix() == 22);
+    std::FILE* original = std::tmpfile();
+    Require(original != nullptr);
+    std::fputs("retained", original);
+    std::fflush(original);
+#ifdef _WIN32
+    const int descriptor = _dup(_fileno(original));
+#else
+    const int descriptor = ::dup(::fileno(original));
+#endif
+    Require(descriptor >= 0);
+    auto* wrapped = fdopen_nid_postfix(descriptor, "r+b");
+    Require(wrapped != nullptr && fileno_nid_postfix(wrapped) == descriptor);
+    setbuf_nid_postfix(wrapped, nullptr);
+    Require(fseek_nid_postfix(wrapped, 0, SEEK_SET) == 0);
+    char contents[32]{};
+    Require(fgets_nid_postfix(contents, sizeof(contents), wrapped) == contents && std::strcmp(contents, "retained") == 0);
+    Require(fclose_nid_postfix(wrapped) == 0);
+#ifdef _WIN32
+    Require(_close(descriptor) == -1);
+#else
+    Require(::close(descriptor) == -1);
+#endif
+    Require(std::fclose(original) == 0);
     char stringOutput[256];
     std::memset(stringOutput, '!', sizeof(stringOutput));
     std::int64_t count = -1;

@@ -167,6 +167,12 @@ inline Registers InitialContextRegisters() {
     return result;
 }
 
+struct Predication {
+    std::uint64_t address = 0;
+    std::uint32_t operation = 0;
+    bool executeWhenSet = false;
+};
+
 struct QueueState {
     Registers shader;
     Registers context = InitialContextRegisters();
@@ -180,6 +186,7 @@ struct QueueState {
     std::uint32_t indexType = 0;
     std::uint32_t instanceCount = 1;
     std::vector<std::string> markers;
+    Predication predication;
 
     void ClearContext() {
         context = InitialContextRegisters();

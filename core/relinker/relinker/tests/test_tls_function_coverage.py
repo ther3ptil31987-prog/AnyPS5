@@ -30,6 +30,81 @@ def fs_load(register, displacement):
     return bytes([0x64, 0x48 | (register >> 3) << 2, 0x8b, 0x04 | (register & 7) << 3, 0x25]) + struct.pack("<i", displacement)
 
 
+ALU_READ = {"add": 0x03, "or": 0x0b, "adc": 0x13, "sbb": 0x1b, "and": 0x23, "sub": 0x2b, "xor": 0x33, "cmp": 0x3b}
+
+
+def fs_alu(opcode, register, displacement):
+    return bytes([0x64, 0x48 | (register >> 3) << 2, opcode, 0x04 | (register & 7) << 3, 0x25]) + struct.pack("<i", displacement)
+
+
+def alu_check_body(opcode, register, base, value, result, flags_masked):
+    code = bytearray()
+    jumps = []
+
+    def emit(data):
+        code.extend(data)
+
+    def move_immediate(target, immediate):
+        emit(bytes([0x48 | (target >> 3), 0xb8 | (target & 7)]) + struct.pack("<Q", immediate & ((1 << 64) - 1)))
+
+    def compare_with_r8(target):
+        emit(bytes([0x48 | 0x44 | (0x01 if target >= 8 else 0), 0x39, 0xc0 | (target & 7)]))
+
+    def fail_unless_equal():
+        emit(bytes.fromhex("0f 85 00 00 00 00"))
+        jumps.append(len(code) - 4)
+
+    emit(bytes.fromhex("64 c7 04 25 28 00 00 00") + struct.pack("<I", value & 0xffffffff))
+    for target in (0, 1, 3):
+        move_immediate(target, base)
+    emit(fs_alu(opcode, register, 0x28))
+    emit(bytes.fromhex("9c 5a 83 e2 41"))
+    move_immediate(8, result)
+    compare_with_r8(register)
+    fail_unless_equal()
+    for target in (0, 1, 3):
+        if target == register:
+            continue
+        move_immediate(8, base)
+        compare_with_r8(target)
+        fail_unless_equal()
+    emit(bytes.fromhex("83 fa") + bytes([flags_masked]))
+    fail_unless_equal()
+    emit(bytes.fromhex("b8 2a 00 00 00 c3 b8 01 00 00 00 c3"))
+    failure = len(code) - 6
+    for position in jumps:
+        struct.pack_into("<i", code, position, failure - position - 4)
+    return bytes(code)
+
+
+def alu_execution_cases():
+    mask = (1 << 64) - 1
+    cases = (
+        ("xor", 0x33, lambda a, b: a ^ b, 0xffffffff00000000, 0xffffffff),
+        ("and", 0x23, lambda a, b: a & b, 0xffffffff00000000, 0xffffffff),
+        ("or", 0x0b, lambda a, b: a | b, 0xffffffff00000000, 0xffffffff),
+        ("add", 0x03, lambda a, b: a + b, 0x0102030405060708, 0x11223344),
+        ("sub", 0x2b, lambda a, b: a - b, 0x0000000012345678, 0xffffffff),
+        ("cmp", 0x3b, lambda a, b: a, 0x0000000012345678, 0xffffffff),
+        ("cmp-equal", 0x3b, lambda a, b: a, 0x00000000ffffffff, 0xffffffff),
+    )
+    for name, opcode, operation, base, value in cases:
+        result = operation(base, value) & mask
+        if opcode in (0x2b, 0x3b):
+            zero = 1 if (base - value) & mask == 0 else 0
+            carry = 1 if base < value else 0
+        elif opcode == 0x03:
+            zero = 1 if (base + value) & mask == 0 else 0
+            carry = 1 if base + value > mask else 0
+        else:
+            zero = 1 if result == 0 else 0
+            carry = 0
+        flags_masked = (zero << 6) | carry
+        for register in (0, 1, 3):
+            body = alu_check_body(opcode, register, base, value, result, flags_masked)
+            yield f"alu-exec-{name}-{register}", make_image("register", "unwind", body=body)
+
+
 def displacement_load(register, displacement, flags, round_trip=False):
     saved = (3, 5, 6, 7, 12, 13, 14, 15)
     code = bytearray()
@@ -276,17 +351,41 @@ def main():
             convert(name, image, tls_address=address, displacement=displacement)
         for name, image, error in displacement_bounds_cases():
             convert(name, image, error, error_offset=0x1240)
+        for name, opcode in ALU_READ.items():
+            for register in (0, 1, 2, 3, 8, 13):
+                for displacement in (0, 40, -8):
+                    body = fs_alu(opcode, register, displacement) + b"\xc3"
+                    case = f"alu-{name}-{register}-{displacement}"
+                    image = make_image("register", "unwind", body=body)
+                    source = work / (case + ".elf")
+                    output = source.with_suffix(".exe")
+                    source.write_bytes(image)
+                    result = subprocess.run([str(relinker), "--skip-sce-module", "--windows", str(source), str(output)],
+                                            capture_output=True, text=True, timeout=30)
+                    assert result.returncode == 0, (case, result.stderr)
+                    pe = output.read_bytes()
+                    patched_address = 0x10000 + 0x1240
+                    patched = pe_bytes_at(pe, patched_address, 5)
+                    assert patched[0] == 0xe9, case
+                    stub_address = patched_address + 5 + struct.unpack_from("<i", patched, 1)[0]
+                    stub = pe_bytes_at(pe, stub_address, 96)
+                    if register == 0:
+                        expected = bytes.fromhex("48 8b 90") + struct.pack("<i", displacement) + bytes([0x58, 0x48, opcode, 0xc2])
+                    elif register == 1:
+                        expected = bytes.fromhex("48 8b 80") + struct.pack("<i", displacement) + bytes.fromhex("48 8b 4c 24 08") + bytes([0x48, opcode, 0xc8])
+                    else:
+                        expected = bytes.fromhex("48 8b 80") + struct.pack("<i", displacement) + bytes([0x48 | ((register >> 3) << 2), opcode, 0xc0 | ((register & 7) << 3)])
+                    assert expected in stub, (case, expected.hex(), stub.hex())
+        for name, image in alu_execution_cases():
+            convert(name, image)
         rejected = {
             "rsp-displacement": fs_load(4, 40),
+            "rsp-alu": fs_alu(0x33, 4, 40),
             "dword-load": bytes.fromhex("64 8b 04 25 28 00 00 00"),
             "register-address": bytes.fromhex("64 48 8b 00"),
             "gs-load": bytes.fromhex("65 48 8b 04 25 28 00 00 00"),
             "rex-b-load": bytes.fromhex("64 49 8b 04 25 28 00 00 00"),
             "rex-x-load": bytes.fromhex("64 4a 8b 04 25 28 00 00 00"),
-            "compare": bytes.fromhex("64 48 3b 04 25 28 00 00 00"),
-            "subtract": bytes.fromhex("64 48 2b 04 25 28 00 00 00"),
-            "add": bytes.fromhex("64 48 03 04 25 28 00 00 00"),
-            "xor": bytes.fromhex("64 48 33 04 25 28 00 00 00"),
         }
         for name, instruction in rejected.items():
             convert(name, make_image("register", "unwind", body=instruction + b"\xc3"),

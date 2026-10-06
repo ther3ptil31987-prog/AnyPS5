@@ -1,4 +1,5 @@
 #include "prx/libScePad/include/Pad.hpp"
+#include "prx/libScePad/include/PadInputTypes.hpp"
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <chrono>
@@ -42,6 +43,20 @@ static void CheckTiltCorrection(int handle) {
     PadPublishInput_nid_postfix(PadInputState{});
 }
 
+static void CheckTouchContact() {
+    PadInputState touch;
+    touch.buttons = static_cast<std::uint32_t>(Pad::PadButton::TouchPad);
+    touch.touch[0] = {true, 960, 471, 0};
+    PadPublishInput_nid_postfix(touch);
+    const auto data = Pad::ReadState();
+    Require((data.buttons & static_cast<std::uint32_t>(Pad::PadButton::TouchPad)) != 0);
+    Require(data.touch_data_touch_num == 1);
+    Require(data.touch_data_touch0_x == 960);
+    Require(data.touch_data_touch0_y == 471);
+    PadPublishInput_nid_postfix(PadInputState{});
+    Pad::ReadState();
+}
+
 int main() {
     constexpr int noHandle = static_cast<int>(0x80920008);
     constexpr int user = 0x10000000;
@@ -55,6 +70,7 @@ int main() {
     Require(scePadGetHandle(user, 0, 0) == handle);
     Require(scePadGetHandle(user, 2, 0) == handle);
     CheckTiltCorrection(handle);
+    CheckTouchContact();
     Require(scePadGetHandle(0xff, 16, 0) == handle);
     Require(scePadGetHandle(user, 16, 0) == noHandle);
     Require(scePadGetHandle(user, 0, 1) == noHandle);

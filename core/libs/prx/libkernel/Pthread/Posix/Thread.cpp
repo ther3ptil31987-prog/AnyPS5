@@ -5,6 +5,7 @@
 #include "prx/libc/include/General.hpp"
 #include "../include/Pthread.hpp"
 #include "Common.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 #include <thread>
 
 extern "C" {
@@ -37,6 +38,18 @@ int APS5_VABI pthread_detach_nid_postfix(Pthread thread) {
 
 void APS5_VABI pthread_exit_nid_postfix(void* value) {
     scePthreadExit(value);
+}
+
+int APS5_VABI scePthreadGetschedparam(Pthread thread, int* policy, KernelSchedParam* param) {
+    if (!policy || !param) return SCE_KERNEL_ERROR_EINVAL;
+    *policy = GUEST_SCHED_FIFO;
+    return scePthreadGetprio(thread, &param->sched_priority);
+}
+
+int APS5_VABI scePthreadSetschedparam(Pthread thread, int policy, const KernelSchedParam* param) {
+    (void)policy;
+    if (!param) return SCE_KERNEL_ERROR_EINVAL;
+    return scePthreadSetprio(thread, param->sched_priority);
 }
 
 int APS5_VABI pthread_getschedparam_nid_postfix(Pthread thread, int* policy, KernelSchedParam* param) {

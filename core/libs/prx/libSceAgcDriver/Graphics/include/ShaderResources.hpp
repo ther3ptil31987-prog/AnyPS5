@@ -411,6 +411,7 @@ private:
     std::vector<std::uint64_t> storageKeys;
     std::vector<bool> storageFirstLayer;
     std::vector<bool> storageWritten;
+    std::vector<bool> storageAtomic;
     std::vector<std::shared_ptr<Sampler>> samplers;
     bool reusable = false;
     std::vector<DirectRegion> directRegions;

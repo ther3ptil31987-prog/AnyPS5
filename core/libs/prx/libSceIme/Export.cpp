@@ -10,12 +10,18 @@
 
 namespace {
 
+constexpr int ErrorNotOpened = static_cast<int>(0x80bc0002u);
+constexpr int ErrorInvalidUserId = static_cast<int>(0x80bc0010u);
 constexpr int ErrorInvalidType = static_cast<int>(0x80bc0011u);
 constexpr int ErrorInvalidOption = static_cast<int>(0x80bc0015u);
 constexpr int ErrorInvalidAddress = static_cast<int>(0x80bc0031u);
+constexpr int ErrorNoResourceId = static_cast<int>(0x80bc0023u);
+constexpr int ErrorInvalidMode = static_cast<int>(0x80bc0024u);
+constexpr uint32_t ValidKeyboardModes = 0x0000007f;
 constexpr uint32_t TypeNumber = 4;
 constexpr uint32_t ValidOptions = 0x00007bff;
 constexpr uint32_t OptionUseOver2K = 0x00004000;
+constexpr int32_t UserIdInvalid = -1;
 
 std::mutex g_keyboardMutex;
 std::set<int32_t> g_openKeyboards;
@@ -25,8 +31,7 @@ std::set<int32_t> g_openKeyboards;
 extern "C" {
 
 int APS5_VABI sceImeClose_nid_postfix(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return ErrorNotOpened;
 }
 
 int APS5_VABI sceImeGetPanelSize(const Param* param, uint32_t* width, uint32_t* height) {
@@ -47,9 +52,9 @@ int APS5_VABI sceImeKeyboardClose(int32_t user_id) {
 
 int APS5_VABI sceImeKeyboardGetInfo(uint32_t resource_id, KeyboardInfo* info) {
  (void)resource_id;
- (void)info;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (!info) return ErrorInvalidAddress;
+ std::lock_guard lock(g_keyboardMutex);
+ return g_openKeyboards.empty() ? ErrorNotOpened : ErrorNoResourceId;
 }
 
 int APS5_VABI sceImeKeyboardGetResourceId(int32_t user_id, KeyboardResourceIdArray* resource_ids) {
@@ -67,10 +72,10 @@ int APS5_VABI sceImeKeyboardOpen(int32_t user_id, const KeyboardParam* param) {
 }
 
 int APS5_VABI sceImeKeyboardSetMode(int32_t user_id, uint32_t mode) {
- (void)user_id;
- (void)mode;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (user_id == UserIdInvalid) return ErrorInvalidUserId;
+ std::lock_guard lock(g_keyboardMutex);
+ if (!g_openKeyboards.contains(user_id)) return ErrorNotOpened;
+ return (mode & ~ValidKeyboardModes) == 0 ? 0 : ErrorInvalidMode;
 }
 
 int APS5_VABI sceImeOpen_nid_postfix(const Param* param, const ExtendedParam* extended) {
@@ -88,22 +93,19 @@ void APS5_VABI sceImeParamInit(Param* param) {
 
 int APS5_VABI sceImeSetCaret(const Caret* caret) {
  (void)caret;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return ErrorNotOpened;
 }
 
 int APS5_VABI sceImeSetText(const char16_t* text, uint32_t length) {
  (void)text;
  (void)length;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return ErrorNotOpened;
 }
 
 int APS5_VABI sceImeSetTextGeometry(TextAreaMode mode, const TextGeometry* geometry) {
  (void)mode;
  (void)geometry;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return ErrorNotOpened;
 }
 
 int APS5_VABI sceImeUpdate(EventHandler handler) {

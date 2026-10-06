@@ -321,4 +321,12 @@ int APS5_VABI sceKernelIsTrinityMode(void) {
     return 0;
 }
 
+int APS5_VABI sceKernelGetOperationMode(int* mode, int* submode) {
+    if (!mode || !submode)
+        throw std::invalid_argument("sceKernelGetOperationMode: null output");
+    *mode = 0;
+    *submode = 0;
+    return 0;
+}
+
 }

@@ -166,7 +166,7 @@ std::string_view UnsupportedReason(std::uint32_t header) {
         }
     }
     switch (opcode) {
-        case 0x11: case 0x12: case 0x13: case 0x15: case 0x16: case 0x26: case 0x27:
+        case 0x11: case 0x12: case 0x13: case 0x15: case 0x16: case 0x20: case 0x22: case 0x26: case 0x27:
         case 0x2a: case 0x2d: case 0x2f: case 0x35: case 0x37: case 0x40: case 0x42: case 0x46: case 0x50:
         case 0x58: case 0x63: case 0x64: case 0x69: case 0x76: case 0x79: case 0x7a:
         case 0x81: case 0x83: case 0x9f: return {};
@@ -175,8 +175,6 @@ std::string_view UnsupportedReason(std::uint32_t header) {
             return {};
         case 0x3a: case 0x8d:
             return "graphics draw, shader stages and guest render-target materialization are not implemented";
-        case 0x20: return "GPU query predication is not implemented";
-        case 0x22: return "conditional command execution and conditional flip reservation are not implemented";
         case 0x33: case 0x3f: return "nested command buffers, branching and nested flip reservation are not implemented";
         case 0x3c: case 0x93: return {};
         case 0x39:
@@ -194,8 +192,11 @@ std::string_view UnsupportedReason(std::uint32_t header) {
     }
 }
 
+constexpr std::uint32_t ConditionCachePolicy = 3u << 25u;
+constexpr std::uint32_t ConditionalWordsMask = 0x3fffu;
 constexpr std::uint32_t DmaSourceCachePolicy = 3u << 13u;
 constexpr std::uint32_t DmaDestinationCachePolicy = 3u << 25u;
+constexpr std::uint32_t WriteDataCachePolicy = 3u << 25u;
 
 void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
     require(!packet.empty(), "truncated PM4 header");
@@ -211,7 +212,7 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
     const auto size = [&](std::size_t count) { require(packet.size() == count, "invalid packet size"); };
     const auto graphics = [&] { require(queue == 0, "graphics packet in compute queue"); };
     const auto reason = UnsupportedReason(header);
-    if (!reason.empty()) throw std::runtime_error(std::string(reason));
+    if (!reason.empty() && !(opcode == 0x3f && Predicated(header))) throw std::runtime_error(std::string(reason));
     if (opcode == 0x10) {
         require((header & 3u) == 0, "unsupported NOP header flags");
         switch ((header >> 2u) & 0x3fu) {
@@ -237,11 +238,11 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
         return;
     }
     // Header bit 1 selects the compute shader type and bit 2 (register writes) resets the filter CAM;
-    // neither changes what the packet writes. Predication (bit 0) is not implemented.
+    // neither changes what the packet writes.
     const auto flags = header & 0xffu;
     const bool registerWrite = opcode == 0x69 || opcode == 0x76 || opcode == 0x79 || opcode == 0x7a;
     auto allowedFlags = opcode == 0x11 ? 2u : registerWrite ? 6u : opcode == 0x3c || opcode == 0x93 ? 2u : 0u;
-    if (IsTagMarker(packet)) allowedFlags |= 1u;
+    if (opcode != 0x20 && opcode != 0x22) allowedFlags |= 1u;
     if ((flags & ~allowedFlags) != 0) throw std::runtime_error("PM4 header flags 0x" + ToHex(flags) + " are not implemented");
     switch (opcode) {
         case 0x11:
@@ -250,6 +251,17 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
             if ((header & 2u) == 0) graphics();
             break;
         case 0x12: graphics(); size(2); require((packet[1] & ~0xfu) == 0, "unsupported CLEAR_STATE payload bits"); break;
+        case 0x20: {
+            graphics();
+            size(4);
+            const auto operation = (packet[1] >> 16u) & 7u;
+            require(operation != 1 && operation != 2, "GPU query predication is not implemented");
+            require(operation == 0 || operation == 3 || operation == 4, "invalid predication operation");
+            require((packet[1] & ~0x71100u) == 0, "unsupported SET_PREDICATION bits");
+            if (operation != 0) require(address(packet[2], packet[3]) != 0 && (packet[2] & 0xfu) == 0, "unaligned predication address");
+            break;
+        }
+        case 0x3f: size(4); break;
         case 0x13: case 0x2f: graphics(); size(2); break;
         case 0x26: graphics(); size(3); break;
         case 0x27:
@@ -295,6 +307,13 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
         case 0x16:
             require(packet.size() == 3 || packet.size() == 4, "invalid indirect dispatch size");
             require((packet.back() & ~0xa020u) == 0x41u, "indirect dispatch modifiers are not implemented");
+            break;
+        case 0x22:
+            size(5);
+            require((packet[1] & 3u) == 0, "COND_EXEC reserved address bits are not implemented");
+            require(packet[2] <= 0xffffu, "COND_EXEC address bits above 48 are not implemented");
+            require((packet[3] & ~(queue == 0 ? 0u : ConditionCachePolicy)) == 0, "COND_EXEC reserved control fields are not implemented");
+            require((packet[4] & ~ConditionalWordsMask) == 0, "COND_EXEC reserved count bits are not implemented");
             break;
         case 0x42: size(2); require(packet[1] == 0, "unsupported PFP_SYNC_ME payload"); break;
         case 0x46: {
@@ -380,7 +399,7 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
             break;
         case 0x37: {
             require(packet.size() >= 5, "WRITE_DATA has no data");
-            require((packet[1] & ~0x40110f00u) == 0, "WRITE_DATA engine, cache or reserved fields are not implemented");
+            require((packet[1] & ~(0x40110f00u | WriteDataCachePolicy)) == 0, "WRITE_DATA engine or reserved fields are not implemented");
             const auto destination = (packet[1] >> 8u) & 0xfu;
             require(destination == 1 || destination == 2 || (queue != 0 && destination == 5), "WRITE_DATA register or GDS destination is not implemented");
             require((packet[2] & 3u) == 0, "misaligned WRITE_DATA destination");
@@ -462,6 +481,29 @@ std::size_t WaitAwaitedBytes(std::span<const std::uint32_t> packet) {
     return wide && (packet.size() < 8 || packet[7] != 0) ? 8 : 4;
 }
 
+std::size_t ConditionalWords(std::span<const std::uint32_t> packet) {
+    require(packet.size() == 5 && ((packet[0] >> 8u) & 0xffu) == 0x22u, "expected COND_EXEC packet");
+    return packet[4] & ConditionalWordsMask;
+}
+
+bool PredicationPasses(const QueueState& queue) {
+    const auto& predication = queue.predication;
+    if (predication.operation == 0) return true;
+    const std::size_t bytes = predication.operation == 3 ? 8 : 4;
+    std::uint64_t value = 0;
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Wait);
+    GuestMemory::Read(predication.address, std::as_writable_bytes(std::span(&value, 1)).first(bytes), bytes);
+    return (value != 0) == predication.executeWhenSet;
+}
+
+std::uint32_t ReadCondition(std::span<const std::uint32_t> packet) {
+    require(packet.size() == 5 && ((packet[0] >> 8u) & 0xffu) == 0x22u, "expected COND_EXEC packet");
+    std::uint32_t value = 0;
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Wait);
+    GuestMemory::Read(address(packet[1], packet[2]), std::as_writable_bytes(std::span(&value, 1)), 4);
+    return value;
+}
+
 std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet) {
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     if (opcode == 0x49 && packet.size() >= 7) {
@@ -537,7 +579,7 @@ bool UsesGpuCacheBarrier(std::span<const std::uint32_t> packet) {
 
 bool AccessesMemory(std::uint32_t header) {
     switch ((header >> 8u) & 0xffu) {
-        case 0x27: case 0x3c: case 0x93: case 0x49: case 0x16: case 0x2d: case 0x35: case 0x24: case 0x25: case 0x2c: case 0x38: case 0x37: case 0x40: case 0x50: case 0x63: case 0x64: case 0x83: case 0x9f: return true;
+        case 0x22: case 0x27: case 0x3c: case 0x93: case 0x49: case 0x16: case 0x2d: case 0x35: case 0x24: case 0x25: case 0x2c: case 0x38: case 0x37: case 0x40: case 0x50: case 0x63: case 0x64: case 0x83: case 0x9f: return true;
         default: return false;
     }
 }
@@ -703,6 +745,12 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             APS5_LOG_OUT_DEBUG("CLEAR_STATE targetMaskBefore=0x%x shaderMaskBefore=0x%x", queue.context.contains(0x8e) ? queue.context.at(0x8e) : 0u, queue.context.contains(0x8f) ? queue.context.at(0x8f) : 0u);
             queue.ClearContext(); return;
         case 0x13: queue.indexBufferSize = packet[1]; return;
+        case 0x20: {
+            const auto operation = (packet[1] >> 16u) & 7u;
+            queue.predication = {operation == 0 ? 0 : address(packet[2], packet[3]), operation, (packet[1] & 0x100u) != 0};
+            return;
+        }
+        case 0x3f: throw std::runtime_error(std::string(UnsupportedReason(packet[0])));
         case 0x26: queue.indexBase = address(packet[1], packet[2]); return;
         case 0x2a: queue.indexType = packet[1]; return;
         case 0x2f: queue.instanceCount = packet[1]; return;

@@ -16,6 +16,29 @@ extern "C" {
 
 [[noreturn]] void APS5_VABI _ZSt11_Xbad_allocv_nid_postfix();
 
+FileStream* APS5_VABI fdopen_nid_postfix(int descriptor, const char* mode) {
+    if (descriptor < 0) { errno = 9; return nullptr; }
+    if (!mode) { errno = 22; return nullptr; }
+    const char* supported[] = {"r", "w", "a", "rb", "wb", "ab", "r+", "w+", "a+",
+        "rb+", "wb+", "ab+", "r+b", "w+b", "a+b"};
+    bool valid = false;
+    for (const auto* candidate : supported) if (std::strcmp(mode, candidate) == 0) valid = true;
+    if (!valid) { errno = 22; return nullptr; }
+    try {
+        const auto release = [](void* pointer) { ::operator delete(pointer); };
+        std::unique_ptr<void, decltype(release)> storage(::operator new(sizeof(FileStream)), release);
+#ifdef _WIN32
+        auto* native = ::_fdopen(descriptor, mode);
+#else
+        auto* native = ::fdopen(descriptor, mode);
+#endif
+        if (!native) return nullptr;
+        auto* stream = new (storage.get()) FileStream(native, true);
+        storage.release();
+        return stream;
+    } catch (const std::bad_alloc&) { errno = 12; return nullptr; }
+}
+
 FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode, FileStream* stream) {
     if (!stream || !mode) { errno = 22; return nullptr; }
     if (!filename) { errno = 45; return nullptr; } // Mode-only reopening is not supported.

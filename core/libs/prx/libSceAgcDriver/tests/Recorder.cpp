@@ -2573,6 +2573,44 @@ void firstLayerViewTests(const Device& device, Recorder& recorder) {
     expectRed(program.Red(flatTexture.View(), flatTexture.Layout(), 0.0f), 0x20 / 255.0f, "a 2D texture over the surface does not read its first layer");
 }
 
+void atomicViewTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    TextureDetiler detiler(context);
+    auto withDetiler = context;
+    withDetiler.detiler = &detiler;
+    for (const std::uint32_t format : {20u, 21u, 22u, 56u}) {
+        GuestTextureResource resource{};
+        resource.width = 64;
+        resource.height = 4;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kLinear;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = format;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        const auto geometry = DescribeSurface(resource);
+        std::vector<std::uint8_t> memory(static_cast<std::size_t>(geometry.guestBytes) + 256);
+        resource.baseAddress = (reinterpret_cast<std::uintptr_t>(memory.data()) + 255) & ~std::uintptr_t{255};
+        auto image = std::make_shared<StorageTexture>(withDetiler, detiler, resource, 0);
+        recorder.Keep(image);
+        if (format == 56u) {
+            bool refused = false;
+            try {
+                static_cast<void>(image->AtomicView(0, false));
+            } catch (const std::exception&) {
+                refused = true;
+            }
+            Require(refused, "an 8_8_8_8 storage image has an atomic view");
+            continue;
+        }
+        const auto atomic = image->AtomicView(0, false);
+        Require(atomic != VK_NULL_HANDLE && atomic == image->AtomicView(0, false), "atomic storage views are not reused");
+        Require((atomic == image->View(0)) == (format == 20u), "only a 32_UINT storage image serves atomics through its own view");
+    }
+}
+
 void keysFillTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -2724,6 +2762,7 @@ int main() {
         dataRefreshTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
+        atomicViewTests(device, recorder);
         metadataPassTests(device, recorder);
         pendingKeyStoreTests(device, recorder);
         sampleDumpTests(device, recorder);

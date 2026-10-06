@@ -137,7 +137,7 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
             if (name.empty() || !exports.insert(name).second) fail("Duplicate or empty export after stripping #: " + name);
         }
         if ((info & 15) == 6 && section != 0 && (tls == nullptr || value > tls->MemorySize || size > tls->MemorySize - value)) fail("TLS symbol exceeds TLS segment: " + name);
-        if (section != 0 && (info & 15) != 6) {
+        if (section != 0 && section != AbsoluteSection && (info & 15) != 6) {
             if (section >= 0xff00) fail("Unsupported special symbol section: " + name);
             mapped(value, std::max<std::uint64_t>(size, 1), (info & 15) == 2 ? 1 : 0);
         }
@@ -218,7 +218,7 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
                     else if (type == 1) {
                         const auto& symbol = image.Symbols.at(info >> 32);
                         if ((symbol.Info & 15) != 2 || addend != 0) fail("Invalid guest lifecycle function relocation");
-                        if (symbol.Section != 0) mapped(symbol.Value, 1, 1);
+                        if (symbol.Section != 0 && symbol.Section != AbsoluteSection) mapped(symbol.Value, 1, 1);
                     } else fail("Unsupported guest lifecycle relocation");
                 }
             }

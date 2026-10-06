@@ -38,6 +38,7 @@ namespace {
 constexpr int NET_ENOENT = 2;
 constexpr int NET_EBADF = 9;
 constexpr int NET_EINVAL = 22;
+constexpr int NET_ENOSPC = 28;
 constexpr int NET_EAGAIN = 35;
 constexpr int NET_ENOTSOCK = 38;
 constexpr int NET_EOPNOTSUPP = 45;
@@ -49,6 +50,7 @@ constexpr int NET_ECONNABORTED = 53;
 constexpr int NET_EMSGSIZE = 40;
 constexpr int NET_ETIMEDOUT = 60;
 constexpr int NET_ECONNREFUSED = 61;
+constexpr int NET_ERROR_BASE = static_cast<int>(0x80410100u);
 constexpr int NET_ERROR_RESOLVER_ENODNS = static_cast<int>(0x804101E1u);
 
 constexpr int NET_AF_INET = 2;
@@ -65,6 +67,7 @@ constexpr int NET_SO_NBIO = 0x1200;
 using NativeSocket = SOCKET;
 using NativeLength = int;
 constexpr NativeSocket INVALID_NATIVE_SOCKET = INVALID_SOCKET;
+constexpr int NATIVE_SEND_FLAGS = 0;
 bool initialize_sockets() {
     static const int result = [] {
         WSADATA data{};
@@ -95,6 +98,7 @@ int native_error() {
 using NativeSocket = int;
 using NativeLength = socklen_t;
 constexpr NativeSocket INVALID_NATIVE_SOCKET = -1;
+constexpr int NATIVE_SEND_FLAGS = MSG_NOSIGNAL;
 bool initialize_sockets() { return true; }
 void close_socket(NativeSocket socket) { ::close(socket); }
 int native_error() {
@@ -115,6 +119,7 @@ int native_error() {
         case EINTR: return 4;
         case EINVAL: return NET_EINVAL;
         case ENOTSOCK: return NET_ENOTSOCK;
+        case EPIPE: return 32;
         default: return 5;
     }
 }
@@ -198,7 +203,7 @@ std::set<int> g_epolls;
 std::map<int, std::map<int, NetEpollEvent>> g_epoll_socks;
 std::set<int> g_epoll_aborted;
 std::set<int> g_pools;
-std::set<int> g_resolvers;
+std::map<int, int> g_resolvers;
 int g_next_sock = 32;
 int g_next_epoll = 0x4000;
 int g_next_pool = 1;
@@ -212,7 +217,13 @@ int* errno_slot() {
 
 int fail(int err) {
     *errno_slot() = err;
-    return -1;
+    return NET_ERROR_BASE | err;
+}
+
+void set_resolver_error(int rid, int error) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    const auto resolver = g_resolvers.find(rid);
+    if (resolver != g_resolvers.end()) resolver->second = error;
 }
 
 void log_soft(const char* func, const char* what) {
@@ -484,7 +495,7 @@ int64_t APS5_VABI sceNetSend(int s, const void* buf, size_t len, int flags) {
         if (it == g_socks.end()) return fail(NET_EBADF);
         socket = it->second;
     }
-    const int result = ::send(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), 0);
+    const int result = ::send(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), NATIVE_SEND_FLAGS);
     return result >= 0 ? result : fail(native_error());
 }
 
@@ -502,13 +513,13 @@ int64_t APS5_VABI sceNetSendto(int s, const void* buf, size_t len, int flags, co
     int result;
     if (!to) {
         if (tolen != 0) return fail(NET_EINVAL);
-        result = ::send(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), 0);
+        result = ::send(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), NATIVE_SEND_FLAGS);
     } else {
         sockaddr_storage destination{};
         NativeLength destination_length = 0;
         if (!guest_to_native_address(to, tolen, destination, destination_length)) return fail(NET_EINVAL);
         if (destination.ss_family != (socket.family == NET_AF_INET ? AF_INET : AF_INET6)) return fail(NET_EAFNOSUPPORT);
-        result = ::sendto(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), 0,
+        result = ::sendto(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), NATIVE_SEND_FLAGS,
             reinterpret_cast<const sockaddr*>(&destination), destination_length);
     }
     return result >= 0 ? result : fail(native_error());
@@ -814,7 +825,7 @@ int APS5_VABI sceNetInetPton(int af, const char* src, void* dst) {
 }
 
 const char* APS5_VABI sceNetInetNtop(int af, const void* src, char* dst, uint32_t size) {
-    if (src == nullptr || dst == nullptr || size == 0) {
+    if (src == nullptr || dst == nullptr) {
         *errno_slot() = NET_EINVAL;
         return nullptr;
     }
@@ -822,11 +833,23 @@ const char* APS5_VABI sceNetInetNtop(int af, const void* src, char* dst, uint32_
         *errno_slot() = NET_EAFNOSUPPORT;
         return nullptr;
     }
+    char text[INET6_ADDRSTRLEN];
 #ifdef _WIN32
-    return InetNtopA(af == NET_AF_INET ? AF_INET : AF_INET6, const_cast<void*>(src), dst, size);
+    const auto* result = InetNtopA(af == NET_AF_INET ? AF_INET : AF_INET6, const_cast<void*>(src), text, sizeof(text));
 #else
-    return ::inet_ntop(af == NET_AF_INET ? AF_INET : AF_INET6, src, dst, size);
+    const auto* result = ::inet_ntop(af == NET_AF_INET ? AF_INET : AF_INET6, src, text, sizeof(text));
 #endif
+    if (!result) {
+        *errno_slot() = native_error();
+        return nullptr;
+    }
+    const auto length = std::strlen(text) + 1;
+    if (length > size) {
+        *errno_slot() = NET_ENOSPC;
+        return nullptr;
+    }
+    std::memcpy(dst, text, length);
+    return dst;
 }
 
 int APS5_VABI sceNetEtherNtostr(const NetEtherAddr* n, char* str, size_t len) {
@@ -855,7 +878,7 @@ int APS5_VABI sceNetResolverCreate(const char* name, int memid, int flags) {
     (void)flags;
     std::lock_guard<std::mutex> lk(g_mutex);
     const int id = g_next_resolver++;
-    g_resolvers.insert(id);
+    g_resolvers[id] = 0;
     return id;
 }
 
@@ -881,11 +904,13 @@ int APS5_VABI sceNetResolverStartNtoa(int rid, const char* hostname, void* addr,
     if (result != 0) {
         *errno_slot() = result == EAI_AGAIN ? NET_ETIMEDOUT : NET_ENOENT;
         log_soft(__func__, "host DNS lookup failed");
+        set_resolver_error(rid, NET_ERROR_RESOLVER_ENODNS);
         return NET_ERROR_RESOLVER_ENODNS;
     }
     const auto* address = reinterpret_cast<const sockaddr_in*>(results->ai_addr);
     std::memcpy(addr, &address->sin_addr, sizeof(address->sin_addr));
     ::freeaddrinfo(results);
+    set_resolver_error(rid, 0);
     return 0;
 }
 
@@ -907,8 +932,20 @@ int APS5_VABI sceNetResolverStartAton(int rid, const void* addr, char* hostname,
     if (result != 0) {
         *errno_slot() = result == EAI_AGAIN ? NET_ETIMEDOUT : NET_ENOENT;
         log_soft(__func__, "host reverse DNS lookup failed");
+        set_resolver_error(rid, NET_ERROR_RESOLVER_ENODNS);
         return NET_ERROR_RESOLVER_ENODNS;
     }
+    set_resolver_error(rid, 0);
     return 0;
 }
+
+int APS5_VABI sceNetResolverGetError(int rid, int* status) {
+    if (!status) return fail(NET_EINVAL);
+    std::lock_guard<std::mutex> lk(g_mutex);
+    const auto resolver = g_resolvers.find(rid);
+    if (resolver == g_resolvers.end()) return fail(NET_EBADF);
+    *status = resolver->second;
+    return 0;
+}
+
 }

@@ -8,6 +8,8 @@ int APS5_VABI clock_getres_nid_postfix(int clockId, KernelTimespec* res);
 int APS5_VABI sceKernelClockGettime(KernelClockid clockId, KernelTimespec* tp);
 int APS5_VABI sceKernelClockGetres(KernelClockid clockId, KernelTimespec* tp);
 int APS5_VABI sceKernelUsleep_nid_postfix(KernelUseconds microseconds);
+int APS5_VABI gettimeofday_nid_postfix(KernelTimeval* tv, KernelTimezone* tz);
+std::int64_t APS5_VABI _Xtime_get_ticks_nid_postfix();
 }
 
 static constexpr int SCE_OK = 0;
@@ -120,6 +122,21 @@ static void IdleProcessAccumulatesNone() {
     Require(Nanos(GUEST_CLOCK_PROF) - profStart <= IDLE_LIMIT_NANOS);
 }
 
+static std::int64_t Microseconds() {
+    KernelTimeval time{-1, -1};
+    Require(gettimeofday_nid_postfix(&time, nullptr) == SCE_OK);
+    return time.tv_sec * 1000000LL + time.tv_usec;
+}
+
+static void XtimeTicksAreGettimeofdayMicroseconds() {
+    for (int i = 0; i < 100; ++i) {
+        const std::int64_t before = Microseconds();
+        const std::int64_t ticks = _Xtime_get_ticks_nid_postfix();
+        const std::int64_t after = Microseconds();
+        Require(before <= ticks && ticks <= after);
+    }
+}
+
 int main() {
     SecondClockReportsWholeSeconds();
 
@@ -135,4 +152,5 @@ int main() {
     ProcessClocksAreOrdered();
     BusyProcessAccumulatesUserTime();
     IdleProcessAccumulatesNone();
+    XtimeTicksAreGettimeofdayMicroseconds();
 }

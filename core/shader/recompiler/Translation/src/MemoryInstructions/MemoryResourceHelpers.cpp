@@ -93,7 +93,7 @@ IrValue* TranslationContext::getSamplerResource(const MemoryInfo& memory) {
     return &ir.Emit(IrOpcode::GetSamplerResource, IrOpcodeType(IrOpcode::GetSamplerResource), {&dword0.Value(), &dword1.Value(), &dword2.Value(), &dword3.Value()});
 }
 
-IrValue* TranslationContext::makeImageAddress(const RdnaInstruction& inst, const RdnaOperand& base) {
+IrValue* TranslationContext::makeImageAddress(const RdnaInstruction& inst, const RdnaOperand& base, std::uint32_t fragmentOffset) {
     std::array<IrValue*, 13> components{};
     IrValue& zero = ir.Constant(0u);
     components.fill(&zero);
@@ -109,6 +109,11 @@ IrValue* TranslationContext::makeImageAddress(const RdnaInstruction& inst, const
         } else {
             components[index] = &readRawU32(offsetOperand(plainBase, index)).Value();
         }
+    }
+    if (fragmentOffset != 0u) {
+        const RdnaImageAddressComponent fragment = GetRdnaImageAddressComponentLayout(inst.imageSampleFlags, inst.imageAddressComponents - 1u);
+        IrValue*& word = components[fragment.bitOffset / 32u];
+        word = &ir.IAdd(*word, ir.Constant(fragmentOffset << (fragment.bitOffset % 32u)));
     }
     if ((inst.imageSampleFlags & RdnaImageSampleFlagCd) != 0u) {
         const auto mask = ballotMask(IrU1(ir.GetExec()));

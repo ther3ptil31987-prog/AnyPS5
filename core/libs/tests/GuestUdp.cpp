@@ -20,6 +20,23 @@ const char* APS5_VABI inet_ntop_nid_postfix(int, const void*, char*, std::uint32
 int APS5_VABI inet_pton_nid_postfix(int, const char*, void*);
 int* APS5_VABI __error_nid_postfix();
 }
+struct Iovec {
+    void* base;
+    std::uint64_t length;
+};
+struct Msghdr {
+    void* name;
+    std::uint32_t nameLength;
+    Iovec* iov;
+    int iovLength;
+    void* control;
+    std::uint32_t controlLength;
+    int flags;
+};
+extern "C" {
+std::int64_t APS5_VABI sendmsg_nid_postfix(int, const Msghdr*, int);
+std::int64_t APS5_VABI recvmsg_nid_postfix(int, Msghdr*, int);
+}
 static void Require(bool value) { if (!value) std::abort(); }
 int main() {
     const int receiver = socket_nid_postfix(2, 2, 0);
@@ -63,6 +80,39 @@ int main() {
     Require(std::strcmp(buffer, message) == 0 && source[1] == 2 && source[4] == 127);
     Require(ioctl_nid_postfix(receiver, 0x4004667f, &queued) == 0 && queued == 0);
     Require(ioctl_nid_postfix(receiver, 123, &queued) == -1 && *__error_nid_postfix() == 25);
+    char head[] = "scatter ";
+    char tail[] = "gather";
+    Iovec parts[2]{{head, 8}, {tail, 6}};
+    Msghdr outgoing{destination.data(), static_cast<std::uint32_t>(destination.size()), parts, 2, nullptr, 0, 0};
+    Require(sendmsg_nid_postfix(sender, &outgoing, 0) == 14);
+    const auto wait = [&] {
+        queued = 0;
+        for (int i = 0; i < 100 && queued == 0; ++i) {
+            Require(ioctl_nid_postfix(receiver, 0x4004667f, &queued) == 0);
+            if (!queued) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        Require(queued != 0);
+    };
+    wait();
+    char first[4]{}, second[16]{};
+    Iovec pieces[2]{{first, sizeof(first)}, {second, sizeof(second)}};
+    source.fill(0);
+    unsigned char control[8]{};
+    Msghdr incoming{source.data(), static_cast<std::uint32_t>(source.size()), pieces, 2, control, sizeof(control), -1};
+    Require(recvmsg_nid_postfix(receiver, &incoming, 0) == 14);
+    Require(std::memcmp(first, "scat", 4) == 0 && std::memcmp(second, "ter gather", 10) == 0);
+    Require(incoming.flags == 0 && incoming.controlLength == 0 && incoming.nameLength == 16 && source[1] == 2 && source[4] == 127);
+    Require(sendmsg_nid_postfix(sender, &outgoing, 0) == 14);
+    wait();
+    char shortBuffer[5]{};
+    Iovec single{shortBuffer, sizeof(shortBuffer)};
+    Msghdr truncated{nullptr, 0, &single, 1, nullptr, 0, 0};
+    Require(recvmsg_nid_postfix(receiver, &truncated, 0) == 5);
+    Require(std::memcmp(shortBuffer, "scatt", 5) == 0 && truncated.flags == 0x10);
+    Require(recvmsg_nid_postfix(receiver, &truncated, 0) == -1 && *__error_nid_postfix() == 35);
+    Msghdr oversized{nullptr, 0, parts, 1025, nullptr, 0, 0};
+    Require(sendmsg_nid_postfix(sender, &oversized, 0) == -1 && *__error_nid_postfix() == 40);
+    Require(recvmsg_nid_postfix(receiver, nullptr, 0) == -1 && *__error_nid_postfix() == 14);
     Require(close_nid_postfix(receiver) == 0);
     Require(close_nid_postfix(receiver) == -1 && *__error_nid_postfix() == 9);
     Require(ioctl_nid_postfix(receiver, 0x4004667f, &queued) == -1);

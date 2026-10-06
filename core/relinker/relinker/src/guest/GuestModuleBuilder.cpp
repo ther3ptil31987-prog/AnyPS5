@@ -7,6 +7,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <set>
 
 namespace Relinker {
@@ -49,6 +50,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     if (lazyBinding) throw Domain::RelinkerException("Guest modules require eager binding; --lazy-binding is incompatible");
     std::vector<GuestImage> images;
     std::map<std::string, std::size_t> exports;
+    std::map<std::string, std::set<std::size_t>> sharedExports;
     std::set<std::string> outputNames;
     Io::FileReader reader;
     for (const auto& path : paths) {
@@ -63,9 +65,13 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         }
         if (!outputNames.insert(folded).second) throw Domain::RelinkerException("Conflicting guest output filename: " + image.OutputName);
         for (const auto& symbol : image.Symbols) {
-            if (symbol.Section == 0 || (symbol.Info >> 4) == 0 || symbol.Visibility == 1 || symbol.Visibility == 2) continue;
+            if (symbol.Section == 0 || symbol.Section == AbsoluteSection || (symbol.Info >> 4) == 0 || symbol.Visibility == 1 || symbol.Visibility == 2) continue;
             const auto [existing, inserted] = exports.emplace(symbol.Name, images.size());
-            if (!inserted) throw Domain::RelinkerException("Duplicate guest export after stripping #: " + symbol.Name + " in " + images.at(existing->second).SourcePath.string() + " and " + path.string());
+            if (inserted) continue;
+            if (windows || existing->second == images.size()) throw Domain::RelinkerException("Duplicate guest export after stripping #: " + symbol.Name + " in " + images.at(existing->second).SourcePath.string() + " and " + path.string());
+            auto& providers = sharedExports[symbol.Name];
+            providers.insert(existing->second);
+            providers.insert(images.size());
         }
         std::vector<Domain::ProgramHeader> codeHeaders;
         for (const auto& header : image.Headers) if (header.Type == 1 && (header.Flags & 1) != 0) codeHeaders.push_back(header);
@@ -88,6 +94,30 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             if (!inserted && found->second != index) throw Domain::RelinkerException("Ambiguous guest dependency name: " + name);
         }
     }
+    const auto rejectSharedImport = [&](const std::string& name, const std::string& importer) {
+        const auto shared = sharedExports.find(name);
+        if (shared == sharedExports.end()) return;
+        std::string providers;
+        for (const auto provider : shared->second) providers += " " + images[provider].SourcePath.string();
+        throw Domain::RelinkerException("Ambiguous guest import " + name + " in " + importer + ": exported by" + providers);
+    };
+    const auto rename = [](std::vector<std::uint8_t>& symbols, std::vector<std::uint8_t>& strings, std::size_t index, const std::string& name) {
+        if (strings.size() > std::numeric_limits<std::uint32_t>::max()) throw Domain::RelinkerException("Guest string table too large");
+        Io::WriteU32(symbols, index * 24, static_cast<std::uint32_t>(strings.size()));
+        Io::AppendString(strings, name + GuestSymbolSuffix);
+    };
+    if (dynamic.DynSymData.size() % 24 != 0) throw Domain::RelinkerException("Invalid executable symbol table");
+    for (std::size_t offset = 0; offset < dynamic.DynSymData.size(); offset += 24) {
+        if (Io::ReadU16(dynamic.DynSymData, offset + 6) != 0) continue;
+        const auto nameOffset = Io::ReadU32(dynamic.DynSymData, offset);
+        if (nameOffset >= dynamic.DynStrData.size()) throw Domain::RelinkerException("Invalid executable symbol name offset");
+        const auto start = dynamic.DynStrData.begin() + nameOffset;
+        const auto end = std::find(start, dynamic.DynStrData.end(), 0);
+        if (end == dynamic.DynStrData.end()) throw Domain::RelinkerException("Unterminated executable symbol name");
+        const std::string name(start, end);
+        rejectSharedImport(name.substr(0, name.find('#')), inputPath.string());
+        if (!windows && exports.contains(name)) rename(dynamic.DynSymData, dynamic.DynStrData, offset / 24, name);
+    }
     std::vector<std::set<std::size_t>> dependencies(images.size());
     for (auto& image : images) image.UsePlatformTlsResolver = !exports.contains("vNe1w4diLCs");
     for (std::size_t index = 0; index < images.size(); ++index) {
@@ -97,13 +127,23 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         }
         for (const auto& symbol : images[index].Symbols) {
             if (symbol.Section != 0 || symbol.Name.empty()) continue;
+            rejectSharedImport(symbol.Name, images[index].SourcePath.string());
             const auto found = exports.find(symbol.Name);
             if (found != exports.end()) {
                 const auto& provider = images[found->second];
-                const auto exported = std::find_if(provider.Symbols.begin(), provider.Symbols.end(), [&](const auto& candidate) { return candidate.Section != 0 && candidate.Name == symbol.Name && (candidate.Info >> 4) != 0 && candidate.Visibility != 1 && candidate.Visibility != 2; });
+                const auto exported = std::find_if(provider.Symbols.begin(), provider.Symbols.end(), [&](const auto& candidate) { return candidate.Section != 0 && candidate.Section != AbsoluteSection && candidate.Name == symbol.Name && (candidate.Info >> 4) != 0 && candidate.Visibility != 1 && candidate.Visibility != 2; });
                 if (exported == provider.Symbols.end() || ((symbol.Info & 15) != 0 && (symbol.Info & 15) != (exported->Info & 15))) throw Domain::RelinkerException("Guest import/export type mismatch: " + symbol.Name);
                 if (found->second != index) dependencies[index].insert(found->second);
             } else if (windows && (symbol.Info & 15) == 6) throw Domain::RelinkerException("Windows guest TLS import requires a guest TLS export: " + symbol.Name);
+        }
+    }
+    if (!windows) {
+        for (auto& image : images) {
+            for (std::size_t index = 1; index < image.Symbols.size(); ++index) {
+                const auto& symbol = image.Symbols[index];
+                const bool exported = symbol.Section != 0 && (symbol.Info >> 4) != 0 && symbol.Visibility != 1 && symbol.Visibility != 2;
+                if ((symbol.Section == 0 || exported) && exports.contains(symbol.Name)) rename(image.Dynamic.DynSymData, image.Dynamic.DynStrData, index, symbol.Name);
+            }
         }
     }
     std::vector<std::size_t> order;

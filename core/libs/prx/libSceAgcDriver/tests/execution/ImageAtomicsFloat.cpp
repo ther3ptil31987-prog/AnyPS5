@@ -24,6 +24,9 @@ constexpr std::uint32_t Rows = 800;
 constexpr std::uint32_t TextureWidth = 64;
 constexpr std::uint32_t TextureHeight = 4;
 constexpr std::uint32_t Format32UInt = 20;
+constexpr std::uint32_t Format32SInt = 21;
+constexpr std::uint32_t Format32Float = 22;
+constexpr std::uint32_t Format16_16Float = 29;
 constexpr std::uint32_t Type2D = 9;
 alignas(256) std::array<std::uint32_t, MaxLanes * (Inputs + Results)> Buffer{};
 alignas(4096) std::array<std::uint32_t, 4096> Texels{};
@@ -474,22 +477,22 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t by
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x01016facu};
 }
 
-std::array<std::uint32_t, 8> TextureDescriptor(const void* data) {
+std::array<std::uint32_t, 8> TextureDescriptor(const void* data, std::uint32_t format) {
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
     return {
         static_cast<std::uint32_t>(address >> 8u),
-        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32UInt << 20u) | (((TextureWidth - 1u) & 3u) << 30u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format << 20u) | (((TextureWidth - 1u) & 3u) << 30u),
         ((TextureWidth - 1u) >> 2u) | ((TextureHeight - 1u) << 14u),
         0xfacu | (Type2D << 28u),
         0u, 0u, 0u, 0u,
     };
 }
 
-void Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const ShaderRecompiler::SpirvTarget& target, const char* name) {
+ShaderRecompiler::RecompileResult Compile(std::uint32_t waveSize, const ShaderRecompiler::SpirvTarget& target, std::uint32_t format) {
     const std::span<const std::uint32_t> code(Code);
     std::vector<std::uint32_t> userData(16, 0u);
     const auto buffer = BufferDescriptor(Buffer.data(), static_cast<std::uint32_t>(Buffer.size() * 4u));
-    const auto texture = TextureDescriptor(Texels.data());
+    const auto texture = TextureDescriptor(Texels.data(), format);
     std::copy(buffer.begin(), buffer.end(), userData.begin());
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
@@ -501,7 +504,12 @@ void Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const ShaderRe
         {0, 0, 0, 128}
     };
     request.useCache = false;
-    const auto result = ShaderRecompiler::Recompile(request);
+    return ShaderRecompiler::Recompile(request);
+}
+
+void Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const ShaderRecompiler::SpirvTarget& target, const char* name, std::uint32_t format) {
+    const std::span<const std::uint32_t> code(Code);
+    const auto result = Compile(waveSize, target, format);
     Texels.fill(0xdeadbeefu);
     for (std::uint32_t first = 0; first < Rows; first += waveSize) {
         Buffer.fill(0xdeadbeefu);
@@ -521,7 +529,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const ShaderRe
             for (std::uint32_t j = 0; j < Checked; ++j) {
                 const auto actual = Buffer[MaxLanes * Inputs + lane * Results + j];
                 char message[192];
-                std::snprintf(message, sizeof(message), "image float atomics %s: row %u %s is 0x%08x, expected 0x%08x", name, row, names[j], actual, expected[j]);
+                std::snprintf(message, sizeof(message), "image float atomics %s, format %u: row %u %s is 0x%08x, expected 0x%08x", name, format, row, names[j], actual, expected[j]);
                 Require(actual == expected[j], message);
             }
         }
@@ -534,9 +542,18 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        Run(*device, 32, device->Target(), "wave32");
-        Run(*device, 64, device->Target(), "wave64");
-        Run(*device, 64, device->ComputeTarget(32), "wave64 split");
+        for (const auto format : {Format32UInt, Format32SInt, Format32Float}) {
+            Run(*device, 32, device->Target(), "wave32", format);
+            Run(*device, 64, device->Target(), "wave64", format);
+            Run(*device, 64, device->ComputeTarget(32), "wave64 split", format);
+        }
+        bool refused = false;
+        try {
+            static_cast<void>(Compile(32, device->Target(), Format16_16Float));
+        } catch (const std::exception& error) {
+            refused = std::string(error.what()).find("atomic image descriptor uses an unsupported format 29") != std::string::npos;
+        }
+        Require(refused, "image float atomics on a 16_16 float surface were not refused");
         std::puts("image float atomics tests passed");
         return 0;
     } catch (const std::exception& error) {

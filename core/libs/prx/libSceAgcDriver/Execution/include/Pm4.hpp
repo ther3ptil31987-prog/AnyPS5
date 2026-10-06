@@ -88,6 +88,8 @@ bool AccessesMemory(std::uint32_t header);
 // synchronization): such a packet needs a pipeline barrier, not a device drain.
 bool UsesGpuCacheBarrier(std::span<const std::uint32_t> packet);
 bool IsTagMarker(std::span<const std::uint32_t> packet);
+inline bool Predicated(std::uint32_t header) { return !FillerPacket(header) && (header & 1u) != 0; }
+bool PredicationPasses(const QueueState& queue);
 bool WaitSatisfied(std::span<const std::uint32_t> packet);
 // WaitSatisfied for a polling loop: the caller has validated the address once, so the value is read
 // directly instead of through the checked guest memory path.
@@ -96,6 +98,8 @@ bool WaitSatisfiedUnchecked(std::span<const std::uint32_t> packet);
 // holds will store), without reading memory.
 bool WaitComparesValue(std::span<const std::uint32_t> packet, std::uint64_t value);
 std::size_t WaitAwaitedBytes(std::span<const std::uint32_t> packet);
+std::size_t ConditionalWords(std::span<const std::uint32_t> packet);
+std::uint32_t ReadCondition(std::span<const std::uint32_t> packet);
 // A label write (RELEASE_MEM with a data select, WRITE_DATA to memory): the destination and the
 // bytes it stores, so the write can be recorded on the GPU behind the work it signals. Packets
 // without a memory destination decode to nothing. No allocation per label (tens of thousands per

@@ -80,4 +80,7 @@ int APS5_VABI setvbuf_nid_postfix(FileStream* stream, char* buffer, int mode, st
     const int native = mode == 0 ? _IOFBF : mode == 1 ? _IOLBF : _IONBF;
     return std::setvbuf(GetNativeStream(stream), buffer, native, size);
 }
+void APS5_VABI setbuf_nid_postfix(FileStream* stream, char* buffer) {
+    setvbuf_nid_postfix(stream, buffer, buffer ? 0 : 2, buffer ? 1024 : 0);
+}
 }

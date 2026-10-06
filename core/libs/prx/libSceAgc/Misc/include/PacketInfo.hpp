@@ -1,4 +1,11 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGC_MISC_INCLUDE_PACKETINFO_HPP
 #define CORE_LIBS_PRX_LIBSCEAGC_MISC_INCLUDE_PACKETINFO_HPP
 
+#include <cstdint>
+
+struct SceAgcMemoryRange {
+    void* base;
+    uint64_t size;
+};
+
 #endif

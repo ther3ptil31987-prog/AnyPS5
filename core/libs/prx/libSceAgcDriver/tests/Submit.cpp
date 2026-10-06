@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -7,6 +8,7 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -15,6 +17,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern "C" int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* name);
 extern "C" int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq);
@@ -76,7 +81,7 @@ void testValidation() {
     expectFailure([&] { sceAgcDriverSubmitDcb(&packet); });
     commands[0] = 0xc001105c;
     expectFailure([&] { sceAgcDriverSubmitDcb(&packet); });
-    commands[0] = 0xc0017601;
+    commands[0] = 0xc0017608;
     expectFailure([&] { sceAgcDriverSubmitDcb(&packet); });
     commands[0] = 0xc0017600;
     commands[1] = 0x10000;
@@ -110,7 +115,7 @@ void testClearState() {
     words[0] = 0xc0011200;
     packet.dw_num = 3;
     expectFailure([&] { sceAgcDriverSubmitDcb(&packet); });
-    words[0] = 0xc0001201;
+    words[0] = 0xc0001202;
     packet.dw_num = 2;
     expectFailure([&] { sceAgcDriverSubmitDcb(&packet); });
     words[0] = 0xc0001200;
@@ -342,6 +347,33 @@ void testWaitFreeSubmissionTheCpuWaitsFor() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
+void testMultiSubmissions() {
+    alignas(64) static volatile std::uint32_t value = 0, done = 0;
+    check(sceAgcDriverSubmitMultiDcbs(nullptr, nullptr, 0) == 0, "empty multi-DCB submit failed");
+    check(sceAgcDriverAgrSubmitMultiDcbs(nullptr, nullptr, 0) == 0, "empty AGR multi-DCB submit failed");
+    std::array<std::uint32_t, 3> invalid{0xc0017600, 0x20c, 0};
+    std::array<std::uint32_t*, 1> invalidAddresses{invalid.data()};
+    std::array<std::uint32_t, 1> invalidSizes{2};
+    expectFailure([&] { sceAgcDriverSubmitMultiDcbs(nullptr, invalidSizes.data(), 1); });
+    expectFailure([&] { sceAgcDriverAgrSubmitMultiDcbs(invalidAddresses.data(), nullptr, 1); });
+    expectFailure([&] { sceAgcDriverSubmitMultiDcbs(invalidAddresses.data(), invalidSizes.data(), 1); });
+    expectFailure([&] { sceAgcDriverAgrSubmitMultiDcbs(invalidAddresses.data(), invalidSizes.data(), 1); });
+    for (bool agr : {false, true}) {
+        value = 0;
+        done = 0;
+        auto first = writeData(&value, 1);
+        auto second = writeData(&value, 2);
+        auto third = writeData(&done, 1);
+        std::array<std::uint32_t*, 3> addresses{first.data(), second.data(), third.data()};
+        std::array<std::uint32_t, 3> sizes{static_cast<std::uint32_t>(first.size()), static_cast<std::uint32_t>(second.size()), static_cast<std::uint32_t>(third.size())};
+        const int result = agr ? sceAgcDriverAgrSubmitMultiDcbs(addresses.data(), sizes.data(), 3) : sceAgcDriverSubmitMultiDcbs(addresses.data(), sizes.data(), 3);
+        check(result == 0, "multi-DCB submit failed");
+        waitFor(&done, 1, "the last DCB of a multi-DCB submit never ran");
+        check(value == 2, "multi-DCB submit did not run its DCBs in order");
+        AgcDriverWaitIdle_nid_postfix();
+    }
+}
+
 void testWorkerFailure() {
     std::array<std::uint32_t, 5> words{0xc0031500, 1, 1, 1, 0x41};
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
@@ -362,6 +394,68 @@ void testWorkerFailure() {
 
 int main() {
     try {
+        alignas(256) std::array<std::uint32_t, 64> rawCode{};
+        rawCode.fill(0xbf800000);
+        rawCode[0] = 0xbe8003ff;
+        rawCode[1] = 0xbf810000;
+        rawCode[2] = 0xbf810000;
+        const auto rawAddress = reinterpret_cast<std::uintptr_t>(rawCode.data());
+        const auto literal = AgcDriver::DriverDetail::ReadRawComputeShader(rawAddress);
+        check(literal->code.size() == 3 && literal->header.empty(), "raw compute stopped at an instruction literal");
+        check(AgcDriver::DriverDetail::ReadRawComputeShader(rawAddress) == literal, "unchanged raw compute code lost its snapshot identity");
+        rawCode[0] = 0xbf820002;
+        rawCode[1] = 0xbf810000;
+        rawCode[2] = 0xbf800000;
+        rawCode[3] = 0xbf810000;
+        const auto branched = AgcDriver::DriverDetail::ReadRawComputeShader(rawAddress);
+        check(branched->code.size() == 4 && literal->code[0] == 0xbe8003ff, "raw compute lost branch targets or modified an earlier snapshot");
+        check(branched != literal, "changed raw compute code reused a stale snapshot");
+        std::array<std::shared_ptr<const AgcDriver::DriverDetail::ShaderSnapshot>, 8> concurrent;
+        std::vector<std::thread> readers;
+        for (auto& snapshot : concurrent) readers.emplace_back([&snapshot, rawAddress] {
+            snapshot = AgcDriver::DriverDetail::ReadRawComputeShader(rawAddress);
+        });
+        for (auto& reader : readers) reader.join();
+        for (const auto& snapshot : concurrent) check(snapshot == branched, "concurrent raw compute readers lost snapshot reuse");
+        alignas(256) std::array<std::array<std::uint32_t, 64>, 65> programs{};
+        for (auto& program : programs) program[0] = 0xbf810000;
+        const auto firstAddress = reinterpret_cast<std::uintptr_t>(programs.front().data());
+        readers.clear();
+        for (auto& snapshot : concurrent) readers.emplace_back([&snapshot, firstAddress] {
+            snapshot = AgcDriver::DriverDetail::ReadRawComputeShader(firstAddress);
+        });
+        for (auto& reader : readers) reader.join();
+        for (const auto& snapshot : concurrent) check(snapshot == concurrent.front(), "concurrent raw compute misses duplicated snapshots");
+        const auto evicted = AgcDriver::DriverDetail::ReadRawComputeShader(firstAddress);
+        for (std::size_t i = 1; i < programs.size(); ++i)
+            AgcDriver::DriverDetail::ReadRawComputeShader(reinterpret_cast<std::uintptr_t>(programs[i].data()));
+        check(AgcDriver::DriverDetail::ReadRawComputeShader(firstAddress) != evicted && evicted->code[0] == 0xbf810000,
+            "raw compute cache eviction lost snapshot lifetime or exceeded its entry limit");
+        check(!expectFailure([&] { AgcDriver::DriverDetail::ReadRawComputeShader(rawAddress + 4); }).empty(), "raw compute accepted a misaligned entry");
+        check(!expectFailure([] { AgcDriver::DriverDetail::ReadRawComputeShader(0); }).empty(), "raw compute accepted an unmapped entry");
+#ifdef _WIN32
+        auto* mapping = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        check(mapping != nullptr, "cannot allocate raw compute boundary test");
+        DWORD protection = 0;
+        check(VirtualProtect(mapping + 1024, 4096, PAGE_NOACCESS, &protection) != 0, "cannot protect raw compute boundary");
+        auto* boundedCode = mapping + 1024 - 64;
+        std::fill_n(boundedCode, 64, 0xbf800000u);
+        const auto boundedAddress = reinterpret_cast<std::uintptr_t>(boundedCode);
+        const auto unterminated = expectFailure([&] { AgcDriver::DriverDetail::ReadRawComputeShader(boundedAddress); });
+        boundedCode[63] = 0xbf810000;
+        const auto bounded = AgcDriver::DriverDetail::ReadRawComputeShader(boundedAddress);
+        check(VirtualProtect(mapping + 1024, 4096, PAGE_READWRITE, &protection) != 0, "cannot extend raw compute mapping");
+        boundedCode[63] = 0xbf800000;
+        boundedCode[64] = 0xbf810000;
+        const auto extended = AgcDriver::DriverDetail::ReadRawComputeShader(boundedAddress);
+        check(extended != bounded && extended->code.size() == 65, "raw compute reused code before its end changed");
+        check(VirtualProtect(mapping + 1024, 4096, PAGE_NOACCESS, &protection) != 0, "cannot revoke cached raw compute tail");
+        check(!expectFailure([&] { AgcDriver::DriverDetail::ReadRawComputeShader(boundedAddress); }).empty(), "raw compute reused an inaccessible cached tail");
+        check(VirtualProtect(mapping, 4096, PAGE_NOACCESS, &protection) != 0, "cannot revoke cached raw compute code");
+        check(!expectFailure([&] { AgcDriver::DriverDetail::ReadRawComputeShader(boundedAddress); }).empty(), "raw compute reused inaccessible cached code");
+        check(VirtualFree(mapping, 0, MEM_RELEASE) != 0, "cannot release raw compute boundary test");
+        check(!unterminated.empty() && bounded->code.size() == 64, "raw compute crossed inaccessible memory or missed its last instruction");
+#endif
         testEvents();
         testValidation();
         testClearState();
@@ -375,6 +469,7 @@ int main() {
         testWaitFreeSubmissionQueue0WaitsOn();
         testWaitFreeSubmissionBehindHeldOne();
         testWaitFreeSubmissionTheCpuWaitsFor();
+        testMultiSubmissions();
         testWorkerFailure();
         check(expectFailure([] { LibcRunShutdown_nid_postfix(); }).find("required shader register") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC driver submit tests passed");

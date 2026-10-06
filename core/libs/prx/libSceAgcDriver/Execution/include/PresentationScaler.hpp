@@ -17,6 +17,7 @@ public:
 
     void EnsureSourceImage(std::uint32_t width, std::uint32_t height);
     void RecordUpload(VkCommandBuffer commands, VkBuffer uploadBuffer);
+    void RecordClear(VkCommandBuffer commands, const VkClearColorValue& color);
     void RecordImage(VkCommandBuffer commands, VkImage image);
     // Fills the source image from another image of the same extent (any blittable format, layout
     // unchanged), leaving the source image ready to blit or read back.

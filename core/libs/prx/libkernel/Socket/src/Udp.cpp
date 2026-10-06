@@ -20,6 +20,9 @@
 #include <memory>
 #include <mutex>
 #include <cstdarg>
+#include <cstddef>
+#include <stdexcept>
+#include <vector>
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 namespace {
@@ -57,6 +60,7 @@ int NativeError() {
         case EAGAIN: return 35;
         case EADDRINUSE: return 48;
         case EADDRNOTAVAIL: return 49;
+        case EACCES: return 13;
         case EMSGSIZE: return 40;
         case ENETUNREACH: return 51;
         case EHOSTUNREACH: return 65;
@@ -65,6 +69,10 @@ int NativeError() {
         case ECONNABORTED: return 53;
         case EISCONN: return 56;
         case ENOTCONN: return 57;
+        case ENOBUFS: return 55;
+        case ETIMEDOUT: return 60;
+        case EINTR: return 4;
+        case EINVAL: return 22;
         default: return 5;
     }
 #endif
@@ -151,6 +159,11 @@ void GuestAddress(const sockaddr_storage& native, void* output, std::uint32_t* l
 int GuestSockets::Close(int descriptor) {
     std::lock_guard lock(socketsMutex);
     return sockets.erase(descriptor) ? 0 : Fail(9);
+}
+
+bool GuestSockets::IsOpen(int descriptor) {
+    std::lock_guard lock(socketsMutex);
+    return sockets.contains(descriptor);
 }
 
 extern "C" {
@@ -377,5 +390,95 @@ std::int64_t APS5_VABI recvfrom_nid_postfix(int descriptor, void* buffer, std::u
     if (result < 0) return Fail(NativeError());
     if (address) GuestAddress(native, address, addressLength);
     return result;
+}
+struct GuestIovec {
+    void* base;
+    std::uint64_t length;
+};
+struct GuestMsghdr {
+    void* name;
+    std::uint32_t nameLength;
+    GuestIovec* iov;
+    int iovLength;
+    void* control;
+    std::uint32_t controlLength;
+    int flags;
+};
+static_assert(sizeof(GuestMsghdr) == 48 && offsetof(GuestMsghdr, iov) == 16 && offsetof(GuestMsghdr, control) == 32 && offsetof(GuestMsghdr, flags) == 44);
+static std::int64_t MessageLength(const GuestMsghdr* message) {
+    if (!message) return Fail(14);
+    if (message->iovLength < 0 || message->iovLength > 1024) return Fail(40);
+    if (message->iovLength && !message->iov) return Fail(14);
+    std::uint64_t total = 0;
+    for (int i = 0; i < message->iovLength; ++i) {
+        const auto& entry = message->iov[i];
+        if (!entry.base && entry.length) return Fail(14);
+        if (entry.length > INT_MAX - total) return Fail(22);
+        total += entry.length;
+    }
+    return static_cast<std::int64_t>(total);
+}
+std::int64_t APS5_VABI sendmsg_nid_postfix(int descriptor, const GuestMsghdr* message, int flags) {
+    const auto total = MessageLength(message);
+    if (total < 0) return -1;
+    if (message->control && message->controlLength) throw std::runtime_error("sendmsg: control data is not supported");
+    std::vector<char> buffer;
+    try {
+        buffer.resize(static_cast<std::size_t>(total));
+    } catch (const std::bad_alloc&) {
+        return Fail(55);
+    }
+    std::size_t offset = 0;
+    for (int i = 0; i < message->iovLength; ++i) {
+        if (message->iov[i].length) std::memcpy(buffer.data() + offset, message->iov[i].base, message->iov[i].length);
+        offset += message->iov[i].length;
+    }
+    return sendto_nid_postfix(descriptor, buffer.data(), buffer.size(), flags, message->name, message->name ? message->nameLength : 0u);
+}
+std::int64_t APS5_VABI recvmsg_nid_postfix(int descriptor, GuestMsghdr* message, int flags) {
+    const auto total = MessageLength(message);
+    if (total < 0) return -1;
+    const auto socket = Lookup(descriptor);
+    if (!socket) return -1;
+    if ((flags & ~2) != 0) return Fail(45);
+    const bool datagram = socket->type == 2;
+    std::vector<char> buffer;
+    try {
+        buffer.resize(static_cast<std::size_t>(total) + (datagram ? 1u : 0u));
+    } catch (const std::bad_alloc&) {
+        return Fail(55);
+    }
+    sockaddr_storage native{};
+    socklen_t size = sizeof(native);
+    std::int64_t received = ::recvfrom(socket->value, buffer.data(), static_cast<int>(buffer.size()),
+        flags & 2 ? MSG_PEEK : 0, reinterpret_cast<sockaddr*>(&native), &size);
+    if (received < 0) {
+#ifdef _WIN32
+        if (!datagram || WSAGetLastError() != WSAEMSGSIZE) return Fail(NativeError());
+        received = static_cast<std::int64_t>(buffer.size());
+#else
+        return Fail(NativeError());
+#endif
+    }
+    message->flags = 0;
+    if (received > total) {
+        received = total;
+        message->flags = 0x10;
+    }
+    std::size_t offset = 0;
+    for (int i = 0; i < message->iovLength && offset < static_cast<std::size_t>(received); ++i) {
+        const auto count = std::min<std::size_t>(message->iov[i].length, static_cast<std::size_t>(received) - offset);
+        std::memcpy(message->iov[i].base, buffer.data() + offset, count);
+        offset += count;
+    }
+    if (message->name) {
+        if (size > 0 && (native.ss_family == AF_INET || native.ss_family == AF_INET6)) {
+            GuestAddress(native, message->name, &message->nameLength);
+        } else {
+            message->nameLength = 0;
+        }
+    }
+    message->controlLength = 0;
+    return received;
 }
 }

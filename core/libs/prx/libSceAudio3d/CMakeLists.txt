@@ -18,4 +18,13 @@ if(BUILD_TESTING)
         set_tests_properties(guest_audio3d_parameters PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAudio3d>")
     endif()
+    add_test_executable(guest_audio3d_port_tests ${LIBS_INCLUDE_DIR}/tests/GuestAudio3dPort.cpp)
+    target_include_directories(guest_audio3d_port_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_audio3d_port_tests PRIVATE libSceAudio3d libc)
+    configure_windows_unwind(guest_audio3d_port_tests)
+    add_test(NAME guest_audio3d_port COMMAND guest_audio3d_port_tests)
+    if(WIN32)
+        set_tests_properties(guest_audio3d_port PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAudio3d>")
+    endif()
 endif()

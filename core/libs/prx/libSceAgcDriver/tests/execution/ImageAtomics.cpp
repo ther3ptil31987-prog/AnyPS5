@@ -21,6 +21,8 @@ constexpr std::uint32_t Results = 16;
 constexpr std::uint32_t Operations = 6;
 constexpr std::uint32_t TextureHeight = 8;
 constexpr std::uint32_t Format32UInt = 20;
+constexpr std::uint32_t Format32SInt = 21;
+constexpr std::uint32_t Format32Float = 22;
 constexpr std::uint32_t Type2D = 9;
 alignas(256) std::array<std::uint32_t, Threads * Inputs> Input{};
 alignas(256) std::array<std::uint32_t, Threads * Results> Output{};
@@ -71,24 +73,24 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t by
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x01016facu};
 }
 
-std::array<std::uint32_t, 8> TextureDescriptor(const void* data, std::uint32_t width, std::uint32_t height) {
+std::array<std::uint32_t, 8> TextureDescriptor(const void* data, std::uint32_t width, std::uint32_t height, std::uint32_t format) {
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
     return {
         static_cast<std::uint32_t>(address >> 8u),
-        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32UInt << 20u) | (((width - 1u) & 3u) << 30u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format << 20u) | (((width - 1u) & 3u) << 30u),
         ((width - 1u) >> 2u) | ((height - 1u) << 14u),
         0xfacu | (Type2D << 28u),
         0u, 0u, 0u, 0u,
     };
 }
 
-void Run(AgcDriver::VulkanDevice& device) {
+void Run(AgcDriver::VulkanDevice& device, std::uint32_t format) {
     Output.fill(0xdeadbeefu);
     Texels.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(16, 0u);
     const auto input = BufferDescriptor(Input.data(), static_cast<std::uint32_t>(Input.size() * 4u));
     const auto output = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
-    const auto texture = TextureDescriptor(Texels.data(), Threads, TextureHeight);
+    const auto texture = TextureDescriptor(Texels.data(), Threads, TextureHeight, format);
     std::copy(input.begin(), input.end(), userData.begin());
     std::copy(output.begin(), output.end(), userData.begin() + 4);
     std::copy(texture.begin(), texture.end(), userData.begin() + 8);
@@ -107,7 +109,7 @@ void Run(AgcDriver::VulkanDevice& device) {
     device.WaitIdle();
 }
 
-void Check() {
+void Check(std::uint32_t format) {
     constexpr std::array<const char*, Operations> names{"image_atomic_sub", "image_atomic_smin", "image_atomic_smax", "image_atomic_inc", "image_atomic_dec", "image_atomic_cmpswap"};
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
         const auto* in = &Input[tid * Inputs];
@@ -127,8 +129,8 @@ void Check() {
         for (std::uint32_t j = 0; j < Operations; ++j) {
             const std::uint32_t returned = Output[tid * Results + 2u * j];
             const std::uint32_t stored = Output[tid * Results + 2u * j + 1u];
-            Require(returned == a, std::string(names[j]) + ": thread " + std::to_string(tid) + " returned " + std::to_string(returned) + ", expected " + std::to_string(a));
-            Require(stored == expected[j], std::string(names[j]) + ": thread " + std::to_string(tid) + " stored " + std::to_string(stored) + ", expected " + std::to_string(expected[j]));
+            Require(returned == a, std::string(names[j]) + ", format " + std::to_string(format) + ": thread " + std::to_string(tid) + " returned " + std::to_string(returned) + ", expected " + std::to_string(a));
+            Require(stored == expected[j], std::string(names[j]) + ", format " + std::to_string(format) + ": thread " + std::to_string(tid) + " stored " + std::to_string(stored) + ", expected " + std::to_string(expected[j]));
         }
     }
 }
@@ -140,8 +142,10 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         FillInput();
-        Run(*device);
-        Check();
+        for (const auto format : {Format32UInt, Format32SInt, Format32Float}) {
+            Run(*device, format);
+            Check(format);
+        }
         std::puts("image atomics tests passed");
         return 0;
     } catch (const std::exception& error) {
