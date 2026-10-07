@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvMemory/SpirvInputOutput.hpp"
+#include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvBufferAccess.hpp"
@@ -17,10 +18,6 @@ namespace ShaderRecompiler
 
         constexpr std::uint32_t PsInputFlatShade = 0x00000400u;
         constexpr std::uint32_t PixelParameterLimit = 32u;
-
-        [[noreturn]] void FailEmit(const std::string& reason) {
-            throw std::runtime_error("SPIR-V module emission failed: " + reason);
-        }
 
         IrShaderStage StageOf(const SpirvEmitterState& state) {
             return state.program.Resources().stage;

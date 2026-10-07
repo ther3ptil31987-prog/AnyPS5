@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvMemory/SpirvBufferAccess.hpp"
+#include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvDescriptors.hpp"
 #include <spirv/unified1/spirv.hpp>
@@ -10,10 +11,6 @@
 namespace ShaderRecompiler
 {
 namespace {
-
-    [[noreturn]] void FailEmit(const std::string& reason) {
-        throw std::runtime_error("SPIR-V module emission failed: " + reason);
-    }
 
     const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(const SpirvEmitterState& state) {
         switch (state.program.Resources().stage) {

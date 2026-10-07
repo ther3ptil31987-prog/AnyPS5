@@ -423,12 +423,14 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         viewInfo.image = image;
         viewInfo.viewType = ViewTypeFor(descriptor.dimension, viewLayerCount);
         viewInfo.format = vkFormat;
+        viewFormat = vkFormat;
         viewInfo.components = depthCompare ? VkComponentMapping{} : components;
         viewInfo.subresourceRange = {aspect, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
 
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView");
+        viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
         createFirstLayerView(descriptor, viewInfo);
         if (profile) {
             auto& totals = Profile();
@@ -468,11 +470,13 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         viewInfo.image = source->Image();
         viewInfo.viewType = ViewTypeFor(descriptor.dimension, viewLayerCount);
         viewInfo.format = vkFormat;
+        viewFormat = vkFormat;
         viewInfo.components = components;
         viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView storage view");
+        viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
         createFirstLayerView(descriptor, viewInfo);
         if (profile) {
             auto& totals = Profile();
@@ -492,9 +496,11 @@ Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthForma
     viewInfo.image = depthImage;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = depthFormat;
+    viewFormat = depthFormat;
     viewInfo.components = components;
     viewInfo.subresourceRange = {aspect, 0, 1, 0, 1};
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth plane");
+    viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
 }
 
 Texture::~Texture() {
@@ -506,6 +512,7 @@ void Texture::createFirstLayerView(const GuestTextureResource& descriptor, VkIma
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.subresourceRange.layerCount = 1;
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &firstLayerView), "vkCreateImageView first layer");
+    firstLayerRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
 }
 
 void Texture::release() noexcept {
@@ -1007,6 +1014,16 @@ VkImageView StorageTexture::AtomicView(std::uint32_t mip, bool firstLayer) {
     const auto found = atomicViews.find({mip, firstLayer});
     if (found != atomicViews.end()) return found->second;
     const auto created = createView(mip, firstLayer, VK_FORMAT_R32_UINT);
+    atomicViews.emplace(std::pair{mip, firstLayer}, created);
+    return created;
+}
+
+VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
+    if (storageFormat == VK_FORMAT_R64_UINT) return firstLayer ? FirstLayerView(mip) : View(mip);
+    Require(storageFormat == VK_FORMAT_R32G32_UINT || storageFormat == VK_FORMAT_R32G32_SINT || storageFormat == VK_FORMAT_R32G32_SFLOAT, "64-bit storage image atomics need a surface of two 32-bit components");
+    const auto found = atomicViews.find({mip, firstLayer});
+    if (found != atomicViews.end()) return found->second;
+    const auto created = createView(mip, firstLayer, VK_FORMAT_R64_UINT);
     atomicViews.emplace(std::pair{mip, firstLayer}, created);
     return created;
 }

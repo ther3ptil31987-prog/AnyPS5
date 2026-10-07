@@ -66,9 +66,16 @@ public:
 
     VkImageView View() const;
     VkImageView FirstLayerView() const { return firstLayerView; }
+    struct ViewRange {
+        VkImageViewType type;
+        std::uint32_t levels;
+        std::uint32_t layers;
+    };
+    ViewRange SampledViewRange(bool firstLayer) const { return firstLayer ? firstLayerRange : viewRange; }
     // The layout the image is kept in while sampled.
     VkImageLayout Layout() const { return layout; }
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
+    VkFormat ViewFormat() const { return viewFormat; }
     // Whether this texture is a view of a storage image (no snapshot of its own).
     bool ViewsStorageImage() const { return storageSource != nullptr; }
     const StorageTexture* StorageSource() const { return storageSource.get(); }
@@ -90,8 +97,11 @@ private:
     std::shared_ptr<OwnedImage> owned;
     VkImageView view = VK_NULL_HANDLE;
     VkImageView firstLayerView = VK_NULL_HANDLE;
+    ViewRange viewRange{};
+    ViewRange firstLayerRange{};
     VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkDeviceSize allocationBytes = 0;
+    VkFormat viewFormat = VK_FORMAT_UNDEFINED;
     std::shared_ptr<ResidentColor> source;
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;
@@ -115,6 +125,7 @@ public:
     VkImageView View(std::uint32_t mip);
     VkImageView FirstLayerView(std::uint32_t mip);
     VkImageView AtomicView(std::uint32_t mip, bool firstLayer);
+    VkImageView Atomic64View(std::uint32_t mip, bool firstLayer);
     // Render targets live in the same images: draws attach mip 0 through a view of the color
     // buffer's format and mark the image dirty like a storage write.
     bool Attachable() const { return attachable; }

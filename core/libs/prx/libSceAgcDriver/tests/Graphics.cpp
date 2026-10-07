@@ -108,6 +108,13 @@ void stateTests() {
     queue.context[0x103] = 5;
     Require(AgcDriver::Graphics::DrawRejection(queue, true).find("all ones") != std::string::npos, "a restart index other than all ones was accepted");
     queue = makeState();
+    queue.context[0x293] = 0x06020000u;
+    (void)AgcDriver::Graphics::DecodeState(queue);
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("sample iteration") == std::string::npos, "per-engine primitive discard was rejected");
+    queue.context[0x293] = 0x06030000u;
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("sample iteration") != std::string::npos, "per-sample shading was accepted");
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "sample iteration");
+    queue = makeState();
     queue.userConfig.erase(0x24b);
     queue.context[0x2a5] = 0;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "user-config bank at DWORD 0x24b");
@@ -573,6 +580,35 @@ void DepthStencilTests() {
     queue.context[0x31b] = 0;
     queue.context[0x31c] |= 0x10000000;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "DCC 3D color targets");
+}
+
+// SPI_SHADER_Z_FORMAT (0x1c4) and the export enables of DB_SHADER_CONTROL (0x203): Z export needs a
+// format with a depth channel (1, 2, 3 or 32_ABGR 9), the sample mask needs 32_ABGR, and the
+// formats the export path does not lay out are refused. A missing 0x1c4 gives no verdict here.
+void ZExportTests() {
+    constexpr std::uint32_t zExportEnable = 0x1u;
+    constexpr std::uint32_t maskExportEnable = 0x100u;
+    const auto withExports = [](std::uint32_t format, std::uint32_t exports) {
+        auto queue = makeState();
+        queue.context[0x1b3] = 2;
+        queue.context[0x1b4] = 2;
+        queue.context[0x1c4] = format;
+        queue.context[0x203] = 0x800u | exports;
+        return queue;
+    };
+    for (const std::uint32_t format : {1u, 2u, 3u, 9u}) {
+        const auto queue = withExports(format, zExportEnable);
+        Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "a Z export with format " + std::to_string(format) + " was rejected");
+    }
+    Require(!AgcDriver::Graphics::DrawRejection(withExports(0, zExportEnable), true).empty(), "a Z export without a Z format was accepted");
+    Require(AgcDriver::Graphics::DrawRejection(withExports(9, zExportEnable | maskExportEnable), true).empty(), "a sample-mask export with 32_ABGR was rejected");
+    Require(!AgcDriver::Graphics::DrawRejection(withExports(1, zExportEnable | maskExportEnable), true).empty(), "a sample-mask export with 32_R was accepted");
+    for (std::uint32_t format = 4; format <= 8; ++format) {
+        Require(!AgcDriver::Graphics::DrawRejection(withExports(format, 0), true).empty(), "Z format " + std::to_string(format) + " was accepted");
+    }
+    auto absent = withExports(0, 0);
+    absent.context.erase(0x1c4);
+    Require(AgcDriver::Graphics::DrawRejection(absent, true).empty(), "a missing SPI_SHADER_Z_FORMAT was rejected (or threw) in the precheck");
 }
 
 void DepthBoundsBiasTests() {
@@ -1797,6 +1833,15 @@ void validationTests() {
         attribute.resource.fields[1] |= 0x80000000u;
         expectFailure([&] { AgcDriver::Graphics::BuildVertexInputLayout(context, std::span(&attribute, 1)); }, "descriptor flags");
     }
+    for (const auto capability : {spv::CapabilityInt64Atomics, spv::CapabilityInt64ImageEXT}) {
+        ShaderRecompiler::RecompileResult vertex;
+        vertex.spirv = makeModule({});
+        vertex.spirv.insert(vertex.spirv.begin() + 5, {(2u << 16u) | spv::OpCapability, static_cast<std::uint32_t>(capability)});
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+        const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported device capability");
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, true);
+    }
     for (const auto capability : {spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle}) {
         ShaderRecompiler::RecompileResult vertex;
         vertex.spirv = makeModule({});
@@ -2025,6 +2070,7 @@ int main() {
         hardwareScreenOffsetTests();
         DepthClipTests();
         DepthStencilTests();
+        ZExportTests();
         DepthBoundsBiasTests();
         conservativeZExportTests();
         DisabledColorTests();

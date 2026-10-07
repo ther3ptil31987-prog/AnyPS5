@@ -1,5 +1,10 @@
 #include "GraphicsTests.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "RdnaDecoder/RdnaDescriptorFormat.hpp"
+#include <array>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -16,6 +21,23 @@ void reject(TAction action, std::string_view reason) {
         return;
     }
     throw std::runtime_error(std::string("expected texture format rejection: ") + std::string(reason));
+}
+
+void convertedDccClearTests() {
+    alignas(64) std::array<std::uint8_t, 16> keys{};
+    GuestTextureResource resource{};
+    resource.dccAddress = reinterpret_cast<std::uint64_t>(keys.data());
+    const auto read = [&](std::uint32_t format, std::uint8_t key) {
+        keys.fill(key);
+        resource.format = format;
+        return TextureClearKeys(resource, keys.size() * 256u);
+    };
+    for (const std::uint32_t format : {30u, 34u}) {
+        reject([&] { read(format, 0x40); }, "DCC clear code 0001 of converted texture format " + std::to_string(format));
+        reject([&] { read(format, 0x80); }, "DCC clear code 1110 of converted texture format " + std::to_string(format));
+        Require(read(format, 0x00) == DccKeys::Clear0000 && read(format, 0xc0) == DccKeys::Clear1111, "converted texture format " + std::to_string(format) + " must keep its 0000 and 1111 DCC clear codes");
+    }
+    Require(read(20, 0x40) == DccKeys::Clear0001 && read(20, 0x80) == DccKeys::Clear1110, "format 20 must keep its 0001 and 1110 DCC clear codes");
 }
 
 }
@@ -45,10 +67,18 @@ void RunTextureFormatTests() {
 
     Require(ResolveTextureFormat(34) == ResolveTextureFormat(20), "format 34 must remap to format 20");
     Require(BytesPerElement(34) == BytesPerElement(20), "remapped format 34 must share the width of format 20");
+    Require(ResolveTextureFormat(30) == ResolveTextureFormat(20), "format 30 must remap to format 20");
+    Require(BytesPerElement(30) == 4u, "remapped format 30 must be four bytes wide");
+    for (std::uint32_t format = 0; format < 512u; ++format) {
+        const auto remapped = static_cast<std::uint32_t>(ShaderRecompiler::RemapTextureFormat(static_cast<ShaderRecompiler::IrBufferFormat>(format)));
+        if (remapped == format) continue;
+        Require(ResolveTextureFormat(format) == ResolveTextureFormat(remapped), "guest format " + std::to_string(format) + " must resolve like the format the recompiler remaps it to");
+    }
 
     reject([] { ResolveTextureFormat(0); }, "unsupported guest texture format");
     reject([] { ResolveTextureFormat(183); }, "unsupported guest texture format");
     reject([] { ResolveTextureFormat(9999); }, "unsupported guest texture format");
     reject([] { BytesPerElement(2); }, "unsupported guest texture format");
     reject([] { IsBlockCompressed(200); }, "unsupported guest texture format");
+    convertedDccClearTests();
 }

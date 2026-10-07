@@ -887,6 +887,11 @@ private:
         const auto access = ImageOpcodeInfoOf(op).access;
         const bool atomic = access == ImageAccess::Atomic;
         const bool write = access == ImageAccess::Write || atomic;
+        const bool atomic64 = IsImageAtomic64Opcode(op);
+        if ((image.read || image.written) && image.atomic64 != atomic64) {
+            throw std::runtime_error("an image accessed by 64-bit atomics is also accessed in another way");
+        }
+        image.atomic64 = atomic64;
         image.firstUsePc = std::min(image.firstUsePc, pc);
         image.read = image.read || !write || atomic;
         image.written = image.written || write;

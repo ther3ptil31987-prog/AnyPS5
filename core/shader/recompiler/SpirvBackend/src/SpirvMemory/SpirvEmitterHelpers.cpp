@@ -12,11 +12,11 @@
 
 namespace ShaderRecompiler
 {
-namespace {
-
-[[noreturn]] void FailEmit(const std::string& reason) {
+void FailEmit(const std::string& reason) {
     throw std::runtime_error("SPIR-V module emission failed: " + reason);
 }
+
+namespace {
 
 const ShaderPixelInputInfo& PixelInfo(const SpirvEmitterState& state) {
     if (state.inputInfo.pixel == nullptr) {

@@ -240,22 +240,6 @@ target_link_libraries(agc_driver_tests PRIVATE
 set_target_properties(agc_driver_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_tests)
 
-add_test_executable(agc_driver_recompiler_tests EXCLUDE_FROM_ALL
-        tests/Recompiler.cpp
-)
-
-target_include_directories(agc_driver_recompiler_tests PRIVATE
-        ${LIBS_INCLUDE_DIR}
-)
-
-target_link_libraries(agc_driver_recompiler_tests PRIVATE
-        libSceAgcDriver
-        libc
-)
-
-set_target_properties(agc_driver_recompiler_tests PROPERTIES CXX_EXTENSIONS OFF)
-configure_windows_unwind(agc_driver_recompiler_tests)
-
 add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
@@ -802,6 +786,14 @@ if(BUILD_TESTING)
     add_test(NAME image_sample_gather COMMAND image_sample_gather_tests)
     if(WIN32)
         set_tests_properties(image_sample_gather PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(pixel_ancillary_tests ${LIBS_INCLUDE_DIR}/tests/PixelAncillary.cpp)
+    target_link_libraries(pixel_ancillary_tests PRIVATE shader_recompiler_agc_driver libc)
+    configure_windows_unwind(pixel_ancillary_tests)
+    add_test(NAME pixel_ancillary COMMAND pixel_ancillary_tests)
+    if(WIN32)
+        set_tests_properties(pixel_ancillary PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_indexed_draw_tests ${LIBS_INCLUDE_DIR}/tests/GuestIndexedDraw.cpp)

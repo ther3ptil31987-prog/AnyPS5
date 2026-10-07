@@ -3,9 +3,11 @@
 
 #include "SpirvBackend/SpirvEmitterState.hpp"
 #include "Optimization/BindingAllocator.hpp"
+#include <string>
 
 namespace ShaderRecompiler {
 
+[[noreturn]] void FailEmit(const std::string& reason);
 const RdnaImageDimensionInfo& RdnaImageDimensionInfoFor(RdnaImageDimension dimension);
 std::uint32_t TypeVoid(SpirvEmitterState& state);
 std::uint32_t TypeBool(SpirvEmitterState& state);

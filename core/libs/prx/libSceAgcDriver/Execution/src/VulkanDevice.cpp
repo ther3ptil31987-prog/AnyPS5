@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
@@ -190,6 +191,7 @@ struct VulkanDevice::State {
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
     bool descriptorIndexing = false;
+    bool imageInt64Atomics = false;
     bool primitiveListRestart = false;
     bool depthClipControl = false;
     bool imageViewMinLod = false;
@@ -203,6 +205,7 @@ struct VulkanDevice::State {
     bool depthRangeUnrestricted = false;
     bool samplerAnisotropy = false;
     bool textureCompressionBC = false;
+    bool samplerFilterMinmax = false;
     // VK_KHR_timeline_semaphore enabled: the recorder's unlocked waits are available.
     bool timelineSemaphores = false;
     bool computeWave32 = false;
@@ -510,8 +513,11 @@ struct VulkanDevice::State {
             }
             // Every ShaderResources (kept by the recorder or the resource cache) is gone now, so the
             // sets and samplers they borrowed can go.
+            copiedWriters->clear();
             resourceCache.Clear();
             Graphics::ClearCachedTextures(device);
+            Graphics::ClearImageMirrors(device);
+            patternBuffers.clear();
             descriptorCache.reset();
             emptyBuffer.reset();
             samplerCache.reset();
@@ -570,6 +576,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (state->instanceProc == nullptr) {
         throw std::runtime_error("Vulkan loader: vkGetInstanceProcAddr missing");
     }
+    AgcDriverLockVulkanLoader_nid_postfix();
+    struct LoaderUnlock {
+        ~LoaderUnlock() { AgcDriverUnlockVulkanLoader_nid_postfix(); }
+    } loaderUnlock;
     VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     application.pApplicationName = "AnyPS5 libSceAgcDriver";
     application.apiVersion = VK_API_VERSION_1_1;
@@ -739,6 +749,20 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     atomicInt64Features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES_KHR};
     atomicInt64Features.shaderBufferInt64Atomics = VK_TRUE;
     if (bufferInt64Atomics) deviceExtensions.push_back(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
+    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT imageAtomicInt64Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};
+    if (hasExtension(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &imageAtomicInt64Features};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+    }
+    const bool imageInt64Atomics = imageAtomicInt64Features.shaderImageInt64Atomics == VK_TRUE;
+    imageAtomicInt64Features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};
+    imageAtomicInt64Features.shaderImageInt64Atomics = VK_TRUE;
+    if (imageInt64Atomics) {
+        deviceExtensions.push_back(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+        state->capabilities.push_back(spv::CapabilityInt64ImageEXT);
+        state->imageInt64Atomics = true;
+        state->spirvExtensions.push_back("SPV_EXT_shader_image_int64");
+    }
     deviceExtensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
     state->capabilities.push_back(spv::CapabilitySignedZeroInfNanPreserve);
     state->spirvExtensions.push_back("SPV_KHR_float_controls");
@@ -755,6 +779,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     // drops those writes instead of faulting the device.
     const bool imageRobustness = hasExtension(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
     if (imageRobustness) deviceExtensions.push_back(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
+    if (hasExtension(VK_EXT_SAMPLER_FILTER_MINMAX_EXTENSION_NAME)) {
+        VkPhysicalDeviceSamplerFilterMinmaxPropertiesEXT minmaxProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &minmaxProperties};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
+        state->samplerFilterMinmax = minmaxProperties.filterMinmaxSingleComponentFormats == VK_TRUE && minmaxProperties.filterMinmaxImageComponentMapping == VK_TRUE;
+        if (state->samplerFilterMinmax) deviceExtensions.push_back(VK_EXT_SAMPLER_FILTER_MINMAX_EXTENSION_NAME);
+    }
     // Indirect draws with a GPU-side count (DRAW_INDIRECT_MULTI with count_indirect); a device
     // without it resolves such draws on the CPU.
     state->drawIndirectCount = hasExtension(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
@@ -863,6 +894,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (enabled.shaderImageGatherExtended) state->capabilities.push_back(spv::CapabilityImageGatherExtended);
     enabled.shaderResourceMinLod = available.shaderResourceMinLod;
     if (enabled.shaderResourceMinLod) state->capabilities.push_back(spv::CapabilityMinLod);
+    enabled.sampleRateShading = available.sampleRateShading;
+    enabled.geometryShader = available.geometryShader;
+    if (enabled.geometryShader) state->capabilities.push_back(spv::CapabilityGeometry);
+    enabled.shaderClipDistance = available.shaderClipDistance;
     if (enabled.shaderStorageImageWriteWithoutFormat) state->capabilities.push_back(spv::CapabilityStorageImageWriteWithoutFormat);
     if (enabled.shaderStorageImageReadWithoutFormat) state->capabilities.push_back(spv::CapabilityStorageImageReadWithoutFormat);
     // Bindless image tables index an image array with a wave-uniform runtime slot.
@@ -923,6 +958,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (bufferInt64Atomics) {
         atomicInt64Features.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &atomicInt64Features;
+    }
+    if (imageInt64Atomics) {
+        imageAtomicInt64Features.pNext = byteFeatures.pNext;
+        byteFeatures.pNext = &imageAtomicInt64Features;
     }
     VkPhysicalDeviceImageRobustnessFeaturesEXT imageRobustnessFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT, nullptr, VK_TRUE};
     if (imageRobustness) {
@@ -2333,6 +2372,10 @@ bool VulkanDevice::PrimitiveListRestart() const {
     return state->primitiveListRestart;
 }
 
+bool VulkanDevice::SamplerFilterMinmax() const {
+    return state->samplerFilterMinmax;
+}
+
 Graphics::Context VulkanDevice::graphicsContext() const {
     static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
     if (state->contextReady && !noCache) return state->context;
@@ -2375,12 +2418,14 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.multiDrawIndirect = state->multiDrawIndirect;
     context.depthBounds = state->depthBounds;
     context.depthBiasClamp = state->depthBiasClamp;
+    context.samplerFilterMinmax = state->samplerFilterMinmax;
     context.drawIndirectCount = state->drawIndirectCount;
     context.occlusionQueryPrecise = state->occlusionQueryPrecise;
     context.emptyBuffer = state->emptyBuffer ? state->emptyBuffer->Handle() : VK_NULL_HANDLE;
     context.copiedWriters = state->copiedWriters.get();
     context.functions = state->functionsReady ? &state->deviceFunctions : nullptr;
     context.descriptorIndexing = state->descriptorIndexing;
+    context.imageInt64Atomics = state->imageInt64Atomics;
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
