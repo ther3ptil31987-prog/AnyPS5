@@ -1,4 +1,7 @@
 #version 450
+#ifdef LINEAR_IMAGE
+#extension GL_EXT_shader_image_load_formatted : require
+#endif
 
 layout(constant_id = 0) const uint ELEMENT_BYTES = 4u;
 layout(constant_id = 1) const uint BLOCK_BYTES = 256u;
@@ -26,11 +29,20 @@ layout(constant_id = 19) const uint EQ15 = 0u;
 // Nonzero: block extent in elements (thick 3D blocks are not the thin 2D shape derived below).
 layout(constant_id = 20) const uint BLOCK_WIDTH = 0u;
 layout(constant_id = 21) const uint BLOCK_HEIGHT = 0u;
+layout(constant_id = 22) const uint SPLIT0 = 0u;
+layout(constant_id = 23) const uint SPLIT1 = 0u;
+layout(constant_id = 24) const uint SPLIT2 = 0u;
+layout(constant_id = 25) const uint SPLIT3 = 0u;
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
+#ifdef LINEAR_IMAGE
+layout(set = 0, binding = 0, std430) buffer Tiled { uint data[]; } tiledBuffer;
+layout(set = 0, binding = 1) uniform uimage2D linearImage;
+#else
 layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } inputBuffer;
 layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } outputBuffer;
+#endif
 
 layout(push_constant) uniform Push {
     uint srcBase;
@@ -55,6 +67,8 @@ layout(push_constant) uniform Push {
     // whole mip).
     uint columnBegin;
     uint rowBegin;
+    uint pipeBankXor;
+    uint splitStride;
 } params;
 
 uint equationBit(uint mask, uvec2 p) {
@@ -117,7 +131,7 @@ uint standard64Extra(uint x, uint y) {
 
 uint blockOffset(uvec2 p) {
     if (TILE_FAMILY == 2u) {
-        return equationOffset(p);
+        return equationOffset(p) ^ params.pipeBankXor;
     }
     uint offset = standardOffset(p.x, p.y);
     if (BLOCK_BYTES > 4096u) {
@@ -141,6 +155,43 @@ uvec2 blockExtent() {
     return uvec2(width, BLOCK_BYTES / (width * ELEMENT_BYTES));
 }
 
+#ifdef LINEAR_IMAGE
+void storeElement(uint src, uvec2 p) {
+    uvec4 value = uvec4(0u);
+    uint word = src >> 2;
+    if (ELEMENT_BYTES == 1u) {
+        value.x = (tiledBuffer.data[word] >> ((src & 3u) * 8u)) & 0xffu;
+    } else if (ELEMENT_BYTES == 2u) {
+        value.x = (tiledBuffer.data[word] >> ((src & 3u) * 8u)) & 0xffffu;
+    } else {
+        value.x = tiledBuffer.data[word];
+        if (ELEMENT_BYTES >= 8u) value.y = tiledBuffer.data[word + 1u];
+        if (ELEMENT_BYTES >= 16u) {
+            value.z = tiledBuffer.data[word + 2u];
+            value.w = tiledBuffer.data[word + 3u];
+        }
+    }
+    imageStore(linearImage, ivec2(p), value);
+}
+
+void loadElement(uvec2 p, uint dst) {
+    uvec4 value = imageLoad(linearImage, ivec2(p));
+    uint word = dst >> 2;
+    if (ELEMENT_BYTES >= 4u) {
+        tiledBuffer.data[word] = value.x;
+        if (ELEMENT_BYTES >= 8u) tiledBuffer.data[word + 1u] = value.y;
+        if (ELEMENT_BYTES >= 16u) {
+            tiledBuffer.data[word + 2u] = value.z;
+            tiledBuffer.data[word + 3u] = value.w;
+        }
+    } else {
+        uint mask = ELEMENT_BYTES == 1u ? 0xffu : 0xffffu;
+        uint shift = (dst & 3u) * 8u;
+        atomicAnd(tiledBuffer.data[word], ~(mask << shift));
+        atomicOr(tiledBuffer.data[word], (value.x & mask) << shift);
+    }
+}
+#else
 void copyElement(uint src, uint dst) {
     if (ELEMENT_BYTES >= 4u) {
         for (uint i = 0u; i < ELEMENT_BYTES; i += 4u) {
@@ -154,27 +205,29 @@ void copyElement(uint src, uint dst) {
         atomicOr(outputBuffer.data[dst >> 2], value << shift);
     }
 }
+#endif
 
-void main() {
-    uvec2 p = gl_GlobalInvocationID.xy + uvec2(params.columnBegin, params.rowBegin);
-    if (p.x >= params.width || p.y >= params.height) {
-        return;
-    }
-
+bool locate(uvec2 p, out uint src, out uint dst, out uint ranged) {
     uint linearOffset = p.y * params.pitchBytes + p.x * ELEMENT_BYTES;
 
     if (TILE_FAMILY == 0u) {
-        // kLinear: guest and host layouts match; a straight copy at the
-        // same pitch, no swizzle.
+        ranged = linearOffset;
         if (linearOffset < params.rangeBegin || linearOffset >= params.rangeEnd) {
-            return;
+            return false;
         }
+#ifdef LINEAR_IMAGE
+        src = params.srcBase + linearOffset - params.tiledBase;
+        dst = params.dstBase + linearOffset - params.tiledBase;
+#else
         if (RETILE != 0u) {
-            copyElement(params.srcBase + linearOffset - params.linearBase, params.dstBase + linearOffset - params.tiledBase);
+            src = params.srcBase + linearOffset - params.linearBase;
+            dst = params.dstBase + linearOffset - params.tiledBase;
         } else {
-            copyElement(params.srcBase + linearOffset - params.tiledBase, params.dstBase + linearOffset - params.linearBase);
+            src = params.srcBase + linearOffset - params.tiledBase;
+            dst = params.dstBase + linearOffset - params.linearBase;
         }
-        return;
+#endif
+        return true;
     }
 
     uvec2 swizzle = p;
@@ -187,16 +240,110 @@ void main() {
 
     uint blockIndex = block.y * params.blocksPerRow + block.x;
     uint tiledOffset = blockIndex * BLOCK_BYTES + blockOffset(swizzle);
+    if (SPLIT0 != 0u) {
+        uint split = equationBit(SPLIT0, p) | (equationBit(SPLIT1, p) << 1) | (equationBit(SPLIT2, p) << 2) | (equationBit(SPLIT3, p) << 3);
+        tiledOffset += split * params.splitStride;
+    }
+    ranged = tiledOffset;
     if (tiledOffset < params.rangeBegin || tiledOffset >= params.rangeEnd) {
-        return;
+        return false;
     }
     tiledOffset -= params.tiledBase;
     linearOffset -= params.linearBase;
 
+#ifdef LINEAR_IMAGE
+    src = params.srcBase + tiledOffset;
+    dst = params.dstBase + tiledOffset;
+#else
     if (RETILE != 0u) {
-        copyElement(params.srcBase + linearOffset, params.dstBase + tiledOffset);
+        src = params.srcBase + linearOffset;
+        dst = params.dstBase + tiledOffset;
     } else {
-        copyElement(params.srcBase + tiledOffset, params.dstBase + linearOffset);
+        src = params.srcBase + tiledOffset;
+        dst = params.dstBase + linearOffset;
     }
+#endif
+    return true;
 }
 
+void moveElement(uvec2 p) {
+    uint src;
+    uint dst;
+    uint ranged;
+    if (!locate(p, src, dst, ranged)) {
+        return;
+    }
+#ifdef LINEAR_IMAGE
+    if (RETILE != 0u) {
+        loadElement(p, dst);
+    } else {
+        storeElement(src, p);
+    }
+#else
+    copyElement(src, dst);
+#endif
+}
+
+#ifdef WORD_GROUPS
+shared uint groupWords[32];
+shared uint groupLanes[32];
+shared uint groupDestinations[64];
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy + uvec2(params.columnBegin, params.rowBegin);
+    bool inside = p.x < params.width && p.y < params.height;
+    uint lane = gl_LocalInvocationID.y * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint count = 4u / ELEMENT_BYTES;
+    uint slot = lane / count;
+    uint index = lane % count;
+    uint src = 0u;
+    uint dst = 0u;
+    uint ranged = 0u;
+    bool valid = inside && locate(p, src, dst, ranged);
+    if (index == 0u) {
+        groupWords[slot] = 0u;
+        groupLanes[slot] = 0u;
+    }
+    groupDestinations[lane] = dst;
+    barrier();
+    if (valid) {
+        uint mask = ELEMENT_BYTES == 1u ? 0xffu : 0xffffu;
+#ifdef LINEAR_IMAGE
+        uint value = imageLoad(linearImage, ivec2(p)).x & mask;
+#else
+        uint value = (inputBuffer.data[src >> 2] >> ((src & 3u) * 8u)) & mask;
+#endif
+        atomicOr(groupWords[slot], value << (index * ELEMENT_BYTES * 8u));
+        atomicOr(groupLanes[slot], 1u << index);
+    }
+    barrier();
+    uint first = groupDestinations[slot * count];
+    bool whole = groupLanes[slot] == (1u << count) - 1u && (first & 3u) == 0u;
+    for (uint i = 1u; i < count; ++i) {
+        whole = whole && groupDestinations[slot * count + i] == first + i * ELEMENT_BYTES;
+    }
+    if (whole) {
+        if (index == 0u) {
+#ifdef LINEAR_IMAGE
+            tiledBuffer.data[first >> 2] = groupWords[slot];
+#else
+            outputBuffer.data[first >> 2] = groupWords[slot];
+#endif
+        }
+    } else if (valid) {
+#ifdef LINEAR_IMAGE
+        loadElement(p, dst);
+#else
+        copyElement(src, dst);
+#endif
+    }
+}
+#else
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy + uvec2(params.columnBegin, params.rowBegin);
+    if (p.x >= params.width || p.y >= params.height) {
+        return;
+    }
+    moveElement(p);
+}
+#endif

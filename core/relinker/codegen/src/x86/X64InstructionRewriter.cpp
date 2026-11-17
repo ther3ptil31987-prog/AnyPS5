@@ -14,78 +14,20 @@ X64InstructionRewriter::ReferenceSite X64InstructionRewriter::ClassifyInstructio
     const std::uint8_t* data,
     std::size_t length
 ) {
-    std::size_t pos = 0;
+    const auto info = X64InstructionDecoder{}.DecodeInstruction(data, length);
 
-    while (pos < length) {
-        const std::uint8_t b = data[pos];
-        if ((b >= RexMin && b <= RexMax) ||
-            b == PrefixLock || b == PrefixRepne || b == PrefixRep ||
-            b == PrefixSegCs || b == PrefixSegSs || b == PrefixSegDs ||
-            b == PrefixSegEs || b == PrefixSegFs || b == PrefixSegGs ||
-            b == PrefixOperandSize || b == PrefixAddressSize) {
-            pos += 1;
-            continue;
-        }
-        break;
+    if (info.HasRipRelativeDisp) {
+        return {ReferenceKind::RipRelativeDisp32, info.RipRelativeDispOffset};
     }
 
-    if (pos >= length) {
+    if (!info.HasBranchTarget) {
         return {ReferenceKind::None, 0};
     }
 
-    std::uint8_t opcode = data[pos];
-    const std::size_t opcodeOffset = pos;
-    pos += 1;
-    bool twoByteOpcode = false;
-
-    if (opcode == TwoByteOpcodeEscape) {
-        if (pos >= length) {
-            return {ReferenceKind::None, 0};
-        }
-        twoByteOpcode = true;
-        opcode = data[pos];
-        pos += 1;
-    }
-
-    if (!twoByteOpcode) {
-        if (opcode == OneByteCallRel32 || opcode == OneByteJmpRel32) {
-            if (length >= opcodeOffset + Rel32InstructionLength) {
-                return {ReferenceKind::Rel32Branch, pos};
-            }
-            return {ReferenceKind::None, 0};
-        }
-
-        if (opcode == OneByteJmpRel8 || (opcode >= OneByteJccRel8Min && opcode <= OneByteJccRel8Max)) {
-            if (length >= pos + Disp8Size) {
-                return {ReferenceKind::Rel8Branch, pos};
-            }
-            return {ReferenceKind::None, 0};
-        }
-    } else {
-        if (opcode >= TwoByteJccRel32Min && opcode <= TwoByteJccRel32Max) {
-            if (length >= pos + Disp32Size) {
-                return {ReferenceKind::Rel32Branch, pos};
-            }
-            return {ReferenceKind::None, 0};
-        }
-    }
-
-    if (pos >= length) {
-        return {ReferenceKind::None, 0};
-    }
-
-    const std::uint8_t modrm = data[pos];
-    const std::uint8_t mod = static_cast<std::uint8_t>((modrm >> ModRmModShift) & ModRmModMask);
-    const std::uint8_t rm = static_cast<std::uint8_t>(modrm & ModRmRmMask);
-
-    if (mod == ModRmModIndirect && rm == ModRmRmRipRelative) {
-        const std::size_t dispOffset = pos + 1;
-        if (length >= dispOffset + Disp32Size) {
-            return {ReferenceKind::RipRelativeDisp32, dispOffset};
-        }
-    }
-
-    return {ReferenceKind::None, 0};
+    const bool rel32 = info.IsTwoByteOpcode || info.Opcode == OneByteCallRel32 || info.Opcode == OneByteJmpRel32;
+    return rel32
+        ? ReferenceSite{ReferenceKind::Rel32Branch, info.Length - Disp32Size}
+        : ReferenceSite{ReferenceKind::Rel8Branch, info.Length - Disp8Size};
 }
 
 std::int32_t X64InstructionRewriter::ReadInt32(const std::uint8_t* data) {
@@ -112,6 +54,12 @@ std::int64_t X64InstructionRewriter::AdjustedDelta(
     std::int64_t sliceSize,
     std::int64_t delta
 ) {
+    const bool targetInsideCut = targetPosition > cutStart && targetPosition < cutEnd;
+
+    if (targetInsideCut) {
+        throw CodegenException("Branch target inside rewritten instruction", static_cast<Domain::FileByteOffset>(instrPosition));
+    }
+
     const bool instrShifts = instrPosition >= cutEnd && instrPosition < sliceSize;
     const bool targetShifts = targetPosition >= cutEnd && targetPosition < sliceSize;
 
@@ -132,6 +80,18 @@ RewriteResult X64InstructionRewriter::Rewrite(
         throw CodegenException("Rewrite offset is out of bounds", request.Offset);
     }
 
+    const auto scanner = MakeInstructionScanner();
+    const auto matches = scanner->ScanCodeSection(codeSection, 0, codeSection.size());
+    bool instructionStart = false;
+    for (const auto& match : matches) {
+        if (match.Offset == request.Offset) {
+            instructionStart = true;
+            break;
+        }
+    }
+    if (!instructionStart)
+        throw CodegenException("Rewrite offset is not an instruction boundary", request.Offset);
+
     const X64InstructionDecoder decoder;
     const std::size_t decodedLength = decoder.Decode(codeSection.data() + offset, codeSection.size() - offset);
 
@@ -142,14 +102,76 @@ RewriteResult X64InstructionRewriter::Rewrite(
     const auto cutStart = static_cast<std::int64_t>(offset);
     const std::int64_t cutEnd = cutStart + oldLength;
 
+    const auto sectionSize = static_cast<std::int64_t>(codeSection.size());
+
+    for (const auto& match : matches) {
+        const auto matchOffset = static_cast<std::int64_t>(match.Offset);
+        if (matchOffset >= cutStart && matchOffset < cutEnd)
+            continue;
+
+        const auto info = decoder.DecodeInstruction(
+            codeSection.data() + match.Offset, match.Length);
+
+        if (!info.TruncatesBranchTarget)
+            continue;
+
+        const auto opcodeLength = info.IsTwoByteOpcode ? 2u : 1u;
+        const auto displacementSize =
+            info.Length - info.OpcodeOffset - opcodeLength;
+        const auto displacementOffset =
+            match.Offset + info.Length - displacementSize;
+
+        std::int64_t branchDisplacement = 0;
+
+        if (displacementSize == 1) {
+            branchDisplacement =
+                static_cast<std::int8_t>(codeSection[displacementOffset]);
+        } else if (displacementSize == 2) {
+            const auto raw = static_cast<std::uint16_t>(
+                static_cast<std::uint16_t>(codeSection[displacementOffset]) |
+                (static_cast<std::uint16_t>(
+                    codeSection[displacementOffset + 1]) << 8));
+            branchDisplacement = static_cast<std::int16_t>(raw);
+        } else {
+            throw CodegenException(
+                "Unexpected displacement size for truncated relative branch",
+                match.Offset);
+        }
+
+        const auto rawTargetPosition =
+            matchOffset + static_cast<std::int64_t>(info.Length)
+            + branchDisplacement;
+        if (rawTargetPosition > cutStart && rawTargetPosition < cutEnd) {
+            throw CodegenException(
+                "Branch target inside rewritten instruction",
+                match.Offset);
+        }
+        if (delta == 0)
+            continue;
+        if (rawTargetPosition < 0 || rawTargetPosition > 0xFFFF) {
+            throw CodegenException(
+                "Cannot change code length while a truncated relative branch target wraps at 16 bits",
+                match.Offset);
+        }
+        const auto targetPosition = rawTargetPosition;
+
+        const bool instrShifts =
+            matchOffset >= cutEnd && matchOffset < sectionSize;
+        const bool targetShifts =
+            targetPosition >= cutEnd && targetPosition < sectionSize;
+
+        if (instrShifts != targetShifts) {
+            throw CodegenException(
+                "Cannot change code length while a truncated relative branch moves",
+                match.Offset);
+        }
+    }
+
     std::vector<std::uint8_t> rewritten;
     rewritten.reserve(codeSection.size() + static_cast<std::size_t>(delta > 0 ? delta : 0));
     rewritten.insert(rewritten.end(), codeSection.begin(), codeSection.begin() + offset);
     rewritten.insert(rewritten.end(), request.NewBytes.begin(), request.NewBytes.end());
     rewritten.insert(rewritten.end(), codeSection.begin() + offset + decodedLength, codeSection.end());
-
-    const auto scanner = MakeInstructionScanner();
-    const auto matches = scanner->ScanCodeSection(codeSection, 0, codeSection.size());
 
     std::vector<AddressAdjustment> adjustments;
 

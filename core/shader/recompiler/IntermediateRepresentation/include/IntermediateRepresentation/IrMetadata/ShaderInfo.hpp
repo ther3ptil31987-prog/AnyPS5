@@ -12,13 +12,13 @@ namespace ShaderRecompiler {
 struct ShaderInfo {
     std::uint32_t scratchDwords = 0;
     std::uint32_t sharedMemoryBytes = 0;
-    static constexpr std::uint32_t MaxBuffers = 32;
-    static constexpr std::uint32_t MaxImages = 64;
-    static constexpr std::uint32_t MaxSamplers = 32;
-    static constexpr std::uint32_t MaxSampledPairs = 64;
+    static constexpr std::uint32_t MaxImages = 128;
+    static constexpr std::uint32_t MaxSamplers = 64;
+    static constexpr std::uint32_t MaxSampledPairs = 256;
 
     std::vector<BufferResource> buffers;
     std::vector<ImageResource> images;
+    std::vector<std::vector<ImageResource>> runtimeImageModes;
     std::vector<SamplerResource> samplers;
     std::vector<SampledResourcePair> sampledPairs;
     std::vector<StageInput> inputs;
@@ -33,10 +33,18 @@ struct ShaderInfo {
     bool hasBitwiseXor = false;
     bool usesDma = false;
     bool bdaWrites = false;
+    bool usesFaultBuffer = false;
     bool dispatchThreadLimit = false;
+    bool rasterPrimitive = false;
+    bool layerExported = false;
+    bool smoothOffsetBarycentrics = false;
 
     bool operator==(const ShaderInfo& other) const = default;
 };
+
+[[nodiscard]] inline std::uint32_t WorkgroupMemoryStrideDwords(const ShaderInfo& info) {
+    return info.sharedMemoryBytes == 0u ? 0u : (info.sharedMemoryBytes / 4u + 2u) & ~1u;
+}
 
 }
 

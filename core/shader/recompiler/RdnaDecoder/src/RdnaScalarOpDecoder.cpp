@@ -39,6 +39,8 @@ RdnaOpcode decodeSop1Opcode(std::uint32_t opcode) {
         case 0x1eu: return RdnaOpcode::SBitset1B64;
         case 0x1fu: return RdnaOpcode::SGetpcB64;
         case 0x20u: return RdnaOpcode::SSetpcB64;
+        case 0x21u: return RdnaOpcode::SSwappcB64;
+        case 0x22u: return RdnaOpcode::SRfeB64;
         case 0x24u: return RdnaOpcode::SAndSaveexecB64;
         case 0x25u: return RdnaOpcode::SOrSaveexecB64;
         case 0x26u: return RdnaOpcode::SXorSaveexecB64;
@@ -72,7 +74,7 @@ RdnaOpcode decodeSop1Opcode(std::uint32_t opcode) {
         case 0x46u: return RdnaOpcode::SAndn1WrexecB32;
         case 0x47u: return RdnaOpcode::SAndn2WrexecB32;
         case 0x49u: return RdnaOpcode::SMovrelsd2B32;
-        default: throw std::invalid_argument("unsupported SOP1 opcode " + std::to_string(opcode));
+        default: throw UnsupportedInstructionError("unsupported SOP1 opcode " + std::to_string(opcode), "SOP1", opcode, __FILE__, __LINE__);
     }
 }
 
@@ -129,7 +131,7 @@ RdnaOpcode decodeSop2Opcode(std::uint32_t opcode) {
         case 0x34u: return RdnaOpcode::SPackHhB32B16;
         case 0x35u: return RdnaOpcode::SMulHiU32;
         case 0x36u: return RdnaOpcode::SMulHiI32;
-        default: throw std::invalid_argument("unsupported SOP2 opcode " + std::to_string(opcode));
+        default: throw UnsupportedInstructionError("unsupported SOP2 opcode " + std::to_string(opcode), "SOP2", opcode, __FILE__, __LINE__);
     }
 }
 
@@ -153,7 +155,7 @@ RdnaOpcode decodeSopcOpcode(std::uint32_t opcode) {
         case 0x0fu: return RdnaOpcode::SBitcmp1B64;
         case 0x12u: return RdnaOpcode::SCmpEqU64;
         case 0x13u: return RdnaOpcode::SCmpLgU64;
-        default: throw std::invalid_argument("unsupported SOPC opcode " + std::to_string(opcode));
+        default: throw UnsupportedInstructionError("unsupported SOPC opcode " + std::to_string(opcode), "SOPC", opcode, __FILE__, __LINE__);
     }
 }
 
@@ -179,13 +181,14 @@ RdnaOpcode decodeSopkOpcode(std::uint32_t opcode) {
         case 0x12u: return RdnaOpcode::SGetregB32;
         case 0x13u: return RdnaOpcode::SSetregB32;
         case 0x15u: return RdnaOpcode::SSetregImm32B32;
+        case 0x16u: return RdnaOpcode::SCallB64;
         case 0x17u: return RdnaOpcode::SWaitcnt;
         case 0x18u: return RdnaOpcode::SWaitcnt;
         case 0x19u: return RdnaOpcode::SWaitcnt;
         case 0x1au: return RdnaOpcode::SWaitcnt;
         case 0x1bu: return RdnaOpcode::SSubvectorLoopBegin;
         case 0x1cu: return RdnaOpcode::SSubvectorLoopEnd;
-        default: throw std::invalid_argument("unsupported SOPK opcode " + std::to_string(opcode));
+        default: throw UnsupportedInstructionError("unsupported SOPK opcode " + std::to_string(opcode), "SOPK", opcode, __FILE__, __LINE__);
     }
 }
 
@@ -204,9 +207,11 @@ RdnaOpcode decodeSoppOpcode(std::uint32_t opcode) {
         case 0x0au: return RdnaOpcode::SBarrier;
         case 0x0bu: return RdnaOpcode::SEndpgm;
         case 0x0cu: return RdnaOpcode::SWaitcnt;
+        case 0x0du: return RdnaOpcode::SSethalt;
         case 0x0eu: return RdnaOpcode::SSleep;
         case 0x0fu: return RdnaOpcode::SSetprio;
         case 0x10u: return RdnaOpcode::SSendmsg;
+        case 0x11u: return RdnaOpcode::SSendmsghalt;
         case 0x12u: return RdnaOpcode::STrap;
         case 0x13u: return RdnaOpcode::SIcacheInv;
         case 0x14u: return RdnaOpcode::SIncperflevel;
@@ -218,6 +223,7 @@ RdnaOpcode decodeSoppOpcode(std::uint32_t opcode) {
         case 0x1au: return RdnaOpcode::SCbranchCdbg;
         case 0x1bu:
         case 0x1eu: return RdnaOpcode::SEndpgm;
+        case 0x1fu: return RdnaOpcode::SCodeEnd;
         case 0x20u: return RdnaOpcode::SInstPrefetch;
         case 0x21u: return RdnaOpcode::SClause;
         case 0x22u: return RdnaOpcode::SWaitIdle;
@@ -225,7 +231,7 @@ RdnaOpcode decodeSoppOpcode(std::uint32_t opcode) {
         case 0x24u: return RdnaOpcode::SRoundMode;
         case 0x25u: return RdnaOpcode::SDenormMode;
         case 0x28u: return RdnaOpcode::STtracedata;
-        default: throw std::invalid_argument("unsupported SOPP opcode " + std::to_string(opcode));
+        default: throw UnsupportedInstructionError("unsupported SOPP opcode " + std::to_string(opcode), "SOPP", opcode, __FILE__, __LINE__);
     }
 }
 
@@ -242,7 +248,8 @@ bool isSoppWaitOpcode(RdnaOpcode opcode) {
         opcode == RdnaOpcode::STrap || opcode == RdnaOpcode::STtracedata || opcode == RdnaOpcode::SInstPrefetch ||
         opcode == RdnaOpcode::SClause || opcode == RdnaOpcode::SCbranchCdbg || opcode == RdnaOpcode::SIcacheInv ||
         opcode == RdnaOpcode::SIncperflevel || opcode == RdnaOpcode::SDecperflevel || opcode == RdnaOpcode::SWaitIdle ||
-        opcode == RdnaOpcode::SRoundMode || opcode == RdnaOpcode::SDenormMode;
+        opcode == RdnaOpcode::SRoundMode || opcode == RdnaOpcode::SDenormMode || opcode == RdnaOpcode::SSethalt ||
+        opcode == RdnaOpcode::SSendmsghalt;
 }
 
 std::uint32_t scalarDestinationDwordCount(RdnaOpcode opcode) {
@@ -256,6 +263,7 @@ std::uint32_t scalarDestinationDwordCount(RdnaOpcode opcode) {
         case RdnaOpcode::SBitset0B64:
         case RdnaOpcode::SBitset1B64:
         case RdnaOpcode::SGetpcB64:
+        case RdnaOpcode::SSwappcB64:
         case RdnaOpcode::SAndSaveexecB64:
         case RdnaOpcode::SOrSaveexecB64:
         case RdnaOpcode::SXorSaveexecB64:
@@ -285,6 +293,7 @@ std::uint32_t scalarDestinationDwordCount(RdnaOpcode opcode) {
         case RdnaOpcode::SLshlB64:
         case RdnaOpcode::SLshrB64:
         case RdnaOpcode::SBfmB64:
+        case RdnaOpcode::SCallB64:
         case RdnaOpcode::SBfeU64: return 2u;
         default: return 1u;
     }
@@ -340,7 +349,7 @@ RdnaInstruction DecodeRdnaSop1(std::uint32_t programCounter, std::span<const std
         instruction.destination = DecodeRdnaScalarDestination(scalarDestination, programCounter);
         return instruction;
     }
-    if (instruction.op == RdnaOpcode::SSetpcB64) {
+    if (instruction.op == RdnaOpcode::SSetpcB64 || instruction.op == RdnaOpcode::SRfeB64) {
         instruction.sourceCount = 1;
         instruction.destination.kind = RdnaOperandKind::Null;
         instruction.source0 = DecodeRdnaScalarSource(scalarSource0, programCounter);
@@ -411,8 +420,9 @@ RdnaInstruction DecodeRdnaSopk(std::uint32_t programCounter, std::span<const std
         instruction.destination = DecodeRdnaScalarDestination(scalarRegister, programCounter);
         return instruction;
     }
-    if (instruction.op == RdnaOpcode::SSubvectorLoopBegin || instruction.op == RdnaOpcode::SSubvectorLoopEnd) {
+    if (instruction.op == RdnaOpcode::SSubvectorLoopBegin || instruction.op == RdnaOpcode::SSubvectorLoopEnd || instruction.op == RdnaOpcode::SCallB64) {
         instruction.destination = DecodeRdnaScalarDestination(scalarRegister, programCounter);
+        instruction.dataDwordCount = scalarDestinationDwordCount(instruction.op);
         instruction.branchTarget = programCounter + 4u + static_cast<std::uint32_t>(immediate * 4);
         return instruction;
     }

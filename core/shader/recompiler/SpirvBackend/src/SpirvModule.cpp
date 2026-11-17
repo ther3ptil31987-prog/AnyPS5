@@ -14,6 +14,9 @@ void AppendInstructionWords(std::vector<std::uint32_t>& section, std::span<const
     if (words.empty()) {
         return;
     }
+    if (words.size() > 0xffffu) {
+        throw std::runtime_error("SpirvModule instruction length exceeds maximum SPIR-V word count");
+    }
     const auto opcode = words[0];
     const auto wordCount = static_cast<std::uint32_t>(words.size());
     section.push_back((wordCount << spv::WordCountShift) | opcode);
@@ -87,8 +90,9 @@ std::vector<std::uint32_t> SpirvModule::Finalize() const {
     if (unpatchedPhiIncomings != 0) {
         throw std::runtime_error("SpirvModule::Finalize called with unpatched OpPhi incoming pairs");
     }
+    if (inHelperFunction) throw std::runtime_error("SpirvModule::Finalize called inside a helper function");
     std::vector<std::uint32_t> module;
-    module.reserve(5u + capabilities.size() + extensions.size() + extInstImports.size() + memoryModel.size() + entryPoints.size() + executionModes.size() + debug.size() + annotations.size() + typeDeclarations.size() + declarations.size() + globalVariables.size() + functionInstructions.size());
+    module.reserve(5u + capabilities.size() + extensions.size() + extInstImports.size() + memoryModel.size() + entryPoints.size() + executionModes.size() + debug.size() + annotations.size() + typeDeclarations.size() + declarations.size() + globalVariables.size() + functionInstructions.size() + helperFunctionInstructions.size());
     module.push_back(spv::MagicNumber);
     module.push_back(version);
     module.push_back(0u);
@@ -105,8 +109,36 @@ std::vector<std::uint32_t> SpirvModule::Finalize() const {
     module.insert(module.end(), typeDeclarations.begin(), typeDeclarations.end());
     module.insert(module.end(), declarations.begin(), declarations.end());
     module.insert(module.end(), globalVariables.begin(), globalVariables.end());
+    const auto functionsStart = module.size();
     module.insert(module.end(), functionInstructions.begin(), functionInstructions.end());
+    module.insert(module.end(), helperFunctionInstructions.begin(), helperFunctionInstructions.end());
+    if (inlineFunctions) {
+        std::vector<std::uint32_t> entryIds;
+        for (std::size_t offset = 0; offset < entryPoints.size(); offset += entryPoints[offset] >> spv::WordCountShift) entryIds.push_back(entryPoints[offset + 2u]);
+        for (std::size_t offset = functionsStart; offset < module.size(); offset += module[offset] >> spv::WordCountShift) {
+            if ((module[offset] & spv::OpCodeMask) != spv::OpFunction || std::ranges::find(entryIds, module[offset + 2u]) != entryIds.end()) continue;
+            module[offset + 3u] = (module[offset + 3u] & ~static_cast<std::uint32_t>(spv::FunctionControlDontInlineMask)) | static_cast<std::uint32_t>(spv::FunctionControlInlineMask);
+        }
+    }
     return module;
+}
+
+void SpirvModule::BeginHelperFunction() {
+    if (inHelperFunction) throw std::runtime_error("SpirvModule helper functions cannot nest");
+    std::swap(functionInstructions, helperFunctionInstructions);
+    std::swap(ballots, helperBallots);
+    inHelperFunction = true;
+}
+
+void SpirvModule::EndHelperFunction() {
+    if (!inHelperFunction) throw std::runtime_error("SpirvModule::EndHelperFunction without a helper function");
+    std::swap(functionInstructions, helperFunctionInstructions);
+    std::swap(ballots, helperBallots);
+    inHelperFunction = false;
+}
+
+void SpirvModule::InlineFunctions() {
+    inlineFunctions = true;
 }
 
 void SpirvModule::RequireVersion(std::uint32_t version) {
@@ -158,6 +190,15 @@ std::uint32_t SpirvModule::declareDecoratedType(std::uint32_t opcode, std::vecto
     return id;
 }
 
+std::uint32_t SpirvModule::SpecializationConstant(std::uint32_t type, std::uint32_t constantId, std::uint32_t defaultValue) {
+    if (const auto found = specializationIds.find(constantId); found != specializationIds.end()) return found->second;
+    const auto id = AllocateId();
+    appendInstruction(declarations, spv::OpSpecConstant, type, id, defaultValue);
+    AddAnnotation(spv::OpDecorate, id, spv::DecorationSpecId, constantId);
+    specializationIds.emplace(constantId, id);
+    return id;
+}
+
 std::uint32_t SpirvModule::declareConstant(std::uint32_t opcode, std::vector<std::uint32_t> key) {
     if (const auto it = declarationIds.find(key); it != declarationIds.end()) {
         return it->second;
@@ -178,6 +219,12 @@ void SpirvModule::DefineGlobalVariable(std::uint32_t id, std::uint32_t pointerTy
     appendInstruction(declarations, spv::OpVariable, pointerType, id, storageClass);
 }
 
+std::uint32_t SpirvModule::DefineInitializedGlobalVariable(std::uint32_t pointerType, std::uint32_t storageClass, std::uint32_t initializer) {
+    const auto id = AllocateId();
+    appendInstruction(declarations, spv::OpVariable, pointerType, id, storageClass, initializer);
+    return id;
+}
+
 void SpirvModule::AddMemoryModel(std::uint32_t addressingModel, std::uint32_t memoryModel) {
     appendInstruction(this->memoryModel, spv::OpMemoryModel, addressingModel, memoryModel);
 }
@@ -190,6 +237,33 @@ void SpirvModule::AddName(std::uint32_t target, const std::string& name) {
 
 void SpirvModule::AddFunction(std::span<const std::uint32_t> words) {
     AppendInstructionWords(functionInstructions, words);
+}
+
+void SpirvModule::AddSubgroupBallot(std::uint32_t type, std::uint32_t result, std::uint32_t scope, std::uint32_t predicate) {
+    if (ballots.scanned > functionInstructions.size()) throw std::runtime_error("SpirvModule function instructions shrank under a subgroup ballot");
+    for (auto offset = ballots.scanned; offset < functionInstructions.size();) {
+        const auto wordCount = functionInstructions[offset] >> spv::WordCountShift;
+        if (wordCount == 0u || wordCount > functionInstructions.size() - offset) throw std::runtime_error("SpirvModule malformed function instruction before a subgroup ballot");
+        switch (functionInstructions[offset] & spv::OpCodeMask) {
+        case spv::OpLabel:
+        case spv::OpFunction:
+        case spv::OpFunctionEnd:
+        case spv::OpFunctionCall:
+        case spv::OpDemoteToHelperInvocation:
+            ballots.results.clear();
+            break;
+        default:
+            break;
+        }
+        offset += wordCount;
+    }
+    const auto [found, inserted] = ballots.results.try_emplace({type, scope, predicate}, result);
+    if (inserted) {
+        appendInstruction(functionInstructions, spv::OpGroupNonUniformBallot, type, result, scope, predicate);
+    } else {
+        appendInstruction(functionInstructions, spv::OpCopyObject, type, result, found->second);
+    }
+    ballots.scanned = functionInstructions.size();
 }
 
 void SpirvModule::appendString(std::vector<std::uint32_t>& words, const std::string& text) {
@@ -213,12 +287,17 @@ SpirvDeferredPhi SpirvModule::AddDeferredPhi(std::uint32_t type, std::uint32_t r
     const SpirvDeferredPhi phi {functionInstructions.size()};
     AddFunction(std::span<const std::uint32_t>(words));
     unpatchedPhiIncomings += incomingCount;
+    pendingDeferredPhis[phi.wordOffset] = {incomingCount, incomingCount};
     return phi;
 }
 
 void SpirvModule::PatchDeferredPhi(SpirvDeferredPhi phi, std::size_t incoming, std::uint32_t value, std::uint32_t parent) {
-    const auto incomingCount = ((functionInstructions.at(phi.wordOffset) >> spv::WordCountShift) - 3u) / 2u;
-    if (incoming >= incomingCount || value == 0u || parent == 0u) {
+    const auto it = pendingDeferredPhis.find(phi.wordOffset);
+    if (it == pendingDeferredPhis.end()) {
+        throw std::runtime_error("SpirvModule::PatchDeferredPhi target offset is not a pending deferred phi");
+    }
+    const auto [totalIncomings, remainingIncomings] = it->second;
+    if (incoming >= totalIncomings || value == 0u || parent == 0u) {
         throw std::runtime_error("SpirvModule::PatchDeferredPhi received an invalid incoming index or a zero id");
     }
     const auto valueWord = phi.wordOffset + 3u + incoming * 2u;
@@ -229,6 +308,9 @@ void SpirvModule::PatchDeferredPhi(SpirvDeferredPhi phi, std::size_t incoming, s
     functionInstructions[valueWord] = value;
     functionInstructions[parentWord] = parent;
     unpatchedPhiIncomings--;
+    if (--it->second.second == 0) {
+        pendingDeferredPhis.erase(it);
+    }
 }
 
 }

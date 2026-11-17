@@ -1,13 +1,13 @@
 #include "ControlFlow/ControlFlowGraph.hpp"
+#include "ControlFlow/ControlFlowHelpers.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 #include <iterator>
 #include <stdexcept>
 #include <string>
 
 namespace ShaderRecompiler {
-
-namespace {
 
 std::string toHexString(std::uint32_t value) {
     char buffer[11];
@@ -21,9 +21,51 @@ bool contains(const std::vector<std::uint32_t>& values, std::uint32_t value) {
 
 std::vector<std::uint32_t> intersectSorted(const std::vector<std::uint32_t>& first, const std::vector<std::uint32_t>& second) {
     std::vector<std::uint32_t> result;
+    result.reserve(std::min(first.size(), second.size()));
     std::set_intersection(first.begin(), first.end(), second.begin(), second.end(), std::back_inserter(result));
     return result;
 }
+
+void addUnique(std::vector<std::uint32_t>& values, std::uint32_t value) {
+    if (std::find(values.begin(), values.end(), value) == values.end()) {
+        values.push_back(value);
+    }
+}
+
+void sortUnique(std::vector<std::uint32_t>& values) {
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+}
+
+std::uint32_t remapId(std::uint32_t id, const std::vector<std::uint32_t>& idMap) {
+    return id != InvalidControlFlowId && id < idMap.size() ? idMap[id] : id;
+}
+
+void remapIds(std::vector<std::uint32_t>& values, const std::vector<std::uint32_t>& idMap) {
+    for (auto& value : values) {
+        value = remapId(value, idMap);
+    }
+    if (std::adjacent_find(values.begin(), values.end(), std::greater_equal<>()) != values.end()) {
+        sortUnique(values);
+    }
+}
+
+void rebuildPredecessors(ControlFlowGraph& graph) {
+    for (auto& block : graph.blocks) {
+        block.predecessors.clear();
+        sortUnique(block.successors);
+    }
+    for (const auto& block : graph.blocks) {
+        for (const auto successor : block.successors) {
+            graph.blocks[successor].predecessors.push_back(block.id);
+        }
+    }
+    for (auto& block : graph.blocks) {
+        sortUnique(block.predecessors);
+    }
+}
+
+namespace {
 
 std::string joinIds(const std::vector<std::uint32_t>& values) {
     std::string text;
@@ -68,28 +110,49 @@ BasicBlock& ControlFlowGraph::FindBlockByProgramCounter(std::uint32_t programCou
 }
 
 bool ControlFlowGraph::Dominates(std::uint32_t dominator, std::uint32_t blockId) const {
-    return contains(FindBlock(blockId).dominators, dominator);
+    const auto& dominators = FindBlock(blockId).dominators;
+    return std::binary_search(dominators.begin(), dominators.end(), dominator);
 }
 
 bool ControlFlowGraph::PostDominates(std::uint32_t postDominator, std::uint32_t blockId) const {
-    return contains(FindBlock(blockId).postDominators, postDominator);
+    const auto& postDominators = FindBlock(blockId).postDominators;
+    return std::binary_search(postDominators.begin(), postDominators.end(), postDominator);
 }
 
 std::uint32_t ControlFlowGraph::FindNearestCommonPostDominator(std::uint32_t firstBlock, std::uint32_t secondBlock) const {
     const auto& first = FindBlock(firstBlock);
     const auto& second = FindBlock(secondBlock);
+    if (first.immediatePostDominator != InvalidControlFlowId && second.immediatePostDominator != InvalidControlFlowId) {
+        const BasicBlock* left = &first;
+        const BasicBlock* right = &second;
+        while (left->postDominators.size() > right->postDominators.size()) left = &FindBlock(left->immediatePostDominator);
+        while (right->postDominators.size() > left->postDominators.size()) right = &FindBlock(right->immediatePostDominator);
+        while (left != right) {
+            if (left->immediatePostDominator == left->id) {
+                return InvalidControlFlowId;
+            }
+            left = &FindBlock(left->immediatePostDominator);
+            right = &FindBlock(right->immediatePostDominator);
+        }
+        return left->id;
+    }
     const auto common = intersectSorted(first.postDominators, second.postDominators);
     if (common.empty()) {
         return InvalidControlFlowId;
     }
+    if (common.size() == 1u) {
+        return common.front();
+    }
     for (const auto candidate : common) {
-        bool nearest = true;
-        for (const auto other : common) {
-            if (other != candidate && !PostDominates(other, candidate)) {
-                nearest = false;
-                break;
-            }
+        const auto& postDominators = FindBlock(candidate).postDominators;
+        if (postDominators.size() + 1u < common.size()) {
+            continue;
         }
+        auto member = postDominators.begin();
+        const bool nearest = std::all_of(common.begin(), common.end(), [&](std::uint32_t other) {
+            member = std::lower_bound(member, postDominators.end(), other);
+            return other == candidate || (member != postDominators.end() && *member == other);
+        });
         if (nearest) {
             return candidate;
         }

@@ -2,21 +2,61 @@
 #define CORE_LIBS_PRX_LIBSCEPAD_INPUTMAPPING_HPP
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <istream>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
-#include "SDL_scancode.h"
+#include "SDL_gamecontroller.h"
 #include "SDL_mouse.h"
+#include "SDL_scancode.h"
 
 #include "PadInputTypes.hpp"
 
 namespace Pad {
 
-inline constexpr int MousePollIntervalMs = 33;
 inline constexpr int WheelPressDurationMs = 80;
-inline constexpr double MouseSensitivity = 1.0;
+inline constexpr double DefaultMouseSensitivity = 1.0;
+inline constexpr double MaxMouseSensitivity = 10.0;
+inline constexpr int MaxStickDeadzonePercent = 90;
+inline constexpr std::size_t MaxTitleIdLength = 32;
+
+struct InputSettings {
+    int leftStickDeadzonePercent = 0;
+    int rightStickDeadzonePercent = 0;
+    double mouseSensitivity = DefaultMouseSensitivity;
+    double mouseVerticalScale = 1.0;
+    double mouseCurve = 1.0;
+    double mouseDeadzoneOffset = 0.2;
+    double mouseMaxSpeed = 1.0;
+    double mouseSmoothingMs = 10.0;
+    double mouseDecayMs = 30.0;
+    double stickModifierScale = 0.5;
+    double keyboardRampMs = 0.0;
+    double triggerRampMs = 0.0;
+    bool mouseControlsRightStick = true;
+};
+
+struct InputConfiguration {
+    std::vector<InputBinding> bindings;
+    InputSettings settings;
+    std::array<std::optional<PadButton>, SDL_CONTROLLER_BUTTON_MAX> controllerButtons{};
+};
 
 inline constexpr std::array InputMapping{
     InputBinding{SDL_SCANCODE_F11, MouseButton::None, InputControl::ToggleFullscreen},
+    InputBinding{SDL_SCANCODE_F10, MouseButton::None, InputControl::TogglePerformanceOverlay},
+    InputBinding{SDL_SCANCODE_F12, MouseButton::None, InputControl::Screenshot},
+    InputBinding{SDL_SCANCODE_F9, MouseButton::None, InputControl::ShowPadStatus},
+    InputBinding{SDL_SCANCODE_F1, MouseButton::None, InputControl::ReloadInputMapping},
+    InputBinding{SDL_SCANCODE_F5, MouseButton::None, InputControl::VolumeDown},
+    InputBinding{SDL_SCANCODE_F6, MouseButton::None, InputControl::VolumeUp},
+    InputBinding{SDL_SCANCODE_F8, MouseButton::None, InputControl::ToggleMute},
     InputBinding{SDL_SCANCODE_RETURN, MouseButton::None, InputControl::Button, PadButton::Cross},
     InputBinding{SDL_SCANCODE_SPACE, MouseButton::None, InputControl::Button, PadButton::Cross},
     InputBinding{SDL_SCANCODE_ESCAPE, MouseButton::None, InputControl::Button, PadButton::Options},
@@ -24,6 +64,7 @@ inline constexpr std::array InputMapping{
     InputBinding{SDL_SCANCODE_C, MouseButton::None, InputControl::Button, PadButton::Circle},
     InputBinding{SDL_SCANCODE_Q, MouseButton::None, InputControl::Button, PadButton::L1},
     InputBinding{SDL_SCANCODE_E, MouseButton::None, InputControl::Button, PadButton::R1},
+    InputBinding{SDL_SCANCODE_R, MouseButton::None, InputControl::Button, PadButton::L2},
     InputBinding{SDL_SCANCODE_LALT, MouseButton::None, InputControl::Button, PadButton::R1},
     InputBinding{SDL_SCANCODE_RALT, MouseButton::None, InputControl::Button, PadButton::R1},
     InputBinding{SDL_SCANCODE_LSHIFT, MouseButton::None, InputControl::Button, PadButton::L3},
@@ -44,14 +85,59 @@ inline constexpr std::array InputMapping{
     InputBinding{SDL_SCANCODE_G, MouseButton::None, InputControl::RightStickDown},
     InputBinding{SDL_SCANCODE_BACKSPACE, MouseButton::None, InputControl::TouchLeft},
     InputBinding{SDL_SCANCODE_TAB, MouseButton::None, InputControl::TouchRight},
+    InputBinding{SDL_SCANCODE_F7, MouseButton::None, InputControl::ToggleMouse},
+    InputBinding{SDL_SCANCODE_X, MouseButton::None, InputControl::Shake},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::Middle, InputControl::ToggleMouse},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::Left, InputControl::Button, PadButton::Square},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::Right, InputControl::Button, PadButton::R2},
+    InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::X1, InputControl::Button, PadButton::L2},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::None, InputControl::Button, PadButton::Up, 1},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::None, InputControl::Button, PadButton::Down, -1}
 };
 
-std::vector<InputBinding> LoadInputMapping();
+InputConfiguration LoadInputMapping(std::string_view titleId = {});
+void ApplyInputMapping(InputConfiguration& configuration, std::istream& input, std::string_view source);
+std::string InputProfileName(std::string_view titleId);
+bool TryLoadInputMapping(std::string_view titleId, InputConfiguration& configuration, std::string& error);
+struct InputFileStamp {
+    bool present = false;
+    std::filesystem::file_time_type modified{};
+    std::uintmax_t size = 0;
+    bool operator==(const InputFileStamp& other) const = default;
+};
+
+struct InputMappingStamp {
+    InputFileStamp shared;
+    InputFileStamp profile;
+    bool operator==(const InputMappingStamp& other) const = default;
+};
+
+InputMappingStamp InputMappingFileStamp(std::string_view titleId);
+
+class InputMappingWatch {
+public:
+    explicit InputMappingWatch(InputMappingStamp applied);
+    bool Poll(const InputMappingStamp& current);
+
+private:
+    InputMappingStamp applied;
+    InputMappingStamp candidate;
+};
+
+class InputMappingStore {
+public:
+    explicit InputMappingStore(InputConfiguration initial);
+    std::shared_ptr<const InputConfiguration> Snapshot() const;
+    std::uint64_t Generation() const;
+    void Publish(InputConfiguration configuration);
+
+private:
+    mutable std::mutex mutex;
+    std::shared_ptr<const InputConfiguration> current;
+    std::uint64_t generation = 0;
+};
+
+std::array<std::uint8_t, 2> StickWithDeadzone(std::int16_t x, std::int16_t y, int deadzonePercent);
 
 }
 

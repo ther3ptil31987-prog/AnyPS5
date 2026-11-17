@@ -1,5 +1,6 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <iomanip>
 #include <limits>
@@ -108,7 +109,34 @@ bool sameValue(const IrValue* left, const IrValue* right) {
     return false;
 }
 
-bool equivalentValueImpl(const IrResourcePlan& program, const IrValue* left, const IrValue* right, std::vector<std::pair<const IrValue*, const IrValue*>>& visited) {
+class VisitedPairs {
+public:
+    using Pair = std::pair<const IrValue*, const IrValue*>;
+
+    [[nodiscard]] bool Contains(const Pair& entry) const {
+        const std::size_t inlined = std::min(count, Inline);
+        if (std::find(items.begin(), items.begin() + inlined, entry) != items.begin() + inlined) return true;
+        return std::find(spill.begin(), spill.end(), entry) != spill.end();
+    }
+
+    void Add(const Pair& entry) {
+        if (count < Inline) {
+            items[count++] = entry;
+            return;
+        }
+        spill.push_back(entry);
+        ++count;
+    }
+
+private:
+    static constexpr std::size_t Inline = 16;
+
+    std::array<Pair, Inline> items;
+    std::vector<Pair> spill;
+    std::size_t count = 0;
+};
+
+bool equivalentValueImpl(const IrResourcePlan& program, const IrValue* left, const IrValue* right, VisitedPairs& visited) {
     if (left != nullptr) {
         left = left->Resolve();
     }
@@ -131,10 +159,10 @@ bool equivalentValueImpl(const IrResourcePlan& program, const IrValue* left, con
         return false;
     }
     const auto entry = std::make_pair(left, right);
-    if (std::find(visited.begin(), visited.end(), entry) != visited.end()) {
+    if (visited.Contains(entry)) {
         return true;
     }
-    visited.push_back(entry);
+    visited.Add(entry);
     if (isRuntimeRead(left->Opcode())) {
         const auto leftIndex = left->Flags<MemoryFlags>().index;
         const auto rightIndex = right->Flags<MemoryFlags>().index;
@@ -173,6 +201,21 @@ std::string formatHex64(std::uint64_t value) {
     return stream.str();
 }
 
+bool carriesMemoryInfo(IrOpcode opcode) {
+    return opcode == IrOpcode::ReadConstBuffer || AddressOpcodeInfoOf(opcode).access != AddressAccess::None || BufferComponentCount(opcode) != 0u || SharedComponentCount(opcode) != 0u || ImageOpcodeInfoOf(opcode).access != ImageAccess::None;
+}
+
+std::string memoryToString(const IrProgram& program, const IrValue& inst) {
+    const auto flags = inst.Flags<MemoryFlags>();
+    const auto& memoryInfo = program.Resources().memoryInfo;
+    if (flags.index >= memoryInfo.size()) {
+        return " [pc=" + formatHex32(flags.pc) + " mem=?]";
+    }
+    std::ostringstream stream;
+    stream << " [pc=" << formatHex32(flags.pc) << " off=0x" << std::hex << memoryInfo[flags.index].offset << "]";
+    return stream.str();
+}
+
 std::string valueToString(const std::map<const IrValue*, std::size_t>& ids, const IrValue* value) {
     if (value == nullptr) {
         return "<null>";
@@ -207,6 +250,61 @@ std::string valueToString(const std::map<const IrValue*, std::size_t>& ids, cons
 
 }
 
+std::size_t IrProgram::ReclaimUnusedValues() {
+    std::vector<IrValue*> owned(nextValueId, nullptr);
+    for (IrValue* value : values) owned[value->Id()] = value;
+    std::vector<bool> live(nextValueId, false);
+    std::unordered_set<IrValue*> liveElsewhere;
+    std::vector<IrValue*> pending;
+    const auto keep = [&](IrValue* value) {
+        if (value == nullptr) return;
+        if (const auto id = value->Id(); id < owned.size() && owned[id] == value) {
+            if (live[id]) return;
+            live[id] = true;
+        } else if (!liveElsewhere.insert(value).second) {
+            return;
+        }
+        pending.push_back(value);
+    };
+    const auto isLive = [&](const IrValue& value) { return live[value.Id()]; };
+    const auto keepBlocks = [&](const auto& storage) {
+        for (const auto& block : storage) {
+            for (IrValue* instruction : block->Instructions()) keep(instruction);
+            for (IrValue* value : block->ssaScalarValues) keep(value);
+            for (IrValue* value : block->ssaVectorValues) keep(value);
+            for (IrValue* value : block->ssaThreadBitScalarValues) keep(value);
+            for (IrValue* value : block->ssaScalarMaskTags) keep(value);
+        }
+    };
+    keepBlocks(blocks);
+    keepBlocks(resourcePlan.blockStorage);
+    for (auto& value : resourcePlan.valueStorage) keep(&value);
+    for (const auto& source : resourcePlan.descriptorSources) for (IrValue* word : source.dwords) keep(word);
+    for (const auto& read : resourcePlan.srtReads) keep(read.value);
+    for (const auto& block : resourcePlan.controlFlow) keep(block.condition);
+    for (IrValue* value : resourcePlan.uniformFill.values) keep(value);
+    for (const auto& block : metadata.blockInfo) { keep(block.condition); keep(block.indirectTarget); }
+    for (IrValue* value : metadata.dynamicReads) keep(value);
+    while (!pending.empty()) {
+        IrValue* value = pending.back();
+        pending.pop_back();
+        for (std::size_t index = 0; index < value->ArgumentCount(); ++index) keep(value->Argument(index));
+    }
+    for (IrValue* value : values) {
+        if (isLive(*value)) continue;
+        for (std::size_t index = 0; index < value->ArgumentCount(); ++index) value->ReplaceArgument(index, nullptr);
+    }
+    for (const IrValue* value : values) {
+        if (!isLive(*value) && value->HasUses()) throw std::runtime_error("an unused IR value has an external user");
+    }
+    return values.EraseIf([&](const IrValue& value) { return !isLive(value); });
+}
+
+void IrProgram::ReleaseUseArena() {
+    for (const auto& value : values) value->MoveUsesToHeap();
+    useArena = IrUseArena{};
+}
+
 std::vector<std::unique_ptr<IrBlock>>& IrProgram::Blocks() {
     return blocks;
 }
@@ -239,7 +337,8 @@ void IrProgram::SetWaveSize(std::uint32_t waveSize) {
 }
 
 IrBlock& IrProgram::CreateBlock() {
-    auto block = std::make_unique<IrBlock>(nextBlockId);
+    if (instructionNodes == nullptr) instructionNodes = std::make_shared<std::pmr::unsynchronized_pool_resource>();
+    auto block = std::make_unique<IrBlock>(nextBlockId, instructionNodes);
     nextBlockId++;
     IrBlock& created = *block;
     blocks.push_back(std::move(block));
@@ -247,10 +346,8 @@ IrBlock& IrProgram::CreateBlock() {
 }
 
 IrValue& IrProgram::CreateValue(IrOpcode opcode, IrType type) {
-    auto value = std::make_unique<IrValue>(opcode, type, nextValueId);
+    IrValue& created = values.Create(opcode, type, nextValueId, useArena.Resource());
     nextValueId++;
-    IrValue& created = *value;
-    values.push_back(std::move(value));
     return created;
 }
 
@@ -270,22 +367,34 @@ const IrProgramMetadata& IrProgram::Metadata() const {
     return metadata;
 }
 
-CompiledShaderInfo IrProgram::TakeCompiledInfo() && {
+namespace {
+
+CompiledShaderInfo compiledInfo(const IrResourcePlan& resourcePlan, std::uint32_t waveSize, ShaderInfo info, IrBindingLayout bindings) {
     CompiledShaderInfo result;
     result.stage = resourcePlan.stage;
     result.shaderHash = resourcePlan.shaderHash;
     result.waveSize = waveSize;
     result.userDataBase = resourcePlan.userDataBase;
     result.userDataCount = resourcePlan.userDataCount;
-    result.scratchDwords = resourcePlan.info.scratchDwords;
-    result.info = std::move(resourcePlan.info);
-    result.bindings = std::move(metadata.bindings);
+    result.scratchDwords = info.scratchDwords;
+    result.info = std::move(info);
+    result.bindings = std::move(bindings);
     for (const auto& output : result.info.outputs) {
         if (output.kind == StageOutputKind::Parameter && output.index < 32u) {
             result.paramExportMask |= 1u << output.index;
         }
     }
     return result;
+}
+
+}
+
+CompiledShaderInfo IrProgram::CompiledInfo() const& {
+    return compiledInfo(resourcePlan, waveSize, resourcePlan.info, metadata.bindings);
+}
+
+CompiledShaderInfo IrProgram::TakeCompiledInfo() && {
+    return compiledInfo(resourcePlan, waveSize, std::move(resourcePlan.info), std::move(metadata.bindings));
 }
 
 IrValue& IrProgram::CreateValue(IrOpcode opcode, IrType type, std::uint64_t flags) {
@@ -340,7 +449,11 @@ std::string ProgramToString(const IrProgram& program) {
                     text += valueToString(ids, inst->Argument(index));
                 }
             }
-            text += " (" + TypeToString(inst->Type()) + "; uses=" + std::to_string(inst->UseCount()) + ")\n";
+            text += " (" + TypeToString(inst->Type()) + "; uses=" + std::to_string(inst->UseCount()) + ")";
+            if (carriesMemoryInfo(inst->Opcode())) {
+                text += memoryToString(program, *inst);
+            }
+            text += "\n";
         }
     }
     return text;
@@ -522,11 +635,11 @@ void ValidateProgram(const IrProgram& program, bool requireSsa) {
             if (fixedSignature && inst->ArgumentCount() != IrOpcodeOperandCount(inst->Opcode())) {
                 fail(std::string(IrOpcodeName(inst->Opcode())) + " has " + std::to_string(inst->ArgumentCount()) + " arguments, expected " + std::to_string(IrOpcodeOperandCount(inst->Opcode())));
             }
+            if (carriesMemoryInfo(inst->Opcode()) && inst->Flags<MemoryFlags>().index >= program.Resources().memoryInfo.size()) {
+                fail(std::string(IrOpcodeName(inst->Opcode())) + " has an invalid memory-info index");
+            }
             if (inst->Opcode() == IrOpcode::ReadConstBuffer) {
                 const auto memoryIndex = inst->Flags<MemoryFlags>().index;
-                if (memoryIndex >= program.Resources().memoryInfo.size()) {
-                    fail(std::string(IrOpcodeName(inst->Opcode())) + " has an invalid memory-info index");
-                }
                 const auto& memory = program.Resources().memoryInfo[memoryIndex];
                 if (memory.kind != ResourceKind::ScalarBuffer) {
                     fail(std::string(IrOpcodeName(inst->Opcode())) + " has an invalid scalar-memory resource kind");
@@ -539,9 +652,6 @@ void ValidateProgram(const IrProgram& program, bool requireSsa) {
             const auto addressInfo = AddressOpcodeInfoOf(inst->Opcode());
             if (addressInfo.access != AddressAccess::None) {
                 const auto memoryIndex = inst->Flags<MemoryFlags>().index;
-                if (memoryIndex >= program.Resources().memoryInfo.size()) {
-                    fail(std::string(IrOpcodeName(inst->Opcode())) + " has an invalid memory-info index");
-                }
                 const auto& memory = program.Resources().memoryInfo[memoryIndex];
                 if (!IsAddressResourceKind(memory.kind) || (memory.kind == ResourceKind::ScalarAddress && inst->Opcode() != IrOpcode::LoadAddressU32)) {
                     fail(std::string(IrOpcodeName(inst->Opcode())) + " has an invalid address resource kind");
@@ -556,9 +666,6 @@ void ValidateProgram(const IrProgram& program, bool requireSsa) {
             const auto bufferComponents = BufferComponentCount(inst->Opcode());
             if (bufferComponents != 0u) {
                 const auto memoryIndex = inst->Flags<MemoryFlags>().index;
-                if (memoryIndex >= program.Resources().memoryInfo.size()) {
-                    fail(std::string(IrOpcodeName(inst->Opcode())) + " has an invalid memory-info index");
-                }
                 const auto& memory = program.Resources().memoryInfo[memoryIndex];
                 if (memory.kind != ResourceKind::Buffer && memory.kind != ResourceKind::ScalarBuffer) {
                     fail(std::string(IrOpcodeName(inst->Opcode())) + " has a non-buffer resource kind");
@@ -573,9 +680,6 @@ void ValidateProgram(const IrProgram& program, bool requireSsa) {
             const auto sharedComponents = SharedComponentCount(inst->Opcode());
             if (sharedComponents != 0u) {
                 const auto memoryIndex = inst->Flags<MemoryFlags>().index;
-                if (memoryIndex >= program.Resources().memoryInfo.size()) {
-                    fail(std::string(IrOpcodeName(inst->Opcode())) + " has an invalid memory-info index");
-                }
                 const auto& memory = program.Resources().memoryInfo[memoryIndex];
                 if ((memory.kind != ResourceKind::Lds && memory.kind != ResourceKind::Gds) || memory.resource != 0u || memory.sampler != 0u || memory.componentCount == 0u || memory.componentIndex >= memory.componentCount) {
                     fail(std::string(IrOpcodeName(inst->Opcode())) + " has invalid shared-memory metadata");
@@ -593,9 +697,6 @@ void ValidateProgram(const IrProgram& program, bool requireSsa) {
             const auto imageInfo = ImageOpcodeInfoOf(inst->Opcode());
             if (imageInfo.access != ImageAccess::None) {
                 const auto memoryIndex = inst->Flags<MemoryFlags>().index;
-                if (memoryIndex >= program.Resources().memoryInfo.size()) {
-                    fail(std::string(IrOpcodeName(inst->Opcode())) + " has an invalid memory-info index");
-                }
                 const auto& memory = program.Resources().memoryInfo[memoryIndex];
                 if (memory.kind != ResourceKind::Image || imageInfo.resourceClass == ImageResourceClass::None) {
                     fail(std::string(IrOpcodeName(inst->Opcode())) + " has invalid image-memory metadata");
@@ -670,30 +771,91 @@ void ValidateProgram(const IrProgram& program, bool requireSsa) {
         fail("value IR contains an unreachable block");
     }
 
-    std::vector<std::vector<bool>> dominators(blockOrder.size(), std::vector<bool>(blockOrder.size(), true));
-    dominators.front().assign(blockOrder.size(), false);
-    dominators.front().front() = true;
-    bool changed = true;
-    while (changed) {
+    const auto blockCount = blockOrder.size();
+    std::vector<std::size_t> postNumber(blockCount, 0);
+    std::vector<std::size_t> reversePostOrder;
+    reversePostOrder.reserve(blockCount);
+    {
+        std::vector<bool> visited(blockCount, false);
+        std::vector<std::pair<std::size_t, std::size_t>> walk{{0u, 0u}};
+        visited.front() = true;
+        while (!walk.empty()) {
+            const auto [blockIndex, next] = walk.back();
+            const auto& successors = blockOrder[blockIndex]->Successors();
+            if (next < successors.size()) {
+                ++walk.back().second;
+                const auto successor = blockIndices.at(successors[next]);
+                if (!visited[successor]) {
+                    visited[successor] = true;
+                    walk.push_back({successor, 0u});
+                }
+                continue;
+            }
+            postNumber[blockIndex] = reversePostOrder.size();
+            reversePostOrder.push_back(blockIndex);
+            walk.pop_back();
+        }
+        std::reverse(reversePostOrder.begin(), reversePostOrder.end());
+    }
+    constexpr std::size_t noDominator = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> immediateDominator(blockCount, noDominator);
+    immediateDominator.front() = 0u;
+    const auto intersect = [&](std::size_t left, std::size_t right) {
+        while (left != right) {
+            while (postNumber[left] < postNumber[right]) left = immediateDominator[left];
+            while (postNumber[right] < postNumber[left]) right = immediateDominator[right];
+        }
+        return left;
+    };
+    for (bool changed = true; changed;) {
         changed = false;
-        for (std::size_t blockIndex = 1; blockIndex < blockOrder.size(); blockIndex++) {
-            std::vector<bool> next(blockOrder.size(), true);
+        for (const auto blockIndex : reversePostOrder) {
+            if (blockIndex == 0u) {
+                continue;
+            }
+            std::size_t candidate = noDominator;
             for (const auto* predecessor : blockOrder[blockIndex]->Predecessors()) {
                 const auto predecessorIndex = blockIndices.at(predecessor);
-                for (std::size_t candidate = 0; candidate < next.size(); candidate++) {
-                    next[candidate] = next[candidate] && dominators[predecessorIndex][candidate];
+                if (immediateDominator[predecessorIndex] == noDominator) {
+                    continue;
                 }
+                candidate = candidate == noDominator ? predecessorIndex : intersect(predecessorIndex, candidate);
             }
-            next[blockIndex] = true;
-            if (next != dominators[blockIndex]) {
-                dominators[blockIndex] = std::move(next);
+            if (candidate != immediateDominator[blockIndex]) {
+                immediateDominator[blockIndex] = candidate;
                 changed = true;
             }
         }
     }
 
+    std::vector<std::vector<std::size_t>> dominatedChildren(blockCount);
+    for (std::size_t blockIndex = 1; blockIndex < blockCount; blockIndex++) {
+        dominatedChildren[immediateDominator[blockIndex]].push_back(blockIndex);
+    }
+    std::vector<std::size_t> enterNumber(blockCount, 0);
+    std::vector<std::size_t> leaveNumber(blockCount, 0);
+    {
+        std::size_t clock = 0;
+        std::vector<std::pair<std::size_t, std::size_t>> walk{{0u, 0u}};
+        enterNumber.front() = clock++;
+        while (!walk.empty()) {
+            const auto [blockIndex, next] = walk.back();
+            if (next < dominatedChildren[blockIndex].size()) {
+                ++walk.back().second;
+                const auto child = dominatedChildren[blockIndex][next];
+                enterNumber[child] = clock++;
+                walk.push_back({child, 0u});
+                continue;
+            }
+            leaveNumber[blockIndex] = clock++;
+            walk.pop_back();
+        }
+    }
+
     const auto dominates = [&](const IrBlock* definition, const IrBlock* use) {
-        return dominators[blockIndices.at(use)][blockIndices.at(definition)];
+        const auto definitionIndex = blockIndices.at(definition);
+        const auto useIndex = blockIndices.at(use);
+        return enterNumber[definitionIndex] <= enterNumber[useIndex] && leaveNumber[useIndex] <= leaveNumber[definitionIndex];
     };
     const auto controlDominates = [&](IrValue* value, const IrBlock* use) {
         return value == nullptr || value->Parent() == nullptr || value->Parent() == use || dominates(value->Parent(), use);
@@ -743,7 +905,7 @@ void ResolveControlFlowIdentities(IrProgram& program) {
 }
 
 bool EquivalentValue(const IrResourcePlan& program, const IrValue* left, const IrValue* right) {
-    std::vector<std::pair<const IrValue*, const IrValue*>> visited;
+    VisitedPairs visited;
     return equivalentValueImpl(program, left, right, visited);
 }
 
@@ -827,7 +989,7 @@ PositionExportComponent DecodePositionExportComponent(std::uint32_t control, std
 
 std::uint32_t NativeBinding(IrShaderStage stage, DescriptorBindingKind kind) {
     const std::uint32_t group = stage == IrShaderStage::Pixel ? 1u : stage == IrShaderStage::TessellationControl ? 2u : stage == IrShaderStage::TessellationEvaluation ? 3u : 0u;
-    return static_cast<std::uint32_t>(kind) + group * static_cast<std::uint32_t>(DescriptorBindingKind::Count);
+    return RuntimeAbi::BindingNumber(static_cast<RuntimeAbi::Stage>(group), kind);
 }
 
 ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
@@ -850,17 +1012,15 @@ DescriptorBindingKind DescriptorBindingForImage(const ImageResource& image) {
     constexpr std::uint32_t sampledUintBinding = 8u;
     constexpr std::uint32_t sampledSintBinding = 15u;
     constexpr std::uint32_t storageFloatBinding = FirstStorageImageBinding;
-    constexpr std::uint32_t storageUintBinding = storageFloatBinding + 5u;
-    constexpr std::uint32_t atomicUintBinding = storageUintBinding + 5u;
-    constexpr std::uint32_t atomic64UintBinding = atomicUintBinding + 5u;
+    constexpr std::uint32_t storageUintBinding = storageFloatBinding + 7u;
+    constexpr std::uint32_t atomicUintBinding = storageUintBinding + 7u;
+    constexpr std::uint32_t atomic64UintBinding = atomicUintBinding + 7u;
 
     std::uint32_t base = 0u;
-    bool sampled = false;
     if (image.resourceClass == ImageResourceClass::Sampled) {
         if (image.atomic) {
             fail("DescriptorBindingForImage sampled image cannot be atomic");
         }
-        sampled = true;
         switch (image.numericClass) {
             case IrTextureNumericClass::Float:
                 base = image.depthCompare ? FirstComparisonImageBinding : sampledFloatBinding;
@@ -916,19 +1076,13 @@ DescriptorBindingKind DescriptorBindingForImage(const ImageResource& image) {
             dimension = 3u;
             break;
         case RdnaImageDimension::Dim2DMsaa:
-            if (!sampled) {
-                fail("DescriptorBindingForImage storage image cannot be multisampled");
-            }
             dimension = 4u;
             break;
         case RdnaImageDimension::Dim2DMsaaArray:
-            if (!sampled) {
-                fail("DescriptorBindingForImage storage image cannot be multisampled");
-            }
             dimension = 5u;
             break;
         case RdnaImageDimension::Dim3D:
-            dimension = sampled ? 6u : 4u;
+            dimension = 6u;
             break;
         case RdnaImageDimension::Unknown:
         default:

@@ -1,7 +1,11 @@
+#include "prx/libSceFont/include/Api.hpp"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cerrno>
+#include "prx/libc/include/General.hpp"
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -15,6 +19,7 @@
 #include <vector>
 
 #include "prx/libSceFont/include/FontInternal.hpp"
+#include "prx/libc/include/FilesystemError.hpp"
 
 namespace {
 
@@ -80,7 +85,8 @@ void InitializeOpenedHandle(FontHandleNative* font, FontLibNative* library, Font
     driver->metric(obj, 0xEA00, metric);
     font->metricB = metric[0];
     float scale = 0.0f;
-    driver->scale(obj, metric, &scale);
+    std::uint32_t resolution = 0;
+    driver->scale(obj, &resolution, &scale);
     font->style = {};
     font->style.dpi_x = 0x48;
     font->style.dpi_y = 0x48;
@@ -106,7 +112,7 @@ std::uint32_t ClaimEntry(FontCtxHeader* header, const OpenRequest& request) {
         std::uint32_t firstFree = 0xFFFFFFFFu;
         for (std::uint32_t i = 0; i < header->max_entries; ++i) {
             const auto& entry = entries[i];
-            if ((entry.active != 0 && entry.unique_id == uniqueId) || (request.matchAddress && entry.font_address == address)) {
+            if (entry.active != 0 && (entry.unique_id == uniqueId || (request.matchAddress && entry.font_address == address))) {
                 entryIndex = i;
                 break;
             }
@@ -226,6 +232,13 @@ std::shared_ptr<const std::vector<unsigned char>> SystemFontBytes(const std::fil
     return bytes;
 }
 
+void WarnMissingSystemFont(std::uint32_t fontSetType) {
+    static std::once_flag warned;
+    std::call_once(warned, [&] {
+        std::fprintf(stderr, "[libSceFont] no file for system font set 0x%08X in %s. Titles that lay out text in system fonts can fail far from here without them: put the console's fonts or the Noto substitutes from docs/user/USAGE.md there, or set ANYPS5_SYSTEM_FONTS to their directory.\n", fontSetType, SystemFontDirectory().string().c_str());
+    });
+}
+
 void CopyStyleToCache(FontHandleNative* font) {
     std::memcpy(&font->cached_style.state, &font->style, sizeof(StyleStateBlock));
 }
@@ -280,7 +293,11 @@ int APS5_VABI sceFontOpenFontFile(FontLibrary library, const char* path, std::ui
         return SCE_FONT_ERROR_INVALID_LIBRARY;
     }
     if (!pFontHandle) return SCE_FONT_ERROR_INVALID_PARAMETER;
-    const std::filesystem::path hostPath = path ? ResolvePath_nid_no_patch(path) : std::filesystem::path{};
+    std::filesystem::path hostPath;
+    if (path && ResolvePathError_nid_no_patch(path, hostPath) != 0) {
+        *pFontHandle = nullptr;
+        return SCE_FONT_ERROR_FS_OPEN_FAILED;
+    }
     const std::string hostPathString = hostPath.string();
     std::uint32_t libraryLock = 0;
     const int beginRc = BeginOpen(library, pFontHandle, libraryLock);
@@ -384,9 +401,8 @@ int APS5_VABI sceFontOpenFontInstance(FontHandle fontHandle, FontHandle setupFon
     ReleaseFontLock(source, sourceLock);
     FontState& targetState = ResetState(target);
     if (FontState* sourceState = TryGetState(fontHandle)) {
-        targetState.scaleW = sourceState->scaleW;
-        targetState.scaleH = sourceState->scaleH;
         if (sourceState->faceData && !sourceState->faceData->empty()) LoadStateFace(targetState, sourceState->faceData, subFontIndex);
+        for (const FallbackFace& fallback : sourceState->fallbacks) AddStateFallbackFace(targetState, fallback.data, fallback.subFontIndex);
     }
     if (pFontHandle) *pFontHandle = target;
     return SCE_FONT_OK;
@@ -402,6 +418,7 @@ int APS5_VABI sceFontOpenFontSet(FontLibrary library, std::uint32_t fontSetType,
     if (!pFontHandle) return SCE_FONT_ERROR_INVALID_PARAMETER;
     const std::optional<SystemFontFile> file = FindSystemFontFile(fontSetType);
     APS5_LOG_OUT("fontSetType=0x%08X file=%s", fontSetType, file ? file->path.string().c_str() : "(none)");
+    if (!file && IsSystemFontSet(fontSetType)) WarnMissingSystemFont(fontSetType);
     std::uint32_t libraryLock = 0;
     if (!AcquireLibraryLock(lib, libraryLock)) {
         *pFontHandle = nullptr;
@@ -427,8 +444,13 @@ int APS5_VABI sceFontOpenFontSet(FontLibrary library, std::uint32_t fontSetType,
         if (openRc == SCE_FONT_ERROR_FS_OPEN_FAILED || openRc == SCE_FONT_ERROR_NO_SUPPORT_FORMAT) return SCE_FONT_ERROR_FONT_OPEN_FAILED;
         if (openRc != SCE_FONT_OK) return openRc;
         GetNativeFont(*pFontHandle)->open_info.fontset_flags = fontSetType;
+        const std::vector<SystemFontFile> fallbackFiles = FindSystemFontFallbackFiles(fontSetType);
+        for (const SystemFontFile& fallback : fallbackFiles) APS5_LOG_OUT("fontSetType=0x%08X fallback=%s", fontSetType, fallback.path.string().c_str());
         FontState& state = ResetState(*pFontHandle);
         if (auto bytes = SystemFontBytes(file->path)) LoadStateFace(state, std::move(bytes), file->subFontIndex);
+        for (const SystemFontFile& fallback : fallbackFiles) {
+            if (auto bytes = SystemFontBytes(fallback.path)) AddStateFallbackFace(state, std::move(bytes), fallback.subFontIndex);
+        }
         return SCE_FONT_OK;
     }
     ReleaseLibraryLock(lib, libraryLock);
@@ -464,38 +486,68 @@ int APS5_VABI sceFontGetLibrary(FontHandle fontHandle, FontLibrary* pLibrary) {
     if (!pLibrary) return SCE_FONT_ERROR_INVALID_PARAMETER;
     const auto* font = GetNativeFont(fontHandle);
     if (!font || font->magic != HANDLE_MAGIC) {
-        *pLibrary = nullptr;
+        if (!CopyOutGuest(pLibrary, FontLibrary{})) return SCE_FONT_ERROR_INVALID_PARAMETER;
         return SCE_FONT_ERROR_INVALID_FONT_HANDLE;
     }
-    *pLibrary = font->library;
+    if (!CopyOutGuest(pLibrary, font->library)) return SCE_FONT_ERROR_INVALID_PARAMETER;
     return SCE_FONT_OK;
 }
 
 int APS5_VABI sceFontGetFontGlyphsCount(FontHandle fontHandle, std::uint32_t* glyphsCount) {
-    if (!glyphsCount) return SCE_FONT_ERROR_INVALID_PARAMETER;
-    *glyphsCount = 0;
+    const auto* font = GetNativeFont(fontHandle);
+    if (!font || font->magic != HANDLE_MAGIC) {
+        if (glyphsCount) CopyOutGuest(glyphsCount, std::uint32_t{0});
+        return SCE_FONT_ERROR_INVALID_FONT_HANDLE;
+    }
+    if (!glyphsCount || !CopyOutGuest(glyphsCount, std::uint32_t{0})) return SCE_FONT_ERROR_INVALID_PARAMETER;
+    std::uint32_t count = 0;
     const int rc = CallOpenFontObject(fontHandle, [&](const SysDriver& driver, FontObj* obj) {
         if (!driver.glyphs_count) return SCE_FONT_ERROR_FATAL;
-        return driver.glyphs_count(obj, glyphsCount);
+        return driver.glyphs_count(obj, &count);
     });
-    if (rc != SCE_FONT_OK) *glyphsCount = 0;
+    if (rc != SCE_FONT_OK) count = 0;
+    if (!CopyOutGuest(glyphsCount, count)) return SCE_FONT_ERROR_INVALID_PARAMETER;
     return rc;
 }
 
 int APS5_VABI sceFontGetCharGlyphCode(FontHandle fontHandle, std::uint32_t code, std::uint32_t* glyphCode) {
+    if (glyphCode) {
+        const std::uint32_t zero = 0;
+        const int savedErrno = errno;
+        const bool zeroed = GuestCopyOut_nid_no_patch(glyphCode, &zero, sizeof(zero));
+        errno = savedErrno;
+        if (!zeroed) return SCE_FONT_ERROR_INVALID_PARAMETER;
+    }
+    const auto* font = GetNativeFont(fontHandle);
+    if (!font || font->magic != HANDLE_MAGIC) return SCE_FONT_ERROR_INVALID_FONT_HANDLE;
+    if (code == 0) return SCE_FONT_ERROR_NO_SUPPORT_CODE;
     if (!glyphCode) return SCE_FONT_ERROR_INVALID_PARAMETER;
-    *glyphCode = 0;
+    if ((code & 0x80000000u) != 0 && (code & 0x3fff0000u) != 0) return SCE_FONT_ERROR_NO_SUPPORT_CODE;
+    std::uint32_t index = 0;
     const int rc = CallOpenFontObject(fontHandle, [&](const SysDriver& driver, FontObj* obj) {
+        if ((code & 0x80000000u) != 0) {
+            if (!driver.glyphs_count) return SCE_FONT_ERROR_FATAL;
+            std::uint32_t count = 0;
+            const int result = driver.glyphs_count(obj, &count);
+            if (result != SCE_FONT_OK) return result;
+            index = code & 0x3fffffffu;
+            return index < count ? SCE_FONT_OK : SCE_FONT_ERROR_NO_SUPPORT_GLYPH;
+        }
         if (!driver.glyph_index) return SCE_FONT_ERROR_FATAL;
-        if (code == 0) return SCE_FONT_ERROR_NO_SUPPORT_CODE;
-        return driver.glyph_index(obj, code, glyphCode);
+        return driver.glyph_index(obj, code, &index);
     });
-    if (rc != SCE_FONT_OK) *glyphCode = 0;
+    if (rc == SCE_FONT_OK) {
+        const std::uint32_t outGlyph = index | 0x80000000u;
+        const int savedErrno = errno;
+        const bool copied = GuestCopyOut_nid_no_patch(glyphCode, &outGlyph, sizeof(outGlyph));
+        errno = savedErrno;
+        if (!copied) return SCE_FONT_ERROR_INVALID_PARAMETER;
+    }
     return rc;
 }
 
 int APS5_VABI sceFontGetFontResolution(FontHandle fontHandle, std::uint32_t* pResolution, float* pScalePixel) {
-    std::uint16_t unitsPerEm = 0;
+    std::uint32_t unitsPerEm = 0;
     float scalePixel = 0.0f;
     const int rc = CallOpenFontObject(fontHandle, [&](const SysDriver& driver, FontObj* obj) {
         if (!pResolution && !pScalePixel) return SCE_FONT_ERROR_INVALID_PARAMETER;
@@ -503,12 +555,13 @@ int APS5_VABI sceFontGetFontResolution(FontHandle fontHandle, std::uint32_t* pRe
         return driver.scale(obj, &unitsPerEm, &scalePixel);
     });
     if (rc != SCE_FONT_OK) {
-        unitsPerEm = 0;
-        scalePixel = 0.0f;
+        if (pResolution) CopyOutGuest(pResolution, std::uint32_t{0});
+        if (pScalePixel) CopyOutGuest(pScalePixel, 0.0f);
+        return rc;
     }
-    if (pResolution) *pResolution = unitsPerEm;
-    if (pScalePixel) *pScalePixel = scalePixel;
-    return rc;
+    if (pResolution && !CopyOutGuest(pResolution, unitsPerEm)) return SCE_FONT_ERROR_INVALID_PARAMETER;
+    if (pScalePixel && !CopyOutGuest(pScalePixel, scalePixel)) return SCE_FONT_ERROR_INVALID_PARAMETER;
+    return SCE_FONT_OK;
 }
 
 int APS5_VABI sceFontBindRenderer(FontHandle fontHandle, FontRenderer renderer) {

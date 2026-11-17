@@ -1,3 +1,5 @@
+#include "prx/libSceAgc/Patch/include/Branch.hpp"
+#include "prx/libSceAgc/Cb/include/Branch.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 
 #include <algorithm>
@@ -6,14 +8,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
-
-extern "C" {
-std::uint32_t* APS5_VABI sceAgcCbBranch(CommandBuffer*, std::uint8_t, std::uint8_t, const volatile std::uint64_t*, std::uint64_t, std::uint64_t, std::uint8_t, const volatile std::uint32_t*, std::uint32_t, std::uint8_t, const volatile std::uint32_t*, std::uint32_t);
-std::uint32_t APS5_VABI sceAgcCbBranchGetSize();
-int APS5_VABI sceAgcBranchPatchSetCompareAddress(std::uint32_t*, const volatile std::uint64_t*);
-int APS5_VABI sceAgcBranchPatchSetThenTarget(std::uint32_t*, const volatile std::uint32_t*, std::uint32_t);
-int APS5_VABI sceAgcBranchPatchSetElseTarget(std::uint32_t*, const volatile std::uint32_t*, std::uint32_t);
-}
 
 namespace {
 
@@ -58,6 +52,21 @@ void testWriter() {
     check(storage.packet[expected.size()] == 0xabcdef01u, "branch command overwrote following word");
 }
 
+void testUnusedFields() {
+    std::array<std::uint32_t, 64> words{};
+    CommandBuffer buffer{words.data(), words.data() + words.size(), words.data(), words.data() + words.size(), nullptr, nullptr, 0};
+    auto* packet = sceAgcCbBranch(&buffer, 1, 0, compareAt(0x0000001234567894ull), 0, 0, 0, targetAt(0x0000002233445564ull), 0x123u, 0, nullptr, 0);
+    const std::array expected{0xc00c3f00u, 0x1u, 0x34567894u, 0x12u, 0u, 0u, 0u, 0u, 0x33445564u, 0x22u, 0x123u, 0u, 0u, 0u};
+    check(std::equal(expected.begin(), expected.end(), packet), "an always-taken branch without an else target was not written");
+    packet = sceAgcCbBranch(&buffer, 1, 0, nullptr, 0, 0, 0, nullptr, 0, 0, nullptr, 0);
+    check(packet[1] == 1u && packet[2] == 0u && packet[8] == 0u && packet[10] == 0u, "an empty always-taken branch was not written");
+    const auto cursor = buffer.cursor_up;
+    expectFailure([&] { sceAgcCbBranch(&buffer, 1, 3, compareAt(0x0000001234567894ull), 0, 0, 0, targetAt(0x2000u), 1, 0, nullptr, 0); });
+    expectFailure([&] { sceAgcCbBranch(&buffer, 1, 0, nullptr, 0, 0, 0, nullptr, 1, 0, nullptr, 0); });
+    expectFailure([&] { sceAgcCbBranch(&buffer, 2, 0, nullptr, 0, 0, 0, targetAt(0x2000u), 1, 0, nullptr, 1); });
+    check(buffer.cursor_up == cursor, "a rejected branch advanced the command buffer");
+}
+
 void testCompareAddress() {
     Storage storage;
     auto expected = storage.words;
@@ -92,6 +101,31 @@ void testTarget(TSetter setter, std::size_t field, std::uint32_t cachePolicyBits
     check(storage.words == expected, name);
 }
 
+template <typename TSetter>
+void testTargetWithCachePolicy(TSetter setter, std::size_t field, const char* name) {
+    Storage storage;
+    auto expected = storage.words;
+    expected[field] = 0x89abcdecu;
+    expected[field + 1] = 0x4567u;
+    expected[field + 2] = 0x30000004u;
+    check(setter(storage.packet, 3, targetAt(0x0000456789abcdecull), 4) == 0, name);
+    check(storage.words == expected, name);
+    expected[field] = 0x1000u;
+    expected[field + 1] = 0;
+    expected[field + 2] = 0xfffffu;
+    check(setter(storage.packet, 0, targetAt(0x1000u), 0xfffffu) == 0, name);
+    check(storage.words == expected, name);
+    expectFailure([&] { setter(storage.packet, 4, targetAt(0x2000u), 1); });
+    expectFailure([&] { setter(storage.packet, 1, nullptr, 1); });
+    expectFailure([&] { setter(storage.packet, 1, targetAt(0x1002u), 1); });
+    expectFailure([&] { setter(storage.packet, 1, targetAt(0x2000u), 0x100000u); });
+    expectFailure([&] { setter(nullptr, 1, targetAt(0x2000u), 1); });
+    storage.packet[0] = 0xc00b3f00u;
+    expected[0] = 0xc00b3f00u;
+    expectFailure([&] { setter(storage.packet, 1, targetAt(0x2000u), 1); });
+    check(storage.words == expected, name);
+}
+
 void testMalformedPackets() {
     for (const auto header : {0xc0023f00u, 0xc00b3f00u, 0xc00c3f01u, 0xc00c2200u}) {
         Storage storage;
@@ -109,9 +143,12 @@ void testMalformedPackets() {
 int main() {
     try {
         testWriter();
+        testUnusedFields();
         testCompareAddress();
         testTarget(sceAgcBranchPatchSetThenTarget, 8, 0x10000000u, "then target setter wrote the wrong words");
         testTarget(sceAgcBranchPatchSetElseTarget, 11, 0x20000000u, "else target setter wrote the wrong words");
+        testTargetWithCachePolicy(sceAgcBranchPatchSetThenTarget_0300, 8, "3.00 then target setter wrote the wrong words");
+        testTargetWithCachePolicy(sceAgcBranchPatchSetElseTarget_0300, 11, "3.00 else target setter wrote the wrong words");
         testMalformedPackets();
         std::puts("AGC branch patch tests passed");
         return 0;

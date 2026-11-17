@@ -1,5 +1,7 @@
+#include "prx/libc/include/Api.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <cstdint>
 #include <iterator>
 #include <cstdlib>
 #include <stdexcept>
@@ -8,13 +10,17 @@
 #include <mutex>
 #include <vector>
 #include <utility>
-#include <random>
 #include <string>
 #include <cinttypes>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/SonyCrt.hpp"
 #include "prx/libc/include/specifics/gcc/AtomicOps.hpp"
 #include "prx/libc/include/FileStream.hpp"
+#include "prx/libc/include/HostEntropy.hpp"
 
 namespace {
 
@@ -30,6 +36,20 @@ std::mutex g_exitMutex;
 std::vector<ExitDestructor> g_exitDestructors;
 bool g_exitRunnerRegistered = false;
 
+#ifdef _WIN32
+struct UcrtStream {
+    char* pointer;
+    char* base;
+    int count;
+    long flags;
+    long file;
+    int charBuffer;
+    int bufferSize;
+    char* temporaryName;
+    CRITICAL_SECTION lock;
+};
+#endif
+
 }
 
 extern "C" {
@@ -37,6 +57,15 @@ extern "C" {
 FileStream _Stderr_nid_postfix{stderr};
 FileStream _Stdout_nid_postfix{stdout};
 FileStream _Stdin_nid_postfix{stdin};
+
+std::FILE* GuestStandardOutputFile_nid_no_patch() {
+    return GetNativeStream(&_Stdout_nid_postfix);
+}
+
+std::FILE* GuestStandardOutputForWriting_nid_no_patch() {
+    auto* native = GetNativeStream(&_Stdout_nid_postfix);
+    return _Stdout_nid_postfix.SwitchToWriting() ? native : nullptr;
+}
 
 int APS5_VABI __cxa_atexit_nid_postfix(void (APS5_VABI *func)(void*), void* arg, void* dsoHandle) {
     std::lock_guard lock(g_exitMutex);
@@ -72,6 +101,15 @@ void APS5_VABI cxa_finalize_nid_postfix(void* dsoHandle) {
     CxaFinalize_nid_no_patch(dsoHandle);
 }
 
+void APS5_VABI _Vacopy_nid_postfix(unsigned char* destination, const unsigned char* source) {
+    std::uint64_t overflowArea;
+    std::memcpy(&overflowArea, source + 16, sizeof(overflowArea));
+    std::memcpy(destination + 16, &overflowArea, sizeof(overflowArea));
+    unsigned char offsets[16];
+    std::memcpy(offsets, source, sizeof(offsets));
+    std::memcpy(destination, offsets, sizeof(offsets));
+}
+
 unsigned int APS5_VABI _Atomic_fetch_add_4_nid_postfix(volatile unsigned int* target, unsigned int value, int memoryOrder) {
     (void)memoryOrder;
     return GccAtomicFetchAdd(target, value);
@@ -94,44 +132,90 @@ unsigned int APS5_VABI _Atomic_load_4_nid_postfix(volatile unsigned int* target,
 }
 
 std::intmax_t APS5_VABI strtoimax_nid_postfix(const char* str, char** endptr, int base) {
-    return std::strtoimax(str, endptr, base);
+    if (RejectIntegerBase_nid_no_patch(str, endptr, base, false) || StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
+    return ParseInteger<std::intmax_t>(str, endptr, base, std::strtoimax);
 }
 
 std::uintmax_t APS5_VABI strtoumax_nid_postfix(const char* str, char** endptr, int base) {
-    return std::strtoumax(str, endptr, base);
+    if (RejectIntegerBase_nid_no_patch(str, endptr, base, false) || StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
+    return ParseInteger<std::uintmax_t>(str, endptr, base, std::strtoumax);
 }
 
 unsigned int APS5_VABI _ZSt14_Random_devicev_nid_postfix() {
-    static std::random_device device;
-    static std::mutex mutex;
-    std::lock_guard lock(mutex);
-    return device();
+    unsigned int value = 0;
+    HostEntropy_nid_no_patch(&value, sizeof(value));
+    return value;
 }
 
-[[noreturn]] void APS5_VABI _ZSt14_Throw_C_errori_nid_postfix(int code) {
-    throw std::runtime_error("_Throw_C_error: C11 thread error " + std::to_string(code));
+static constexpr int ThrdNomem = 1;
+static constexpr int ThrdTimedout = 2;
+static constexpr int ThrdBusy = 3;
+static constexpr int ThrdError = 4;
+static constexpr int ThrdPermission = 5;
+
+static constexpr int CppDeviceOrResourceBusy = 0;
+static constexpr int CppInvalidArgument = 1;
+static constexpr int CppOperationNotPermitted = 4;
+static constexpr int CppResourceUnavailableTryAgain = 6;
+
+[[noreturn]] void ThrowCppError_nid_no_patch(int code);
+
+void APS5_VABI _ZSt14_Throw_C_errori_nid_postfix(int code) {
+    switch (code) {
+    case ThrdNomem:
+    case ThrdTimedout:
+        ThrowCppError_nid_no_patch(CppResourceUnavailableTryAgain);
+    case ThrdBusy:
+        ThrowCppError_nid_no_patch(CppDeviceOrResourceBusy);
+    case ThrdError:
+        ThrowCppError_nid_no_patch(CppInvalidArgument);
+    case ThrdPermission:
+        ThrowCppError_nid_no_patch(CppOperationNotPermitted);
+    default:
+        return;
+    }
 }
 
 void APS5_VABI _Lockfilelock_nid_postfix(FileStream* stream) {
     if (stream == nullptr) throw std::invalid_argument("_Lockfilelock: null stream");
 #ifdef _WIN32
-    _lock_file(GetNativeStream(stream));
+    _lock_file(GetStreamHandle(stream));
 #else
-    flockfile(GetNativeStream(stream));
+    flockfile(GetStreamHandle(stream));
 #endif
 }
 
 void APS5_VABI _Unlockfilelock_nid_postfix(FileStream* stream) {
     if (stream == nullptr) throw std::invalid_argument("_Unlockfilelock: null stream");
 #ifdef _WIN32
-    _unlock_file(GetNativeStream(stream));
+    _unlock_file(GetStreamHandle(stream));
 #else
-    funlockfile(GetNativeStream(stream));
+    funlockfile(GetStreamHandle(stream));
 #endif
 }
 
-unsigned long APS5_VABI _Stoul_nid_postfix(const char* str, char** endptr, int base) {
-    return std::strtoul(str, endptr, base);
+void APS5_VABI flockfile_nid_postfix(FileStream* stream) {
+    _Lockfilelock_nid_postfix(stream);
+
+}
+
+void APS5_VABI funlockfile_nid_postfix(FileStream* stream) {
+    _Unlockfilelock_nid_postfix(stream);
+
+}
+
+int APS5_VABI ftrylockfile_nid_postfix(FileStream* stream) {
+    if (stream == nullptr) throw std::invalid_argument("ftrylockfile: null stream");
+#ifdef _WIN32
+    return TryEnterCriticalSection(&reinterpret_cast<UcrtStream*>(GetStreamHandle(stream))->lock) ? 0 : -1;
+#else
+    return ftrylockfile(GetStreamHandle(stream)) == 0 ? 0 : -1;
+#endif
+}
+
+std::uint64_t APS5_VABI _Stoul_nid_postfix(const char* str, char** endptr, int base) {
+    if (RejectIntegerBase_nid_no_patch(str, endptr, base, false) || StopAtPrefixLetter_nid_no_patch(str, endptr, base)) return 0;
+    return ParseInteger<unsigned long long>(str, endptr, base, std::strtoull);
 }
 
 void APS5_VABI _Locksyslock_nid_postfix() {
@@ -140,6 +224,70 @@ void APS5_VABI _Locksyslock_nid_postfix() {
 
 void APS5_VABI _Unlocksyslock_nid_postfix() {
     g_sysLock.unlock();
+}
+
+__int128 APS5_VABI __divti3_nid_postfix(__int128 dividend, __int128 divisor) {
+    return SonyDivti3(dividend, divisor);
+}
+
+unsigned __int128 APS5_VABI __udivti3_nid_postfix(unsigned __int128 dividend, unsigned __int128 divisor) {
+    return SonyUdivti3(dividend, divisor);
+}
+
+unsigned __int128 APS5_VABI __umodti3_nid_postfix(unsigned __int128 dividend, unsigned __int128 divisor) {
+    return SonyUmodti3(dividend, divisor);
+}
+
+__int128 APS5_VABI __modti3_nid_postfix(__int128 dividend, __int128 divisor) {
+    return SonyModti3(dividend, divisor);
+}
+
+namespace {
+
+struct CrtSetupTable {
+    std::uint64_t size;
+    std::uintptr_t unknown;
+    std::uintptr_t primary[8];
+    std::uintptr_t extended[4];
+    std::uintptr_t trailing[10];
+};
+
+std::uintptr_t g_crtPrimarySlots[8] {};
+std::uintptr_t g_crtExtendedSlots[4] {};
+std::uintptr_t g_crtTrailingSlots[10] {};
+
+bool SlotGroupIsUniform(const std::uintptr_t* slots, std::size_t count) {
+    std::size_t filled = 0;
+    for (std::size_t index = 0; index < count; ++index) filled += slots[index] == 0 ? 0 : 1;
+    return filled == 0 || filled == count;
+}
+
+void CopySlots(const std::uintptr_t* source, std::uintptr_t* destination, std::size_t count) {
+    for (std::size_t index = 0; index < count; ++index) destination[index] = source[index];
+}
+
+}
+
+int APS5_VABI _new_setup_nid_postfix(const void* table) {
+    constexpr std::uint64_t primaryTableBytes = 0x50;
+    constexpr std::uint64_t extendedTableBytes = 0x70;
+    constexpr std::uint64_t trailingTableBytes = 0xc0;
+    if (table == nullptr) return 0;
+    const auto* setup = static_cast<const CrtSetupTable*>(table);
+    if (setup->size < primaryTableBytes) return 1;
+    if (!SlotGroupIsUniform(setup->primary, 8)) return 1;
+    const bool primaryPresent = setup->primary[0] != 0;
+    if (primaryPresent) CopySlots(setup->primary, g_crtPrimarySlots, 8);
+    if (setup->size < extendedTableBytes) return 0;
+    if (primaryPresent) {
+        for (std::size_t index = 0; index < 4; ++index) {
+            if (setup->extended[index] != 0) g_crtExtendedSlots[index] = setup->extended[index];
+        }
+    }
+    if (setup->size < trailingTableBytes) return 0;
+    if (!SlotGroupIsUniform(setup->trailing, 10)) return 1;
+    if (setup->trailing[0] != 0) CopySlots(setup->trailing, g_crtTrailingSlots, 10);
+    return 0;
 }
 
 }

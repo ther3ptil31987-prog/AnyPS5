@@ -5,15 +5,31 @@
 #include <elfpatcher/windows/WindowsPeWriter.hpp>
 #include <elfpatcher/windows/WindowsImportBuilder.hpp>
 #include <io/BufferUtils.hpp>
+#include <cerrno>
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 
 namespace {
 
 namespace Fs = std::filesystem;
 using namespace Elfpatcher::Windows;
+
+Fs::path createFixtureDirectory(const Fs::path& parent) {
+    std::random_device random;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        auto name = Fs::path(u8"windows-diagnostic-fixtures-ü日-");
+        name += std::to_string(GetCurrentProcessId()) + "-" + std::to_string(random());
+        const auto directory = parent / name;
+        if (Fs::create_directory(directory))
+            return directory;
+    }
+    throw std::runtime_error("Cannot create a unique diagnostic fixture directory");
+}
 
 void checkRuntimeDependencies() {
     const auto check = [](const std::vector<std::string>& input, const std::vector<std::string>& expected) {
@@ -31,17 +47,70 @@ void checkRuntimeDependencies() {
             throw std::runtime_error("Incorrect Windows runtime dependency visibility");
     };
     check({}, {});
-    check({"libkernel.prx"}, {"libkernel.prx"});
+    check({"libkernel.prx"}, {"libkernel.prx", "libkernel_sys.prx", "libkernel_web.prx", "libc.prx"});
+    check({"libkernel.prx", "libc.prx"}, {"libkernel.prx", "libc.prx", "libkernel_sys.prx", "libkernel_web.prx"});
     check({"libSceLibcInternal.prx", "libkernel.prx"},
-          {"libSceLibcInternal.prx", "libkernel.prx", "libc.prx"});
+          {"libSceLibcInternal.prx", "libkernel.prx", "libkernel_sys.prx", "libkernel_web.prx", "libc.prx"});
     check({"libc.prx", "libSceLibcInternal.prx"},
           {"libc.prx", "libSceLibcInternal.prx"});
+    check({"libSceVideoOut.prx", "libkernel.prx", "libSceVideoOut.prx"},
+          {"libSceVideoOut.prx", "libkernel.prx", "libkernel_sys.prx", "libkernel_web.prx", "libc.prx"});
+    check({"libkernel_sys.prx"}, {"libkernel_sys.prx", "libkernel.prx", "libkernel_web.prx", "libc.prx"});
+    check({"libkernel_web.prx"}, {"libkernel_web.prx", "libkernel.prx", "libkernel_sys.prx", "libc.prx"});
+    check({"libSceVideoOut.prx", "libSceVideoOut.prx"}, {"libSceVideoOut.prx"});
+}
+
+template <typename TStream>
+void openFixture(TStream& stream, const Fs::path& path, std::ios::openmode mode) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        errno = 0;
+        _set_doserrno(0);
+        stream.clear();
+        stream.open(path, mode);
+        if (stream.is_open() || _doserrno != ERROR_SHARING_VIOLATION || std::chrono::steady_clock::now() >= deadline)
+            return;
+        Sleep(10);
+    }
+}
+
+void removeFixtures(const Fs::path& directory) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        std::error_code error;
+        Fs::remove_all(directory, error);
+        if (!error)
+            return;
+        if (error != std::errc::permission_denied || std::chrono::steady_clock::now() >= deadline)
+            throw Fs::filesystem_error("cannot remove diagnostic fixtures", directory, error);
+        Sleep(10);
+    }
 }
 
 void writeFile(const Fs::path& path, const std::vector<std::uint8_t>& bytes) {
-    std::ofstream stream(path, std::ios::binary);
+    const auto fail = [&](const char* phase) {
+        const auto error = errno;
+        const auto nativeError = _doserrno;
+        throw std::runtime_error("Cannot write diagnostic fixture: phase=" + std::string(phase) +
+                                 " path=" + path.string() + " errno=" + std::to_string(error) +
+                                 " native_error=" + std::to_string(nativeError) +
+                                 " bytes=" + std::to_string(bytes.size()));
+    };
+    std::ofstream stream;
+    openFixture(stream, path, std::ios::binary);
+    if (!stream.is_open())
+        fail("open");
     if (!stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size())))
-        throw std::runtime_error("Cannot write diagnostic fixture");
+        fail("write");
+    stream.close();
+    if (!stream)
+        fail("close");
+}
+
+std::vector<std::uint8_t> fakeElfBytes() {
+    std::vector<std::uint8_t> elf{0x7f, 'E', 'L', 'F', 2, 1, 1};
+    elf.resize(64);
+    return elf;
 }
 
 void createImage(const Fs::path& path, const std::vector<std::pair<std::string, std::string>>& imports, const std::string& exported, const std::string& forwarded = {}) {
@@ -140,18 +209,18 @@ void expectDiagnostic(const Fs::path& runner, const std::vector<std::string>& ex
     HANDLE output = nullptr;
     if (!CreatePipe(&input, &output, &security, 0) || !SetHandleInformation(input, HANDLE_FLAG_INHERIT, 0))
         throw std::runtime_error("Cannot create diagnostic test pipe");
-    STARTUPINFOA startup{};
+    STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     startup.dwFlags = STARTF_USESTDHANDLES;
     startup.hStdOutput = output;
     startup.hStdError = output;
     startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     PROCESS_INFORMATION process{};
-    const auto filename = runner.string();
-    if (!CreateProcessA(filename.c_str(), nullptr, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, runner.parent_path().string().c_str(), &startup, &process))
+    const auto filename = runner.wstring();
+    if (!CreateProcessW(filename.c_str(), nullptr, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, runner.parent_path().wstring().c_str(), &startup, &process))
         throw std::runtime_error("Cannot start diagnostic test: " + std::to_string(GetLastError()));
     CloseHandle(output);
-    if (WaitForSingleObject(process.hProcess, 20000) != WAIT_OBJECT_0) {
+    if (WaitForSingleObject(process.hProcess, 120000) != WAIT_OBJECT_0) {
         TerminateProcess(process.hProcess, 1);
         throw std::runtime_error("Diagnostic test timed out");
     }
@@ -174,57 +243,123 @@ void expectDiagnostic(const Fs::path& runner, const std::vector<std::string>& ex
     }
 }
 
-}
-
-int main() {
-    try {
-        checkRuntimeDependencies();
-        std::vector<char> filename(32768);
-        const auto size = GetModuleFileNameA(nullptr, filename.data(), static_cast<DWORD>(filename.size()));
-        if (size == 0 || size >= filename.size())
-            throw std::runtime_error("Cannot locate diagnostic tests");
-        const auto directory = Fs::path(filename.data()).parent_path() / "windows-diagnostic-fixtures";
-        Fs::create_directories(directory);
-        const auto root = directory / "diagnostic-root.prx";
-        const auto middle = directory / "diagnostic-middle.dll";
-        const auto leaf = directory / "diagnostic-leaf.dll";
-        const auto runner = directory / "diagnostic-runner.exe";
-        createRunner(runner, root);
-        createImage(root, {{middle.filename().string(), "Middle"}}, {});
-        createImage(middle, {{leaf.filename().string(), "Missing"}}, "Middle");
+void runScenario(const std::string& scenario, const Fs::path& root, const Fs::path& middle, const Fs::path& leaf, const Fs::path& runner) {
+    const auto middleName = middle.filename().string();
+    const auto leafName = leaf.filename().string();
+    if (scenario == "missing_symbol_diamond") {
+        createImage(root, {{middleName, "Middle"}}, {});
+        createImage(middle, {{leafName, "Missing"}}, "Middle");
         createImage(leaf, {}, "Present");
-        expectDiagnostic(runner, {"Importer: " + middle.string(), "Provider: " + leaf.string(), "Symbol: Missing", runner.string() + " -> " + root.string() + " -> " + middle.string() + " -> " + leaf.string()});
-        createImage(middle, {{leaf.filename().string(), "#8"}}, "Middle");
+        expectDiagnostic(runner, {"Importer: " + middle.string(), "Provider: " + leaf.string(), "Symbol: Missing",
+            runner.string() + " -> " + root.string() + " -> " + middle.string() + " -> " + leaf.string()});
+    } else if (scenario == "ordinal_missing") {
+        createImage(root, {{middleName, "Middle"}}, {});
+        createImage(leaf, {}, "Present");
+        createImage(middle, {{leafName, "#8"}}, "Middle");
         expectDiagnostic(runner, {"Symbol: #8"});
-        createImage(middle, {{leaf.filename().string(), "#7"}}, "Middle");
+    } else if (scenario == "ordinal_present") {
+        createImage(root, {{middleName, "Middle"}}, {});
+        createImage(leaf, {}, "Present");
+        createImage(middle, {{leafName, "#7"}}, "Middle");
         expectDiagnostic(runner, {"Dependency tables contain no missing imports"});
+    } else if (scenario == "forwarded_missing") {
+        createImage(root, {{middleName, "Middle"}}, {});
+        createImage(leaf, {}, "Present");
         createImage(middle, {}, "Middle", "diagnostic-leaf.Missing");
         expectDiagnostic(runner, {"Symbol: Missing", "Importer: " + middle.string()});
+    } else if (scenario == "forwarded_present") {
+        createImage(root, {{middleName, "Middle"}}, {});
+        createImage(leaf, {}, "Present");
         createImage(middle, {}, "Middle", "diagnostic-leaf.#7");
         expectDiagnostic(runner, {"Dependency tables contain no missing imports"});
+    } else if (scenario == "forward_cycle_capacity") {
+        createImage(root, {{middleName, "Middle"}}, {});
+        createImage(middle, {}, "Middle", "diagnostic-leaf.#7");
         createImage(leaf, {}, "Present", "diagnostic-middle.Middle");
         expectDiagnostic(runner, {"capacity exceeded"});
-        createImage(middle, {{leaf.filename().string(), "Present"}}, "Middle");
-        createImage(leaf, {{middle.filename().string(), "Middle"}}, "Present");
+    } else if (scenario == "mutual_cycle_resolved") {
+        createImage(root, {{middleName, "Middle"}}, {});
+        createImage(middle, {{leafName, "Present"}}, "Middle");
+        createImage(leaf, {{middleName, "Middle"}}, "Present");
         expectDiagnostic(runner, {"Dependency tables contain no missing imports"});
-        createImage(leaf, {{middle.filename().string(), "MissingInCycle"}}, "Present");
+    } else if (scenario == "mutual_cycle_missing") {
+        createImage(root, {{middleName, "Middle"}}, {});
+        createImage(middle, {{leafName, "Present"}}, "Middle");
+        createImage(leaf, {{middleName, "MissingInCycle"}}, "Present");
         expectDiagnostic(runner, {"Symbol: MissingInCycle", "Importer: " + leaf.string()});
+    } else if (scenario == "module_not_found") {
         createImage(root, {{"diagnostic-absent.dll", "Missing"}}, {});
         expectDiagnostic(runner, {"dependency module not found", "Importer: " + root.string()});
+    } else if (scenario == "apiset_module_not_found") {
+        createImage(root, {{"api-ms-win-core-relinkerdiagnostics-l1-1-0.dll", "Missing"}}, {});
+        expectDiagnostic(runner, {"dependency module not found: api-ms-win-core-relinkerdiagnostics-l1-1-0.dll", "Importer: " + root.string(),
+            runner.string() + " -> " + root.string() + " -> api-ms-win-core-relinkerdiagnostics-l1-1-0.dll"});
+    } else if (scenario == "real_export_present") {
         createImage(root, {{"KERNEL32.dll", "CreateRemoteThreadEx"}}, {});
         expectDiagnostic(runner, {"Dependency tables contain no missing imports"});
+    } else if (scenario == "real_module_fake_export") {
         createImage(root, {{"KERNEL32.dll", "RelinkerDiagnosticsMissingExport"}}, {});
         expectDiagnostic(runner, {"Symbol: RelinkerDiagnosticsMissingExport"});
+    } else if (scenario == "corrupted_import_table") {
+        createImage(root, {{"KERNEL32.dll", "RelinkerDiagnosticsMissingExport"}}, {});
         {
-            std::fstream corrupt(root, std::ios::binary | std::ios::in | std::ios::out);
+            std::fstream corrupt;
+            openFixture(corrupt, root, std::ios::binary | std::ios::in | std::ios::out);
             const std::array<char, 4> invalidRva{static_cast<char>(0xf0), static_cast<char>(0xff), static_cast<char>(0xff), static_cast<char>(0xff)};
             corrupt.seekp(LoadRva + 0x300);
             if (!corrupt.write(invalidRva.data(), invalidRva.size()))
                 throw std::runtime_error("Cannot corrupt diagnostic fixture");
         }
         expectDiagnostic(runner, {"invalid or unsupported PE dependency metadata"});
+    } else if (scenario == "not_a_pe_garbage") {
         writeFile(root, {0, 1, 2});
+        expectDiagnostic(runner, {"dependency module is not a Windows PE image: " + root.string()});
+    } else if (scenario == "not_a_pe_elf_magic") {
+        writeFile(root, fakeElfBytes());
+        expectDiagnostic(runner, {"dependency module is not a Windows PE image: " + root.string(), "Importer: " + runner.string(),
+            "Chain: " + runner.string() + " -> " + root.string() + "\n"});
+    } else if (scenario == "missing_root") {
+        expectDiagnostic(runner, {"dependency module not found: " + root.string(), "Importer: " + runner.string(),
+            "Chain: " + runner.string() + " -> " + root.string() + "\n"});
+    } else if (scenario == "root_is_directory") {
+        Fs::create_directory(root);
         expectDiagnostic(runner, {"Windows API failed"});
+    } else if (scenario == "nested_not_a_pe") {
+        createImage(root, {{middleName, "Middle"}}, {});
+        writeFile(middle, fakeElfBytes());
+        expectDiagnostic(runner, {"dependency module is not a Windows PE image: " + middle.string(), "Importer: " + root.string(),
+            "Chain: " + runner.string() + " -> " + root.string() + " -> " + middle.string() + "\n"});
+    } else {
+        throw std::runtime_error("Unknown diagnostic scenario: " + scenario);
+    }
+}
+
+}
+
+int main(int argc, char** argv) {
+    try {
+        if (argc != 2) {
+            std::cerr << "Usage: windows_dependency_diagnostics_tests <scenario>\n";
+            return 2;
+        }
+        const std::string scenario = argv[1];
+        if (scenario == "runtime_dependencies") {
+            checkRuntimeDependencies();
+            std::cout << "Windows dependency machine-code tests passed\n";
+            return 0;
+        }
+        std::vector<wchar_t> filename(32768);
+        const auto size = GetModuleFileNameW(nullptr, filename.data(), static_cast<DWORD>(filename.size()));
+        if (size == 0 || size >= filename.size())
+            throw std::runtime_error("Cannot locate diagnostic tests");
+        const auto directory = createFixtureDirectory(Fs::path(filename.data()).parent_path());
+        const auto root = directory / "diagnostic-root.prx";
+        const auto middle = directory / "diagnostic-middle.dll";
+        const auto leaf = directory / "diagnostic-leaf.dll";
+        const auto runner = directory / "diagnostic-runner.exe";
+        createRunner(runner, root);
+        runScenario(scenario, root, middle, leaf, runner);
+        removeFixtures(directory);
         std::cout << "Windows dependency machine-code tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

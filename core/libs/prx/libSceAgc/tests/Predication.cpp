@@ -1,20 +1,13 @@
+#include "prx/libSceAgc/Predication/include/Predication.hpp"
+#include "prx/libSceAgc/DcbState/include/Predication.hpp"
+#include "prx/libSceAgc/DcbDraw/include/IndexBuffer.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
-
-extern "C" {
-std::uint32_t* APS5_VABI sceAgcDcbSetPredication(CommandBuffer*, std::uint8_t, std::uint8_t, std::uint8_t, const volatile void*, std::uint32_t);
-std::uint32_t APS5_VABI sceAgcDcbSetZPassPredicationEnableGetSize();
-std::uint32_t APS5_VABI sceAgcDcbSetPredicationDisableGetSize();
-std::uint32_t APS5_VABI sceAgcDcbSetBoolPredicationEnableGetSize();
-std::uint32_t* APS5_VABI sceAgcDcbSetIndexCount(CommandBuffer*, std::uint32_t);
-std::uint32_t* APS5_VABI sceAgcDcbSetIndexBuffer(CommandBuffer*, std::uint64_t);
-int APS5_VABI sceAgcSetPacketPredication(std::uint32_t*, std::uint32_t);
-int APS5_VABI sceAgcSetRangePredication(std::uint32_t*, const volatile std::uint32_t*, std::uint32_t);
-}
 
 namespace {
 
@@ -46,6 +39,28 @@ void testSizes() {
     check(sceAgcDcbSetZPassPredicationEnableGetSize() == bytes, "z-pass predication size");
     check(sceAgcDcbSetPredicationDisableGetSize() == bytes, "predication disable size");
     check(sceAgcDcbSetBoolPredicationEnableGetSize() == bytes, "bool predication size");
+}
+
+void testConsoleArguments() {
+    struct Case {
+        std::uint8_t condition;
+        std::uint8_t operation;
+        std::uint8_t waitOperation;
+        std::uintptr_t address;
+        std::uint32_t count;
+        std::array<std::uint32_t, 4> words;
+    };
+    const std::array<Case, 3> cases{{
+        {0x11, 0x22, 0x33, 0x44444444u, 0x55555555u, {0xc0022000u, 0x00021100u, 0x44444440u, 0u}},
+        {1, 2, 3, 4u, 5u, {0xc0022000u, 0x00021100u, 0u, 0u}},
+        {0x22, 0x44, 0, 0u, 0u, {0xc0022000u, 0x00040000u, 0u, 0u}},
+    }};
+    for (const auto& item : cases) {
+        Storage storage;
+        const auto* packet = sceAgcDcbSetPredication(&storage.buffer, item.condition, item.operation, item.waitOperation, reinterpret_cast<const volatile void*>(item.address), item.count);
+        check(packet == storage.words.data() && std::equal(item.words.begin(), item.words.end(), packet), "SET_PREDICATION does not match the console's packet");
+        check(storage.buffer.cursor_up == storage.words.data() + item.words.size(), "SET_PREDICATION cursor mismatch");
+    }
 }
 
 void testPacket() {
@@ -86,6 +101,7 @@ void testRange() {
 int main() {
     try {
         testSizes();
+        testConsoleArguments();
         testPacket();
         testRange();
         std::puts("agc predication tests passed");

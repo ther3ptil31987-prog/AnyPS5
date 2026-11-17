@@ -1,7 +1,10 @@
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
+#include "PipelineSpecialization.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
+#include "SpirvBackend/SpirvRuntimeBuffer.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -10,6 +13,10 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <unordered_set>
+#include <bit>
+#include <optional>
+#include <span>
 
 namespace ShaderRecompiler {
 namespace {
@@ -85,11 +92,29 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
         const auto pc = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, TypeU32(state), pc, state.loopGuardPc);
         EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), pc, ConstantU32(state, 0u)), [&] {
-            RecordBdaFault(state, BdaConstant(state, state.program.Resources().shaderHash), ConstantU32(state, state.loopGuardLimit), EmitBinaryU32(state, spv::OpISub, pc, ConstantU32(state, 1u)), BdaAbi::FaultReason::LoopLimit);
+            const auto hash = state.program.Resources().shaderHash;
+            RecordBdaFaultWords(state, ConstantU32(state, static_cast<std::uint32_t>(hash)), ConstantU32(state, static_cast<std::uint32_t>(hash >> 32u)), ConstantU32(state, state.loopGuardLimit), EmitBinaryU32(state, spv::OpISub, pc, ConstantU32(state, 1u)), BdaAbi::FaultReason::LoopLimit);
         });
     }
+    FlushColorTargetMerge(state);
+    if (OrderedPixelShader(state)) {
+        state.module.AddFunction(spv::OpEndInvocationInterlockEXT);
+    }
     EmitKillIfPixelValidMaskInactive(state);
-    state.module.AddFunction(spv::OpReturn);
+    if (state.quadPixelUncovered != 0u) EmitKillIfBoolFalse(state, Unary(state, spv::OpLogicalNot, TypeBool(state), state.quadPixelUncovered));
+    if (state.stencilReplay) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeI32(state), value, state.stencilRefVariable);
+        const auto reference = Unary(state, spv::OpBitcast, TypeU32(state), value);
+        const auto masked = Binary(state, spv::OpBitwiseAnd, TypeU32(state), reference, ConstantU32(state, 0xffu));
+        const auto offset = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::StencilReferenceOffset, state.program.Metadata().bindings.stencilReferenceDword);
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), offset);
+        const auto expected = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeU32(state), expected, pointer);
+        EmitKillIfBoolFalse(state, Binary(state, spv::OpIEqual, TypeBool(state), masked, expected));
+    }
+    EmitReturnReleasingScratch(state);
 }
 
 // The loop guard (see SpirvEmitterState::loopGuardLimit) at a branch that may leave a loop: counts the
@@ -128,7 +153,7 @@ bool IsContinueTarget(const IrProgram& program, std::uint32_t block) {
 
 std::uint32_t EmitWaveAny(SpirvEmitterState& state, std::uint32_t predicate) {
     const auto ballot = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4u), ballot, ConstantU32(state, spv::ScopeSubgroup), predicate);
+    EmitSubgroupBallot(state, ballot, predicate);
     const auto wave = EmitWaveBallot(state, ballot);
     const auto low = state.module.AllocateId();
     const auto high = state.module.AllocateId();
@@ -161,17 +186,13 @@ std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& i
         return ctx.Def(info.condition);
     }
     auto& state = ctx.state;
-    const auto ballot = ctx.Ballot(info.condition);
-    const auto low = state.module.AllocateId();
-    const auto high = state.module.AllocateId();
-    const auto result = state.module.AllocateId();
-    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0u);
-    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1u);
-    const auto kind = info.terminator.condition;
-    const bool zero = kind == BranchCondition::ExecZero || kind == BranchCondition::VccZero || kind == BranchCondition::SccZero;
-    const auto combined = EmitBinaryU32(state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
-    state.module.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result, combined, ConstantU32(state, zero ? ~0u : 0u));
-    return result;
+    const auto own = ctx.Def(info.condition);
+    const auto other = ctx.otherHalf->Def(info.condition);
+    if (condition == BranchCondition::ExecZero || condition == BranchCondition::VccZero || condition == BranchCondition::SccZero) {
+        const auto clear = Binary(state, spv::OpLogicalOr, TypeBool(state), Unary(state, spv::OpLogicalNot, TypeBool(state), own), Unary(state, spv::OpLogicalNot, TypeBool(state), other));
+        return Unary(state, spv::OpLogicalNot, TypeBool(state), EmitWaveAny(state, clear));
+    }
+    return EmitWaveAny(state, Binary(state, spv::OpLogicalOr, TypeBool(state), own, other));
 }
 
 void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& program, const BlockInfo& info) {
@@ -208,10 +229,15 @@ void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& progr
                 EmitReturnTerminator(ctx);
                 return;
             }
-            if (const IrValue* resolved = info.condition->Resolve(); !resolved->HasImmediate() && !ctx.definitions.contains(resolved)) {
+            if (const IrValue* resolved = info.condition->Resolve(); !resolved->HasImmediate() && !ctx.definitions.Contains(resolved)) {
                 const std::string where = resolved->Parent() == nullptr ? std::string("no block") : "block " + std::to_string(resolved->Parent()->Id());
                 const std::string message = "branch condition " + std::string(IrOpcodeName(resolved->Opcode())) + " of block " + std::to_string(info.id) + " (defined in " + where + ") was not emitted before the branch";
                 ctx.Fail(message.c_str());
+            }
+            if (ctx.Label(trueBlock) == ctx.Label(falseBlock)) {
+                if (term.loopHeader) emitMerge();
+                state.module.AddFunction(spv::OpBranch, ctx.Label(trueBlock));
+                return;
             }
             auto condition = EmitBranchCondition(ctx, info);
             if (state.loopGuardLimit != 0 && term.trueBlock != term.falseBlock) {
@@ -284,12 +310,17 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::Void: return Invoke(EmitVoid, ctx, inst);
         case IrOpcode::Reference: return Invoke(EmitReference, ctx, inst);
         case IrOpcode::ReferenceU32: return Invoke(EmitReferenceU32, ctx, inst);
+        case IrOpcode::UnlinkedCall: return Invoke(EmitUnlinkedCall, ctx, inst);
+        case IrOpcode::WindowLaneGuard: return Invoke(EmitWindowLaneGuard, ctx, inst);
+        case IrOpcode::DescriptorFault: return Invoke(EmitDescriptorFault, ctx, inst);
         case IrOpcode::GetUserData: return Invoke(EmitGetUserData, ctx, inst);
         case IrOpcode::GetShaderBase: return Invoke(EmitGetShaderBase, ctx, inst);
         case IrOpcode::ShaderClock: return Invoke(EmitShaderClock, ctx, inst);
         case IrOpcode::RealtimeClock: return Invoke(EmitRealtimeClock, ctx, inst);
         case IrOpcode::MeshDrawParameter: return Invoke(EmitMeshDrawParameter, ctx, inst);
         case IrOpcode::MeshArgument: return Invoke(EmitMeshArgument, ctx, inst);
+        case IrOpcode::MeshRestartStart: return Invoke(EmitMeshRestartStart, ctx, inst);
+        case IrOpcode::MeshCapturedWord: return Invoke(EmitMeshCapturedWord, ctx, inst);
         case IrOpcode::MeshAllocate: return Invoke(EmitMeshAllocate, ctx, inst);
         case IrOpcode::TessellationBase: return Invoke(EmitTessellationBase, ctx, inst);
         case IrOpcode::GetTessellationAttribute: return Invoke(EmitGetTessellationAttribute, ctx, inst);
@@ -303,6 +334,8 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::SetScalarRegister: return Invoke(EmitSetScalarRegister, ctx, inst);
         case IrOpcode::GetVectorRegister: return Invoke(EmitGetVectorRegister, ctx, inst);
         case IrOpcode::SetVectorRegister: return Invoke(EmitSetVectorRegister, ctx, inst);
+        case IrOpcode::LoadVectorWindow: return Invoke(EmitLoadVectorWindow, ctx, inst);
+        case IrOpcode::StoreVectorWindow: return Invoke(EmitStoreVectorWindow, ctx, inst);
         case IrOpcode::GetGotoVariable: return Invoke(EmitGetGotoVariable, ctx, inst);
         case IrOpcode::SetGotoVariable: return Invoke(EmitSetGotoVariable, ctx, inst);
         case IrOpcode::GetScc: return Invoke(EmitGetScc, ctx, inst);
@@ -349,8 +382,21 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::CompositeExtractU32x2: return Invoke(EmitCompositeExtractU32x2, ctx, inst);
         case IrOpcode::CompositeExtractU32x3: return Invoke(EmitCompositeExtractU32x3, ctx, inst);
         case IrOpcode::CompositeExtractU32x4: return Invoke(EmitCompositeExtractU32x4, ctx, inst);
-        case IrOpcode::PackHalf2x16: return Invoke(EmitPackHalf2x16, ctx, inst);
+        case IrOpcode::PackHalf2x16: return Invoke(EmitPackHalf2x16Value, ctx, inst);
         case IrOpcode::PackFloat2x16Rtz: return Invoke(EmitPackFloat2x16Rtz, ctx, inst);
+        case IrOpcode::FPAdd16x2: return Invoke(EmitFPAdd16x2, ctx, inst);
+        case IrOpcode::FPMul16x2: return Invoke(EmitFPMul16x2, ctx, inst);
+        case IrOpcode::FPFma16x2: return Invoke(EmitFPFma16x2, ctx, inst);
+        case IrOpcode::IAdd16x2: return Invoke(EmitIAdd16x2, ctx, inst);
+        case IrOpcode::ISub16x2: return Invoke(EmitISub16x2, ctx, inst);
+        case IrOpcode::IMul16x2: return Invoke(EmitIMul16x2, ctx, inst);
+        case IrOpcode::ShiftLeftLogical16x2: return Invoke(EmitShiftLeftLogical16x2, ctx, inst);
+        case IrOpcode::ShiftRightLogical16x2: return Invoke(EmitShiftRightLogical16x2, ctx, inst);
+        case IrOpcode::ShiftRightArithmetic16x2: return Invoke(EmitShiftRightArithmetic16x2, ctx, inst);
+        case IrOpcode::SMin16x2: return Invoke(EmitSMin16x2, ctx, inst);
+        case IrOpcode::SMax16x2: return Invoke(EmitSMax16x2, ctx, inst);
+        case IrOpcode::UMin16x2: return Invoke(EmitUMin16x2, ctx, inst);
+        case IrOpcode::UMax16x2: return Invoke(EmitUMax16x2, ctx, inst);
         case IrOpcode::FPAbs32: return Invoke(EmitFPAbs32, ctx, inst);
         case IrOpcode::FPNeg32: return Invoke(EmitFPNeg32, ctx, inst);
         case IrOpcode::FPSaturate32: return Invoke(EmitFPSaturate32, ctx, inst);
@@ -406,7 +452,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::SLessThanEqual32: return Invoke(EmitSLessThanEqual32, ctx, inst);
         case IrOpcode::ULessThanEqual32: return Invoke(EmitULessThanEqual32, ctx, inst);
         case IrOpcode::SGreaterThan32: return Invoke(EmitSGreaterThan32, ctx, inst);
-        case IrOpcode::UGreaterThan32: return Invoke(EmitUGreaterThan32, ctx, inst);
+        case IrOpcode::UGreaterThan32: return Invoke(EmitSampleNanQuery, ctx, inst);
         case IrOpcode::UGreaterThan64: return Invoke(EmitUGreaterThan64, ctx, inst);
         case IrOpcode::INotEqual32: return Invoke(EmitINotEqual32, ctx, inst);
         case IrOpcode::INotEqual64: return Invoke(EmitINotEqual64, ctx, inst);
@@ -428,7 +474,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::FPUnordLessThanEqual32: return Invoke(EmitFPUnordLessThanEqual32, ctx, inst);
         case IrOpcode::FPOrdGreaterThanEqual32: return Invoke(EmitFPOrdGreaterThanEqual32, ctx, inst);
         case IrOpcode::FPUnordGreaterThanEqual32: return Invoke(EmitFPUnordGreaterThanEqual32, ctx, inst);
-        case IrOpcode::FPIsNan32: return Invoke(EmitFPIsNan32, ctx, inst);
+        case IrOpcode::FPIsNan32: return Invoke(EmitSampleNanQuery, ctx, inst);
         case IrOpcode::FPCmpClass32: return Invoke(EmitFPCmpClass32, ctx, inst);
         case IrOpcode::FPAdd32: return Invoke(EmitFPAdd32, ctx, inst);
         case IrOpcode::FPSub32: return Invoke(EmitFPSub32, ctx, inst);
@@ -457,6 +503,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::FPMul64: return Invoke(EmitFPMul64, ctx, inst);
         case IrOpcode::FPFma64: return Invoke(EmitFPFma64, ctx, inst);
         case IrOpcode::FPFmaScale64: return Invoke(EmitFPFmaScale64, ctx, inst);
+        case IrOpcode::FPFmaScale32: return Invoke(EmitFPFmaScale32, ctx, inst);
         case IrOpcode::FPMin64: return Invoke(EmitFPMin64, ctx, inst);
         case IrOpcode::FPMax64: return Invoke(EmitFPMax64, ctx, inst);
         case IrOpcode::FPSaturate64: return Invoke(EmitFPSaturate64, ctx, inst);
@@ -473,6 +520,8 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::FPSqrt64: return Invoke(EmitFPSqrt64, ctx, inst);
         case IrOpcode::FPTrigPreop64: return Invoke(EmitFPTrigPreop64, ctx, inst);
         case IrOpcode::FPDot2F32F16: return Invoke(EmitFPDot2F32F16, ctx, inst);
+        case IrOpcode::FPInterpolateF32: return Invoke(EmitFPInterpolateF32, ctx, inst);
+        case IrOpcode::FPInterpolateF16: return Invoke(EmitFPInterpolateF16, ctx, inst);
         case IrOpcode::ConvertF32F64: return Invoke(EmitConvertF32F64, ctx, inst);
         case IrOpcode::ConvertF64F32: return Invoke(EmitConvertF64F32, ctx, inst);
         case IrOpcode::ConvertF64S32: return Invoke(EmitConvertF64S32, ctx, inst);
@@ -484,6 +533,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::Permlane16U32: return Invoke(EmitPermlane16U32, ctx, inst);
         case IrOpcode::BpermuteU32: return Invoke(EmitBpermuteU32, ctx, inst);
         case IrOpcode::PermuteU32: return Invoke(EmitPermuteU32, ctx, inst);
+        case IrOpcode::HalfSwapU32: return Invoke(EmitHalfSwapU32, ctx, inst);
         case IrOpcode::GetSrtResource: return Invoke(EmitGetSrtResource, ctx, inst);
         case IrOpcode::GetBufferResource: return Invoke(EmitGetBufferResource, ctx, inst);
         case IrOpcode::GetAddressResource: return Invoke(EmitGetAddressResource, ctx, inst);
@@ -502,6 +552,9 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::StoreAddressU8: return Invoke(EmitStoreAddressU8, ctx, inst);
         case IrOpcode::StoreAddressU16: return Invoke(EmitStoreAddressU16, ctx, inst);
         case IrOpcode::StoreAddressU32: return Invoke(EmitStoreAddressU32, ctx, inst);
+        case IrOpcode::StoreAddressU32x2: return Invoke(EmitStoreAddressU32x2, ctx, inst);
+        case IrOpcode::StoreAddressU32x3: return Invoke(EmitStoreAddressU32x3, ctx, inst);
+        case IrOpcode::StoreAddressU32x4: return Invoke(EmitStoreAddressU32x4, ctx, inst);
         case IrOpcode::AddressAtomicSwap32: return Invoke(EmitAddressAtomic, ctx, inst);
         case IrOpcode::AddressAtomicCmpSwap32: return Invoke(EmitAddressAtomic, ctx, inst);
         case IrOpcode::AddressAtomicIAdd32: return Invoke(EmitAddressAtomic, ctx, inst);
@@ -632,11 +685,14 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::SharedAtomicMskor64: return Invoke(EmitSharedAtomicMskor64, ctx, inst);
         case IrOpcode::DataAppend: return Invoke(EmitDataAppend, ctx, inst);
         case IrOpcode::DataConsume: return Invoke(EmitDataConsume, ctx, inst);
+        case IrOpcode::DataOrderedCount: return Invoke(EmitDataOrderedCount, ctx, inst);
+        case IrOpcode::DataOrderedSwap: return Invoke(EmitDataOrderedSwap, ctx, inst);
         case IrOpcode::SwizzleU32: return Invoke(EmitSwizzleU32, ctx, inst);
         case IrOpcode::ImageQueryDimensions: return Invoke(EmitImageQueryDimensions, ctx, inst);
         case IrOpcode::ImageQueryLod: return Invoke(EmitImageQueryLod, ctx, inst);
         case IrOpcode::ImageRead: return Invoke(EmitImageRead, ctx, inst);
         case IrOpcode::ImageBvhIntersectRay: return Invoke(EmitImageBvhIntersectRay, ctx, inst);
+        case IrOpcode::NanPropagateF32: return Invoke(EmitNanPropagateF32, ctx, inst);
         case IrOpcode::ImageWrite: return Invoke(EmitImageWrite, ctx, inst);
         case IrOpcode::ImageSampleRaw: return Invoke(EmitImageSampleRaw, ctx, inst);
         case IrOpcode::ImageGatherRaw: return Invoke(EmitImageGatherRaw, ctx, inst);
@@ -669,6 +725,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::ImageAtomicCmpSwap64: return Invoke(EmitImageAtomicCmpSwap64, ctx, inst);
         case IrOpcode::GetAttribute: return Invoke(EmitGetAttribute, ctx, inst);
         case IrOpcode::GetInterpolationParameter: return Invoke(EmitGetInterpolationParameter, ctx, inst);
+        case IrOpcode::GetInterpolationParameterF16: return Invoke(EmitGetInterpolationParameterF16, ctx, inst);
         case IrOpcode::SetAttribute: return Invoke(EmitSetAttribute, ctx, inst);
         case IrOpcode::ControlNop: return Invoke(EmitControlNop, ctx, inst);
         case IrOpcode::Waitcnt: return Invoke(EmitWaitcnt, ctx, inst);
@@ -698,16 +755,314 @@ void EmitStructuredInstruction(SpirvValueEmitContext& ctx, StructuredFunctionSta
     EmitDirectInstruction(ctx, inst);
 }
 
+const IrValue* RegionNanCondition(const IrValue* test) {
+    std::vector<const IrValue*> pending{test};
+    std::unordered_set<const IrValue*> visited;
+    while (!pending.empty()) {
+        test = pending.back()->Resolve();
+        pending.pop_back();
+        if (!visited.insert(test).second) continue;
+        if (test->Flags<std::uint64_t>() != 0u) continue;
+        if (test->Opcode() == IrOpcode::LogicalAnd) {
+            for (std::size_t index = test->ArgumentCount(); index > 0u; --index) pending.push_back(test->Argument(index - 1u));
+            continue;
+        }
+        if (test->Opcode() != IrOpcode::UGreaterThan32) continue;
+        const auto* limit = test->Argument(1)->Resolve();
+        if (!limit->HasImmediate() || limit->ImmediateU32() != 0x7f800000u) continue;
+        const auto* magnitude = test->Argument(0)->Resolve();
+        if (magnitude->Opcode() != IrOpcode::BitwiseAnd32 || magnitude->Flags<std::uint64_t>() != 0u) continue;
+        for (std::size_t index = 0u; index < 2u; ++index) {
+            const auto* mask = magnitude->Argument(index)->Resolve();
+            if (mask->HasImmediate() && mask->ImmediateU32() == 0x7fffffffu) return magnitude->Argument(1u - index)->Resolve();
+        }
+    }
+    return nullptr;
+}
+
+const IrValue* RegionNanSource(const IrValue* select) {
+    if (select->Opcode() != IrOpcode::SelectU32 && select->Opcode() != IrOpcode::SelectF32) return nullptr;
+    return select->Flags<std::uint64_t>() == 0u ? RegionNanCondition(select->Argument(0)) : nullptr;
+}
+
+bool RegionArithmetic(const IrValue* inst) {
+    if (inst->Flags<std::uint64_t>() != 0u) return false;
+    switch (inst->Opcode()) {
+        case IrOpcode::BitCastU32F32:
+        case IrOpcode::BitCastF32U32:
+        case IrOpcode::BitwiseAnd32:
+        case IrOpcode::BitwiseOr32:
+        case IrOpcode::BitwiseXor32:
+        case IrOpcode::IEqual32:
+        case IrOpcode::INotEqual32:
+        case IrOpcode::ULessThan32:
+        case IrOpcode::UGreaterThan32:
+        case IrOpcode::LogicalNot:
+        case IrOpcode::LogicalAnd:
+        case IrOpcode::LogicalOr:
+        case IrOpcode::SelectU32:
+        case IrOpcode::SelectF32:
+        case IrOpcode::SelectU1:
+        case IrOpcode::IAdd32:
+        case IrOpcode::ISub32:
+        case IrOpcode::FPMul32:
+        case IrOpcode::FPAdd32:
+        case IrOpcode::FPSub32:
+        case IrOpcode::FPFma32:
+        case IrOpcode::FPMad32:
+        case IrOpcode::FPAbs32:
+        case IrOpcode::FPNeg32:
+        case IrOpcode::FPOrdLessThan32:
+        case IrOpcode::FPOrdLessThanEqual32:
+        case IrOpcode::FPOrdGreaterThan32:
+        case IrOpcode::FPOrdGreaterThanEqual32:
+        case IrOpcode::FPSin:
+        case IrOpcode::FPCos:
+        case IrOpcode::FPFract32:
+        case IrOpcode::FPFloor32:
+        case IrOpcode::FPRoundEven32:
+        case IrOpcode::FPSaturate32:
+            return true;
+        default: return false;
+    }
+}
+
+class RegionEntryBounds {
+public:
+    RegionEntryBounds(const std::unordered_set<const IrValue*>& members, int exponent) : members(members), inputExponent(exponent) {}
+
+    std::optional<int> Bound(const IrValue* value) {
+        value = value->Resolve();
+        if (const auto found = known.find(value); found != known.end()) return found->second;
+        known.emplace(value, std::nullopt);
+        const auto result = Compute(value);
+        known[value] = result;
+        return result;
+    }
+
+    bool KnownFalse(const IrValue* value) {
+        return False(value, [&](const IrValue* source) {
+            const auto found = known.find(source->Resolve());
+            return found != known.end() && found->second.has_value();
+        });
+    }
+
+    std::vector<const IrValue*> inputs;
+
+private:
+    std::optional<int> Join(std::optional<int> first, std::optional<int> second, bool product, bool add) {
+        if (!first || !second) return std::nullopt;
+        const int exponent = (product ? *first + *second : std::max(*first, *second) + (add ? 1 : 0)) + (product || add ? 1 : 0);
+        return exponent <= 126 ? std::optional(std::max(exponent, -149)) : std::nullopt;
+    }
+
+    template<typename TFinite>
+    bool False(const IrValue* value, const TFinite& finite) {
+        value = value->Resolve();
+        if (value->Flags<std::uint64_t>() != 0u) return false;
+        if (value->Opcode() == IrOpcode::LogicalAnd) return False(value->Argument(0), finite) || False(value->Argument(1), finite);
+        if (value->Opcode() == IrOpcode::LogicalOr) return False(value->Argument(0), finite) && False(value->Argument(1), finite);
+        if (const auto* source = RegionNanCondition(value)) return finite(source);
+        if (value->Opcode() != IrOpcode::IEqual32) return false;
+        for (unsigned index = 0u; index < 2u; ++index) {
+            const auto* constant = value->Argument(index)->Resolve();
+            const auto* magnitude = value->Argument(1u-index)->Resolve();
+            if (!constant->HasImmediate() || constant->ImmediateU32() != 0x7f800000u || magnitude->Opcode() != IrOpcode::BitwiseAnd32 || magnitude->Flags<std::uint64_t>() != 0u) continue;
+            for (unsigned part = 0u; part < 2u; ++part) {
+                const auto* mask = magnitude->Argument(part)->Resolve();
+                if (mask->HasImmediate() && mask->ImmediateU32() == 0x7fffffffu) return finite(magnitude->Argument(1u-part));
+            }
+        }
+        return false;
+    }
+
+    std::optional<int> Compute(const IrValue* value) {
+        if (value->HasImmediate()) {
+            if (value->Type() != IrType::U32 && value->Type() != IrType::F32) return std::nullopt;
+            const auto bits = value->ImmediateU32() & 0x7fffffffu;
+            if (bits >= 0x7f800000u) return std::nullopt;
+            const int exponent = bits == 0u ? -149 : bits < 0x00800000u ? static_cast<int>(std::bit_width(bits)) - 150 + (std::has_single_bit(bits) ? 0 : 1) : static_cast<int>(bits >> 23u) - 127 + ((bits & 0x007fffffu) != 0u ? 1 : 0);
+            return exponent <= 126 ? std::optional(exponent) : std::nullopt;
+        }
+        if (value->Flags<std::uint64_t>() == 0u) {
+            switch (value->Opcode()) {
+                case IrOpcode::BitCastU32F32:
+                case IrOpcode::BitCastF32U32: return Bound(value->Argument(0));
+                case IrOpcode::FPSaturate32: return 0;
+                case IrOpcode::BitwiseAnd32:
+                case IrOpcode::BitwiseXor32:
+                    for (unsigned part = 0u; part < 2u; ++part) {
+                        const auto* mask = value->Argument(part)->Resolve();
+                        if (!mask->HasImmediate()) continue;
+                        if (value->Opcode() == IrOpcode::BitwiseAnd32 && mask->ImmediateU32() == 0x80000000u) return -149;
+                        const auto accepted = value->Opcode() == IrOpcode::BitwiseAnd32 ? 0x7fffffffu : 0x80000000u;
+                        if (mask->ImmediateU32() == accepted) return Bound(value->Argument(1u-part));
+                    }
+                    break;
+                default: break;
+            }
+        }
+        if (!members.contains(value)) {
+            if (value->Type() != IrType::U32 && value->Type() != IrType::F32) return std::nullopt;
+            if (uniqueInputs.insert(value).second) inputs.push_back(value);
+            return inputExponent;
+        }
+        if (value->Flags<std::uint64_t>() != 0u) return std::nullopt;
+        switch (value->Opcode()) {
+            case IrOpcode::FPAbs32:
+            case IrOpcode::FPNeg32: return Bound(value->Argument(0));
+            case IrOpcode::FPMul32: return Join(Bound(value->Argument(0)), Bound(value->Argument(1)), true, false);
+            case IrOpcode::FPAdd32:
+            case IrOpcode::FPSub32: return Join(Bound(value->Argument(0)), Bound(value->Argument(1)), false, true);
+            case IrOpcode::FPFma32:
+            case IrOpcode::FPMad32: return Join(Join(Bound(value->Argument(0)), Bound(value->Argument(1)), true, false), Bound(value->Argument(2)), false, true);
+            case IrOpcode::SelectU32:
+            case IrOpcode::SelectF32:
+                if (RegionNanSource(value) != nullptr || False(value->Argument(0), [&](const IrValue* source) { return Bound(source).has_value(); })) return Bound(value->Argument(2));
+                return Join(Bound(value->Argument(1)), Bound(value->Argument(2)), false, false);
+            case IrOpcode::FPSin:
+            case IrOpcode::FPCos:
+            case IrOpcode::FPFract32:
+                return Bound(value->Argument(0)) ? std::optional(2) : std::nullopt;
+            case IrOpcode::FPFloor32:
+            case IrOpcode::FPRoundEven32: {
+                const auto source = Bound(value->Argument(0));
+                if (!source) return std::nullopt;
+                const int exponent = std::max(*source, 0) + 1;
+                return exponent <= 126 ? std::optional(exponent) : std::nullopt;
+            }
+            default: return std::nullopt;
+        }
+    }
+
+    const std::unordered_set<const IrValue*>& members;
+    int inputExponent;
+    std::unordered_map<const IrValue*, std::optional<int>> known;
+    std::unordered_set<const IrValue*> uniqueInputs;
+};
+
+bool EmitNanRegion(SpirvValueEmitContext& ctx, const std::vector<const IrValue*>& region) {
+    std::unordered_set<const IrValue*> members(region.begin(), region.end());
+    std::unordered_set<const IrValue*> uniqueSources;
+    std::vector<const IrValue*> sources;
+    std::unordered_set<const IrValue*> bypassed;
+    for (const auto* value : region) {
+        if (const auto* source = RegionNanSource(value)) {
+            bypassed.insert(value);
+            if (uniqueSources.insert(source).second) sources.push_back(source);
+        }
+    }
+    if (bypassed.size() < 2u) return false;
+    int low = -149, high = 126, accepted = -150;
+    std::vector<const IrValue*> entryInputs;
+    while (low <= high) {
+        const int exponent = low + (high - low) / 2;
+        RegionEntryBounds proof(members, exponent);
+        bool valid = true;
+        for (const auto* source : sources) if (!proof.Bound(source)) { valid = false; break; }
+        if (valid) {
+            accepted = exponent;
+            entryInputs = std::move(proof.inputs);
+            low = exponent + 1;
+        } else high = exponent - 1;
+    }
+    const bool entryGuard = accepted >= -149 && entryInputs.size() < sources.size();
+    if (entryGuard) {
+        RegionEntryBounds certificate(members, accepted);
+        for (const auto* source : sources) certificate.Bound(source);
+        for (const auto* value : region) {
+            if ((value->Opcode() == IrOpcode::SelectU32 || value->Opcode() == IrOpcode::SelectF32 || value->Opcode() == IrOpcode::SelectU1) && certificate.KnownFalse(value->Argument(0))) bypassed.insert(value);
+        }
+    }
+
+    std::size_t first = 0u;
+    while (!bypassed.contains(region[first])) {
+        EmitDirectInstruction(ctx, *region[first]);
+        members.erase(region[first++]);
+    }
+    const auto suffix = std::span(region).subspan(first);
+    auto exact = ctx;
+    auto& state = ctx.state;
+    const auto exceptional = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    auto magnitude = ConstantU32(state, 0u);
+    const auto accumulate = [&](const IrValue* value) {
+        const auto native = ctx.Def(value);
+        const auto word = value->Type() == IrType::F32 ? Unary(state, spv::OpBitcast, TypeU32(state), native) : native;
+        const auto bits = Binary(state, spv::OpBitwiseAnd, TypeU32(state), word, ConstantU32(state, 0x7fffffffu));
+        magnitude = EmitMinMaxU32Value(state, magnitude, bits, true);
+    };
+    if (entryGuard) {
+        for (const auto* input : entryInputs) accumulate(input);
+        const std::uint32_t limit = accepted >= -126 ? static_cast<std::uint32_t>(accepted + 127) << 23u : 1u << static_cast<unsigned>(accepted + 149);
+        const auto special = Binary(state, spv::OpUGreaterThan, TypeBool(state), magnitude, ConstantU32(state, limit));
+        const auto fast = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlDontFlattenMask);
+        state.module.AddFunction(spv::OpBranchConditional, special, exceptional, fast);
+        EmitLabel(state, fast);
+    } else for (const auto* value : sources) if (!members.contains(value)) accumulate(value);
+    for (const auto* value : suffix) {
+        if (bypassed.contains(value)) ctx.Define(*value, ctx.Def(value->Argument(2)));
+        else EmitDirectInstruction(ctx, *value);
+        if (!entryGuard && uniqueSources.contains(value)) accumulate(value);
+    }
+    const auto fastLabel = state.currentLabel;
+    if (entryGuard) state.module.AddFunction(spv::OpBranch, merge);
+    else {
+        const auto special = Binary(state, spv::OpUGreaterThan, TypeBool(state), magnitude, ConstantU32(state, 0x7f800000u));
+        state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlDontFlattenMask);
+        state.module.AddFunction(spv::OpBranchConditional, special, exceptional, merge);
+    }
+    EmitLabel(state, exceptional);
+    for (const auto* value : suffix) EmitDirectInstruction(exact, *value);
+    const auto exactLabel = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, merge);
+    for (const auto* output : suffix) {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpPhi, TypeId(state, output->Type()), result, ctx.Def(output), fastLabel, exact.Def(output), exactLabel);
+        ctx.definitions.Erase(output);
+        ctx.definitions.Emplace(output, result);
+    }
+    return true;
+}
+
 void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrBlock* block) {
     auto& state = ctx.state;
     state.currentBlock = block;
     EmitLabel(state, ctx.Label(block));
+    std::unordered_map<const IrValue*, std::vector<const IrValue*>> regions;
+    std::unordered_set<const IrValue*> grouped;
+    const auto* info = BlockInfoFor(state.program, block);
+    if (state.laneCount == 1u && !state.continueTarget && info != nullptr && !info->terminator.loopHeader) {
+        std::vector<const IrValue*> region;
+        const auto finish = [&] {
+            if (region.size() > 1u) {
+                std::size_t queries = 0u;
+                for (const auto* value : region) queries += RegionNanSource(value) != nullptr;
+                if (queries > 1u) {
+                    regions.emplace(region.front(), region);
+                    grouped.insert(region.begin(), region.end());
+                }
+            }
+            region.clear();
+        };
+        for (const auto* value : block->Instructions()) {
+            if (RegionArithmetic(value)) region.push_back(value);
+            else finish();
+        }
+        finish();
+    }
     bool emittedNonPhi = false;
     // Wave LDS ordering (see WaveLdsScope): a barrier separates an LDS write from the next LDS access
     // and a read from the next write. The block may be entered right after a write.
     bool ldsWritten = true;
     bool ldsRead = false;
     for (const IrValue* inst : block->Instructions()) {
+        if (const auto found = regions.find(inst); found != regions.end()) {
+            if (!EmitNanRegion(ctx, found->second)) for (const auto* value : found->second) EmitDirectInstruction(ctx, *value);
+        }
+        if (grouped.contains(inst)) { emittedNonPhi = true; continue; }
         if (inst->Opcode() == IrOpcode::Phi) {
             if (emittedNonPhi) {
                 ctx.Fail(*inst, "appears after a non-Phi instruction");
@@ -723,7 +1078,9 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             } else if (access != SharedAccess::None) {
                 const bool writes = access != SharedAccess::Read;
                 if (ldsWritten || (writes && ldsRead)) {
-                    state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, state.waveLdsScope), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
+                    const auto semantics = ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(state));
+                    if (state.waveLdsMemoryBarriers && state.waveLdsScope == spv::ScopeSubgroup) state.module.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeSubgroup), semantics);
+                    else state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, state.waveLdsScope), ConstantU32(state, spv::ScopeWorkgroup), semantics);
                     ldsWritten = false;
                     ldsRead = false;
                 }
@@ -737,8 +1094,8 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
                 ctx.Fail(*inst, "requires a second lane context");
             }
             if (half != 0 && shared) {
-                if (const auto found = ctx.definitions.find(inst); found != ctx.definitions.end()) {
-                    ctx.otherHalf->Define(*inst, found->second);
+                if (const auto* found = ctx.definitions.Find(inst)) {
+                    ctx.otherHalf->Define(*inst, *found);
                     continue;
                 }
             }
@@ -766,10 +1123,32 @@ void PatchStructuredPhis(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
     }
 }
 
+bool CommunicatesThroughMemory(IrOpcode opcode) {
+    const auto buffer = BufferAccessOf(opcode);
+    const auto address = AddressOpcodeInfoOf(opcode).access;
+    const auto image = ImageOpcodeInfoOf(opcode).access;
+    return SharedAccessOf(opcode) != SharedAccess::None || buffer == BufferAccess::Write || buffer == BufferAccess::Atomic || address == AddressAccess::Write || address == AddressAccess::Atomic || image == ImageAccess::Write || image == ImageAccess::Atomic;
 }
 
-void EmitControlFlow(SpirvModule& module, const IrProgram& program) {
-    throw std::runtime_error("EmitControlFlow not implemented");
+bool AccessesMemory(IrOpcode opcode) {
+    return opcode == IrOpcode::ReadConst || opcode == IrOpcode::ReadConstBuffer || SharedAccessOf(opcode) != SharedAccess::None || BufferAccessOf(opcode) != BufferAccess::None || AddressOpcodeInfoOf(opcode).access != AddressAccess::None || ImageOpcodeInfoOf(opcode).access != ImageAccess::None;
+}
+
+bool PrecedesEveryMemoryAccess(const IrProgram& program, const IrValue& barrier) {
+    const auto& blocks = program.BlockOrder();
+    const IrBlock* block = blocks.empty() ? nullptr : blocks.front();
+    for (std::size_t steps = 0; block != nullptr && steps < blocks.size(); ++steps) {
+        for (const auto* instruction : block->Instructions()) {
+            if (instruction == &barrier) return true;
+            if (AccessesMemory(instruction->Opcode())) return false;
+        }
+        if (block->Successors().size() != 1u) return false;
+        block = block->Successors().front();
+        if (block->Predecessors().size() != 1u) return false;
+    }
+    return false;
+}
+
 }
 
 void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& functionState, const IrProgram& program) {
@@ -785,6 +1164,7 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         state.module.AddFunction(spv::OpStore, state.loopGuardVisits, ConstantU32(state, 0u));
         state.module.AddFunction(spv::OpStore, state.loopGuardPc, ConstantU32(state, 0u));
     }
+    PlanFaultCheckDominators(state, program);
     state.module.AddFunction(spv::OpBranch, context.Label(blocks.front()));
     static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
     if (debug) {
@@ -800,16 +1180,19 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         if (block == nullptr) {
             context.Fail("structured control flow contains a null block");
         }
+        state.bufferLengths.clear();
         const BlockInfo* info = BlockInfoFor(program, block);
         if (info == nullptr) {
             context.Fail("structured control flow block has no terminator metadata");
         }
         const bool stops = state.bdaStopsInvocations;
-        state.bdaStopsInvocations = stops && !IsContinueTarget(program, info->id);
+        state.continueTarget = IsContinueTarget(program, info->id);
+        state.bdaStopsInvocations = stops && !state.continueTarget;
         EmitStructuredBlock(context, functionState, block);
         functionState.blockExitLabels.emplace(block, state.currentLabel);
         EmitStructuredTerminator(context, program, *info);
         state.bdaStopsInvocations = stops;
+        state.continueTarget = false;
     }
     PatchStructuredPhis(context, functionState);
 }
@@ -817,10 +1200,20 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
 void EmitVoid(SpirvValueEmitContext&) {
 }
 
-void EmitBarrier(SpirvEmitterState& state) {
+void EmitBarrier(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    auto& state = ctx.state;
+    if (state.program.Resources().stage == IrShaderStage::Vertex) {
+        if (PrecedesEveryMemoryAccess(state.program, inst)) return;
+        for (const auto* block : state.program.BlockOrder()) {
+            for (const auto* instruction : block->Instructions()) {
+                if (CommunicatesThroughMemory(instruction->Opcode())) ctx.Fail(inst, "s_barrier in a vertex program that accesses LDS or GDS or writes memory is not implemented");
+            }
+        }
+        return;
+    }
     const bool tessellation = state.program.Resources().stage == IrShaderStage::TessellationControl;
     const auto memoryScope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
-    const auto semantics = tessellation ? spv::MemorySemanticsMaskNone : spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask;
+    const std::uint32_t semantics = tessellation ? static_cast<std::uint32_t>(spv::MemorySemanticsMaskNone) : spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(state);
     state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, memoryScope), ConstantU32(state, semantics));
 }
 
@@ -834,6 +1227,77 @@ void EmitReference(SpirvValueEmitContext& context) {
 
 void EmitReferenceU32(SpirvValueEmitContext& context) {
     EmitVoid(context);
+}
+
+void EmitUnlinkedCall(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t low, std::uint32_t high, std::uint32_t programCounter) {
+    auto& state = ctx.state;
+    if (state.faultBufferVariable == 0) ctx.Fail(inst, "calls an unlinked target without a fault buffer");
+    RecordBdaFaultWords(state, low, high, ConstantU32(state, 0u), programCounter, BdaAbi::FaultReason::UnlinkedCall);
+    StopBdaInvocationIf(state, ConstantBool(state, true));
+}
+
+void EmitWindowLaneGuard(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t index, std::uint32_t value, std::uint32_t current, std::uint32_t slot, std::uint32_t lane) {
+    auto& state = ctx.state;
+    if (state.faultBufferVariable == 0) ctx.Fail(inst, "checks a spilled lane without a fault buffer");
+    const auto boolean = TypeBool(state);
+    const auto ownLane = Binary(state, spv::OpIEqual, boolean, EmitSubgroupLocalInvocationId(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, state.program.WaveSize() - 1u)));
+    const auto overwritten = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpIEqual, boolean, index, slot), Binary(state, spv::OpINotEqual, boolean, value, current));
+    EmitIfCondition(state, Binary(state, spv::OpLogicalAnd, boolean, ownLane, overwritten), [&] { RecordBdaFaultWords(state, slot, lane, value, ConstantU32(state, 0u), BdaAbi::FaultReason::WindowLaneSpill); });
+}
+
+std::uint32_t EmitNanPropagateF32(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t result, std::uint32_t, std::uint32_t invalid, std::uint32_t source0, std::uint32_t source1, std::uint32_t source2) {
+    auto& state = ctx.state;
+    const auto flags = inst.Argument(1)->Resolve()->ImmediateU32();
+    const bool quiet = (flags & 1u) != 0u;
+    const auto count = flags >> 1u;
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto isNan = [&](std::uint32_t bits) { return Binary(state, spv::OpUGreaterThan, boolean, Binary(state, spv::OpBitwiseAnd, u32, bits, ConstantU32(state, 0x7fffffffu)), ConstantU32(state, 0x7f800000u)); };
+    const std::array<std::uint32_t, 3> sources{source0, source1, source2};
+    const auto mayBeNan = [&](std::uint32_t index) {
+        const IrValue* source = inst.Argument(3u + index)->Resolve();
+        return !source->HasImmediate() || (source->ImmediateU32() & 0x7fffffffu) > 0x7f800000u;
+    };
+    bool anySource = false;
+    for (std::uint32_t index = 0; index < count; ++index) anySource = anySource || mayBeNan(index);
+    const auto bits = Unary(state, spv::OpBitcast, u32, result);
+    const auto resultNan = isNan(bits);
+    if (!anySource) return Unary(state, spv::OpBitcast, TypeF32(state), Select(state, u32, resultNan, ConstantU32(state, 0xffc00000u), bits));
+    const auto entry = state.currentLabel;
+    const auto propagate = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlDontFlattenMask);
+    state.module.AddFunction(spv::OpBranchConditional, resultNan, propagate, merge);
+    EmitLabel(state, propagate);
+    auto propagated = ConstantU32(state, 0xffc00000u);
+    const bool guardedAddend = count == 3u && !(inst.Argument(2)->Resolve()->HasImmediate() && !inst.Argument(2)->Resolve()->ImmediateBool());
+    const auto repeatsEarlier = [&](std::uint32_t index) {
+        for (std::uint32_t earlier = 0; earlier < index; ++earlier) {
+            if (sources[earlier] == sources[index]) return true;
+        }
+        return false;
+    };
+    for (auto index = count; index-- > 0u;) {
+        if (!mayBeNan(index) || repeatsEarlier(index)) continue;
+        const IrValue* source = inst.Argument(3u + index)->Resolve();
+        const auto sourceBits = source->HasImmediate() ? ConstantU32(state, source->ImmediateU32()) : Unary(state, spv::OpBitcast, u32, sources[index]);
+        auto selected = isNan(sourceBits);
+        if (guardedAddend && index == 2u) selected = Binary(state, spv::OpLogicalAnd, boolean, selected, Unary(state, spv::OpLogicalNot, boolean, invalid));
+        propagated = Select(state, u32, selected, sourceBits, propagated);
+    }
+    if (quiet) propagated = Binary(state, spv::OpBitwiseOr, u32, propagated, ConstantU32(state, 0x00400000u));
+    const auto propagateExit = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, merge);
+    const auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpPhi, u32, value, propagated, propagateExit, bits, entry);
+    return Unary(state, spv::OpBitcast, TypeF32(state), value);
+}
+
+void EmitDescriptorFault(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t condition, std::uint32_t low, std::uint32_t high, std::uint32_t programCounter) {
+    auto& state = ctx.state;
+    if (state.faultBufferVariable == 0) ctx.Fail(inst, "reports an invalid descriptor without a fault buffer");
+    EmitIfCondition(state, condition, [&] { RecordBdaFaultWords(state, low, high, ConstantU32(state, 0u), programCounter, BdaAbi::FaultReason::InvalidDescriptor); });
 }
 
 void EmitControlNop(SpirvValueEmitContext& context) {

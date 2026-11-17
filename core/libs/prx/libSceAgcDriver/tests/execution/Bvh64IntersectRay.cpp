@@ -152,7 +152,7 @@ public:
 #endif
         Require(block != nullptr, "bvh64 intersect ray: cannot allocate the guest block");
         std::memset(block, 0, BlockBytes);
-        GuestAllocations::Mutation().Add(block, BlockBytes, true, false);
+        GuestAllocations::Mutation().Add(block, BlockBytes, true, false, true);
     }
 
     ~GuestBlock() {
@@ -230,7 +230,7 @@ void FillInput(std::uint64_t nodeBias) {
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
-    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x01016facu};
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
 }
 
 std::array<std::uint32_t, 4> BvhDescriptor(std::uint64_t base, std::uint64_t lastNode) {

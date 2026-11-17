@@ -1,7 +1,10 @@
+#include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "Translation/TranslationContext.hpp"
+#include "Recompiler.hpp"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
+#include <string>
 
 namespace ShaderRecompiler {
 
@@ -10,6 +13,24 @@ namespace {
 DppMoveFlags dppFlags(const RdnaOperand& operand) {
     const auto control = operand.dpp8 ? DppMoveFlags::Lanes8 | operand.dppCtrl : operand.dppCtrl;
     return {control, static_cast<std::uint8_t>(operand.dppRowMask), static_cast<std::uint8_t>(operand.dppBankMask), operand.dppFetchInactive, operand.dppBoundCtrl};
+}
+
+const IrValue* constantF32Bits(const IrValue& value) {
+    if (value.Opcode() != IrOpcode::BitCastF32U32) return nullptr;
+    const IrValue* bits = value.Argument(0);
+    return bits->HasImmediate() ? bits : nullptr;
+}
+
+bool keepsProductOutOfTinyRange(const IrValue& factor) {
+    const IrValue* bits = constantF32Bits(factor);
+    if (bits == nullptr) return false;
+    const std::uint32_t exponent = (bits->ImmediateU32() >> 23u) & 0xffu;
+    return exponent == 0u || exponent >= 127u;
+}
+
+bool hasUnitSignificand(const IrValue& factor) {
+    const IrValue* bits = constantF32Bits(factor);
+    return bits != nullptr && (bits->ImmediateU32() & 0x007fffffu) == 0u;
 }
 
 }
@@ -49,6 +70,8 @@ RdnaOperand TranslationContext::destinationOperand(const RdnaInstruction& inst) 
 RdnaOperand TranslationContext::accumulatorOperand(const RdnaInstruction& inst) {
     RdnaOperand accumulator = inst.destination;
     accumulator.dpp = false;
+    accumulator.absolute = inst.source2.absolute;
+    accumulator.negate = inst.source2.negate;
     return accumulator;
 }
 
@@ -125,6 +148,59 @@ RdnaOperand TranslationContext::plainOperand(const RdnaOperand& operand) {
     return result;
 }
 
+IrU32 TranslationContext::flushF32Denormal(IrU32 bits, std::uint32_t flushBit) {
+    if ((f32DenormalFlush & flushBit) == 0u) return bits;
+    if (bits.Value().HasImmediate()) {
+        const std::uint32_t value = bits.Value().ImmediateU32();
+        return (value & 0x7f800000u) == 0u ? IrU32(ir.Constant(value & 0x80000000u)) : bits;
+    }
+    const IrU1 denormal(ir.IEqual(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7f800000u)), ir.Constant(0u)));
+    return IrU32(ir.Select(denormal.Value(), ir.BitwiseAnd(bits.Value(), ir.Constant(0x80000000u)), bits.Value()));
+}
+
+IrF32 TranslationContext::flushTinyProduct(IrValue* lhs, IrValue* rhs, IrValue* product, IrValue* addend, bool afterRounding) {
+    if ((f32DenormalFlush & 2u) == 0u || ((f32DenormalFlush & 1u) != 0u && (keepsProductOutOfTinyRange(*lhs) || keepsProductOutOfTinyRange(*rhs)))) return IrF32(*product);
+    IrValue& lhsBits = ir.BitCastU32(*lhs);
+    IrValue& rhsBits = ir.BitCastU32(*rhs);
+    const std::uint32_t roundMode = floatMode.has_value() ? floatMode->floatMode & 3u : 0u;
+    const auto zeroAddend = [&](IrValue* tiny) -> IrValue* {
+        if (addend == nullptr) return tiny;
+        return &ir.LogicalAnd(*tiny, ir.IEqual(ir.BitwiseAnd(ir.BitCastU32(*addend), ir.Constant(0x7fffffffu)), ir.Constant(0u)));
+    };
+    if (afterRounding && roundMode == 0u) {
+        IrValue& scaled = ir.BitwiseAnd(ir.BitCastU32(ir.Emit(IrOpcode::FPMul32, IrType::F32, {&ir.Emit(IrOpcode::FPMul32, IrType::F32, {lhs, &ir.ConstantF32(0x1p64f)}), rhs})), ir.Constant(0x7fffffffu));
+        IrValue* tiny = zeroAddend(&ir.ULessThan(ir.ISub(scaled, ir.Constant(1u)), ir.Constant(0x207fffffu)));
+        IrValue* smallestNormal = zeroAddend(&ir.IEqual(scaled, ir.Constant(0x20800000u)));
+        IrValue& sign = ir.BitwiseAnd(ir.BitwiseXor(lhsBits, rhsBits), ir.Constant(0x80000000u));
+        IrValue& flushed = ir.Emit(IrOpcode::SelectF32, IrType::F32, {tiny, &ir.BitCastF32(sign), product});
+        return IrF32(ir.Emit(IrOpcode::SelectF32, IrType::F32, {smallestNormal, &ir.BitCastF32(ir.BitwiseOr(sign, ir.Constant(0x00800000u))), &flushed}));
+    }
+    const auto exponent = [&](IrValue& bits) -> IrValue& { return ir.Emit(IrOpcode::BitFieldUExtract, IrType::U32, {&bits, &ir.Constant(23u), &ir.Constant(8u)}); };
+    const auto significand = [&](IrValue& bits) -> IrValue& { return ir.BitwiseOr(ir.BitwiseAnd(bits, ir.Constant(0x007fffffu)), ir.Constant(0x00800000u)); };
+    IrValue& lhsExponent = exponent(lhsBits);
+    IrValue& rhsExponent = exponent(rhsBits);
+    const auto finiteNonZero = [&](IrValue& value) -> IrValue& { return ir.LogicalAnd(ir.INotEqual(value, ir.Constant(0u)), ir.INotEqual(value, ir.Constant(0xffu))); };
+    IrValue* carry = &ir.Constant(0u);
+    IrValue* roundsUp = nullptr;
+    if (!hasUnitSignificand(*lhs) && !hasUnitSignificand(*rhs)) {
+        IrValue& lhsSignificand = significand(lhsBits);
+        IrValue& rhsSignificand = significand(rhsBits);
+        IrValue& high = ir.Emit(IrOpcode::UMulHi, IrType::U32, {&lhsSignificand, &rhsSignificand});
+        carry = &ir.Select(ir.UGreaterThan(high, ir.Constant(0x7fffu)), ir.Constant(1u), ir.Constant(0u));
+        if (afterRounding && roundMode != 3u) roundsUp = &ir.LogicalAnd(ir.IEqual(high, ir.Constant(0x7fffu)), ir.UGreaterThan(ir.IMul(lhsSignificand, rhsSignificand), ir.Constant(0xff800000u)));
+    }
+    IrValue& exponentSum = ir.IAdd(ir.IAdd(lhsExponent, rhsExponent), *carry);
+    IrValue* tiny = zeroAddend(&ir.LogicalAnd(ir.LogicalAnd(finiteNonZero(lhsExponent), finiteNonZero(rhsExponent)), ir.ULessThan(exponentSum, ir.Constant(128u))));
+    IrValue& sign = ir.BitwiseAnd(ir.BitwiseXor(lhsBits, rhsBits), ir.Constant(0x80000000u));
+    IrValue* rounded = &sign;
+    if (roundsUp != nullptr) {
+        roundsUp = &ir.LogicalAnd(ir.IEqual(exponentSum, ir.Constant(127u)), *roundsUp);
+        roundsUp = &ir.LogicalAnd(*roundsUp, ir.IEqual(sign, ir.Constant(roundMode == 1u ? 0u : 0x80000000u)));
+        rounded = &ir.Select(*roundsUp, ir.BitwiseOr(sign, ir.Constant(0x00800000u)), sign);
+    }
+    return IrF32(ir.Emit(IrOpcode::SelectF32, IrType::F32, {tiny, &ir.BitCastF32(*rounded), product}));
+}
+
 IrValue* TranslationContext::readOperand(const RdnaOperand& operand, IrType type) {
     if (type == IrType::U16) {
         return &ir.Emit(IrOpcode::ConvertU16U32, IrType::U16, {&applyBitSourceModifiers(operand, readRawU32(operand)).Value()});
@@ -150,15 +226,31 @@ IrValue* TranslationContext::readOperand(const RdnaOperand& operand, IrType type
         const std::array<IrU32, 2> pair = readU32Pair(operand);
         return &ir.ConstructU64(pair[0].Value(), pair[1].Value());
     }
-    IrU32 bits = applyBitSourceModifiers(operand, readRawU32(operand));
-    if (operand.absolute) {
-        bits = IrU32(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)));
+    if (type == IrType::U32x2) {
+        const std::array<IrU32, 2> pair = readU32Pair(operand);
+        return &ir.Emit(IrOpcode::CompositeConstructU32x2, IrType::U32x2, {&pair[0].Value(), &pair[1].Value()});
     }
-    if (operand.negate) {
-        bits = IrU32(ir.BitwiseXor(bits.Value(), ir.Constant(0x80000000u)));
+    if (type == IrType::U32x3) {
+        return &ir.Emit(IrOpcode::CompositeConstructU32x3, IrType::U32x3, {&readU32(operand).Value(), &readU32(offsetOperand(operand, 1u)).Value(), &readU32(offsetOperand(operand, 2u)).Value()});
+    }
+    if (type == IrType::U32x4) {
+        return &ir.Emit(IrOpcode::CompositeConstructU32x4, IrType::U32x4, {&readU32(operand).Value(), &readU32(offsetOperand(operand, 1u)).Value(), &readU32(offsetOperand(operand, 2u)).Value(), &readU32(offsetOperand(operand, 3u)).Value()});
+    }
+    IrU32 bits = applyBitSourceModifiers(operand, readRawU32(operand));
+    if (bits.Value().HasImmediate()) {
+        const std::uint32_t value = bits.Value().ImmediateU32();
+        const std::uint32_t magnitude = operand.absolute ? value & 0x7fffffffu : value;
+        bits = IrU32(ir.Constant(operand.negate ? magnitude ^ 0x80000000u : magnitude));
+    } else {
+        if (operand.absolute) {
+            bits = IrU32(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)));
+        }
+        if (operand.negate) {
+            bits = IrU32(ir.BitwiseXor(bits.Value(), ir.Constant(0x80000000u)));
+        }
     }
     if (TypesOverlap(type, IrType::F32) && !TypesOverlap(type, IrType::U32)) {
-        return &ir.BitCastF32(bits.Value());
+        return &ir.BitCastF32(flushF32Denormal(bits).Value());
     }
     if (!TypesOverlap(type, IrType::U32)) {
         throw std::runtime_error("TranslationContext::readOperand requested unsupported operand type");
@@ -171,7 +263,11 @@ void TranslationContext::writeOperand(const RdnaOperand& operand, IrValue* value
         return;
     }
     IrType type = value->Type();
+    if (type == IrType::Void) {
+        return;
+    }
     if (type == IrType::F32) {
+        if ((f32DenormalFlush & 2u) != 0u) value = &ir.BitCastF32(flushF32Denormal(IrU32(ir.BitCastU32(*value)), 2u).Value());
         value = &applyF32ResultModifiers(operand, IrF32(*value)).Value();
         type = IrType::F32;
     }
@@ -211,12 +307,25 @@ void TranslationContext::writeOperand(const RdnaOperand& operand, IrValue* value
         write16Bits(operand, IrU32(ir.Emit(IrOpcode::ConvertU32U16, IrType::U32, {&bits.Value()})));
         return;
     }
-    if (type == IrType::U64) {
+    if (type == IrType::U64 || type == IrType::U32x2) {
         writeU32Pair(operand, {IrU32(ir.CompositeExtract(*value, 0u)), IrU32(ir.CompositeExtract(*value, 1u))});
         return;
     }
     if (type == IrType::F32) {
         writeRawU32(operand, IrU32(ir.BitCastU32(*value)));
+        return;
+    }
+    if (type == IrType::U32x3) {
+        writeRawU32(operand, IrU32(ir.CompositeExtract(*value, 0u)));
+        writeRawU32(offsetOperand(operand, 1u), IrU32(ir.CompositeExtract(*value, 1u)));
+        writeRawU32(offsetOperand(operand, 2u), IrU32(ir.CompositeExtract(*value, 2u)));
+        return;
+    }
+    if (type == IrType::U32x4) {
+        writeRawU32(operand, IrU32(ir.CompositeExtract(*value, 0u)));
+        writeRawU32(offsetOperand(operand, 1u), IrU32(ir.CompositeExtract(*value, 1u)));
+        writeRawU32(offsetOperand(operand, 2u), IrU32(ir.CompositeExtract(*value, 2u)));
+        writeRawU32(offsetOperand(operand, 3u), IrU32(ir.CompositeExtract(*value, 3u)));
         return;
     }
     if (type != IrType::U32) {
@@ -248,46 +357,199 @@ IrU32 TranslationContext::applyBitSourceModifiers(const RdnaOperand& operand, Ir
     return value;
 }
 
-IrF32 TranslationContext::applyF32ResultModifiers(const RdnaOperand& operand, IrF32 value) {
-    if (operand.omod != 0u) {
-        IrValue& bits = ir.BitCastU32(value.Value());
-        IrValue& magnitude = ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu));
-        IrValue& sign = ir.BitwiseAnd(bits, ir.Constant(0x80000000u));
-        IrValue* result = nullptr;
-        if (operand.omod == 3u) {
-            result = &ir.Select(ir.ULessThan(magnitude, ir.Constant(0x01000000u)), sign, ir.ISub(bits, ir.Constant(0x00800000u)));
-        } else {
-            const std::uint32_t exponentStep = operand.omod == 1u ? 0x00800000u : 0x01000000u;
-            result = &ir.Select(ir.ULessThan(magnitude, ir.Constant(0x7f800000u - exponentStep)), ir.IAdd(bits, ir.Constant(exponentStep)), ir.BitwiseOr(sign, ir.Constant(0x7f800000u)));
+bool TranslationContext::outputModifierApplies(std::uint32_t denormalShift) const {
+    if (((rounding.unknown >> denormalShift) & 2u) != 0u) {
+        throw std::runtime_error("output modifier on a result whose MODE denormal bits differ between the paths reaching it or were written from an SGPR: not implemented");
+    }
+    const std::uint32_t mode = floatMode.has_value() ? floatMode->floatMode : 0xc0u;
+    return !ieeeMode && ((mode >> denormalShift) & 2u) == 0u;
+}
+
+IrU32 TranslationContext::quietNan32(IrU32 bits) {
+    return ieeeMode ? IrU32(ir.BitwiseOr(bits.Value(), ir.Constant(0x00400000u))) : bits;
+}
+
+IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct, bool multiplication) {
+    if (!ExactF32Arithmetic()) return result;
+    const auto isNan = [&](IrValue& value) -> IrValue& { return ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {&value}); };
+    IrValue* candidate = nullptr;
+    const bool normalFactor = multiplication && std::any_of(sources.begin(), sources.end(), [](const IrValue* source) {
+        const IrValue* constant = constantF32Bits(*source);
+        if (constant == nullptr) return false;
+        const std::uint32_t exponent = (constant->ImmediateU32() >> 23u) & 0xffu;
+        return exponent != 0u && exponent != 0xffu;
+    });
+    if (!normalFactor) {
+        std::array<IrValue*, 3> operands{};
+        std::uint32_t count = 0u;
+        for (IrValue* source : sources) operands.at(count++) = source;
+        for (auto index = count; index < operands.size(); ++index) operands[index] = operands[0];
+        const std::uint32_t flags = (ieeeMode ? 1u : 0u) | (count << 1u);
+        IrValue& invalid = invalidProduct != nullptr && count == 3u ? *invalidProduct : ir.ConstantBool(false);
+        return &ir.Emit(IrOpcode::NanPropagateF32, IrType::F32, {result, &ir.Constant(flags), &invalid, operands[0], operands[1], operands[2]});
+    }
+    for (auto source = sources.end(); source != sources.begin();) {
+        --source;
+        IrValue& sourceBits = ir.BitCastU32(**source);
+        if (candidate == nullptr) {
+            candidate = invalidProduct != nullptr && sources.size() == 3u ? &ir.Select(*invalidProduct, ir.Constant(0u), sourceBits) : &sourceBits;
+            continue;
         }
-        result = &ir.Select(ir.ULessThan(magnitude, ir.Constant(0x00800000u)), ir.Constant(0u), *result);
-        result = &ir.Select(ir.UGreaterThan(magnitude, ir.Constant(0x7f7fffffu)), bits, *result);
-        value = IrF32(ir.BitCastF32(*result));
+        candidate = &ir.Select(isNan(**source), sourceBits, *candidate);
+    }
+    IrValue& fallback = normalFactor ? ir.BitCastU32(*result) : ir.Select(isNan(*result), ir.Constant(0xffc00000u), ir.BitCastU32(*result));
+    return &ir.BitCastF32(ir.Select(isNan(ir.BitCastF32(*candidate)), quietNan32(IrU32(*candidate)).Value(), fallback));
+}
+
+IrValue* TranslationContext::propagatedNanResultF32(std::initializer_list<IrValue*> sources, IrValue* result) {
+    if (!ExactF32Arithmetic()) return result;
+    const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
+    IrValue* nan = &ir.Constant(0xffc00000u);
+    for (auto source = sources.end(); source != sources.begin();) {
+        --source;
+        IrValue& sourceBits = ir.BitCastU32(**source);
+        nan = &ir.Select(isNan(sourceBits), quietNan32(IrU32(sourceBits)).Value(), *nan);
+    }
+    IrValue& bits = ir.BitCastU32(*result);
+    return &ir.BitCastF32(ir.Select(isNan(bits), *nan, bits));
+}
+
+IrValue& TranslationContext::invalidProductF32(IrValue* lhs, IrValue* rhs) {
+    IrValue& lhsMagnitude = ir.BitwiseAnd(ir.BitCastU32(*lhs), ir.Constant(0x7fffffffu));
+    IrValue& rhsMagnitude = ir.BitwiseAnd(ir.BitCastU32(*rhs), ir.Constant(0x7fffffffu));
+    const auto zero = [&](IrValue& magnitude) -> IrValue& { return (f32DenormalFlush & 4u) != 0u ? ir.ULessThan(magnitude, ir.Constant(0x00800000u)) : ir.IEqual(magnitude, ir.Constant(0u)); };
+    const auto infZero = [&](IrValue& inf, IrValue& factor) -> IrValue& { return ir.LogicalAnd(ir.IEqual(inf, ir.Constant(0x7f800000u)), zero(factor)); };
+    return ir.LogicalOr(infZero(lhsMagnitude, rhsMagnitude), infZero(rhsMagnitude, lhsMagnitude));
+}
+
+IrValue& TranslationContext::invalidOperationF32(std::initializer_list<IrValue*> sources, IrValue& invalidProduct) {
+    IrValue* noNan = &ir.ConstantBool(true);
+    for (IrValue* source : sources) {
+        IrValue& nan = ir.UGreaterThan(ir.BitwiseAnd(ir.BitCastU32(*source), ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u));
+        noNan = &ir.LogicalAnd(*noNan, ir.LogicalNot(nan));
+    }
+    return ir.LogicalOr(invalidProduct, *noNan);
+}
+
+IrU32 TranslationContext::quietNan16(IrU32 bits) {
+    return ieeeMode ? IrU32(ir.BitwiseOr(bits.Value(), ir.Constant(0x0200u))) : bits;
+}
+
+std::array<IrU32, 2> TranslationContext::quietNan64(const std::array<IrU32, 2>& bits) {
+    return ieeeMode ? std::array<IrU32, 2>{bits[0], IrU32(ir.BitwiseOr(bits[1].Value(), ir.Constant(0x00080000u)))} : bits;
+}
+
+IrF32 TranslationContext::scaleF32Result(std::uint32_t omod, IrF32 value) {
+    IrValue& bits = ir.BitCastU32(value.Value());
+    IrValue& magnitude = ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu));
+    IrValue& sign = ir.BitwiseAnd(bits, ir.Constant(0x80000000u));
+    IrValue* result = nullptr;
+    if (omod == 3u) {
+        result = &ir.Select(ir.ULessThan(magnitude, ir.Constant(0x01000000u)), sign, ir.ISub(bits, ir.Constant(0x00800000u)));
+    } else {
+        const std::uint32_t exponentStep = omod == 1u ? 0x00800000u : 0x01000000u;
+        result = &ir.Select(ir.ULessThan(magnitude, ir.Constant(0x7f800000u - exponentStep)), ir.IAdd(bits, ir.Constant(exponentStep)), ir.BitwiseOr(sign, ir.Constant(0x7f800000u)));
+    }
+    result = &ir.Select(ir.ULessThan(magnitude, ir.Constant(0x00800000u)), ir.Constant(0u), *result);
+    result = &ir.Select(ir.UGreaterThan(magnitude, ir.Constant(0x7f7fffffu)), bits, *result);
+    return IrF32(ir.BitCastF32(*result));
+}
+
+IrF32 TranslationContext::applyF32ResultModifiers(const RdnaOperand& operand, IrF32 value) {
+    if (operand.omod != 0u && outputModifierApplies(4u)) {
+        value = scaleF32Result(operand.omod, value);
     }
     if (operand.clamp) {
-        value = IrF32(ir.Emit(IrOpcode::FPSaturate32, IrType::F32, {&value.Value()}));
+        const IrF32 saturated(ir.Emit(IrOpcode::FPSaturate32, IrType::F32, {&value.Value()}));
+        value = dx10Clamp() ? saturated : selectF32(IrU1(ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {&value.Value()})), value, saturated);
     }
     return value;
 }
 
+IrF32 TranslationContext::scaleF16Result(std::uint32_t omod, IrF32 value) {
+    IrValue& bits = ir.BitCastU32(value.Value());
+    IrValue& magnitude = ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu));
+    IrValue& sign = ir.BitwiseAnd(bits, ir.Constant(0x80000000u));
+    IrValue* result = nullptr;
+    if (omod == 3u) {
+        result = &ir.Select(ir.ULessThan(magnitude, ir.Constant(0x39000000u)), sign, ir.ISub(bits, ir.Constant(0x00800000u)));
+    } else {
+        const std::uint32_t exponentStep = omod == 1u ? 0x00800000u : 0x01000000u;
+        result = &ir.Select(ir.ULessThan(magnitude, ir.Constant(0x47800000u - exponentStep)), ir.IAdd(bits, ir.Constant(exponentStep)), ir.BitwiseOr(sign, ir.Constant(0x47800000u)));
+    }
+    result = &ir.Select(ir.ULessThan(magnitude, ir.Constant(0x38800000u)), sign, *result);
+    result = &ir.Select(ir.UGreaterThan(magnitude, ir.Constant(0x7f7fffffu)), bits, *result);
+    return IrF32(ir.BitCastF32(*result));
+}
+
+IrU32 TranslationContext::scaleF16Bits(std::uint32_t omod, IrU32 bits) {
+    IrValue& raw = bits.Value();
+    IrValue& magnitude = ir.BitwiseAnd(raw, ir.Constant(0x7fffu));
+    IrValue& sign = ir.BitwiseAnd(raw, ir.Constant(0x8000u));
+    IrValue* result = nullptr;
+    if (omod == 3u) {
+        result = &ir.Select(ir.ULessThan(magnitude, ir.Constant(0x0800u)), sign, ir.ISub(raw, ir.Constant(0x0400u)));
+    } else {
+        const std::uint32_t exponentStep = omod == 1u ? 0x0400u : 0x0800u;
+        result = &ir.Select(ir.ULessThan(magnitude, ir.Constant(0x7c00u - exponentStep)), ir.IAdd(raw, ir.Constant(exponentStep)), ir.BitwiseOr(sign, ir.Constant(0x7c00u)));
+    }
+    result = &ir.Select(ir.ULessThan(magnitude, ir.Constant(0x0400u)), sign, *result);
+    result = &ir.Select(ir.UGreaterThan(magnitude, ir.Constant(0x7bffu)), raw, *result);
+    return IrU32(*result);
+}
+
 IrF32 TranslationContext::applyF16ResultModifiers(const RdnaOperand& operand, IrF32 value) {
+    if (operand.omod != 0u && outputModifierApplies(6u)) {
+        value = scaleF16Result(operand.omod, value);
+    }
+    return clampF16Result(operand, value);
+}
+
+IrF32 TranslationContext::applyF16ResultModifiers(const RdnaOperand& operand, IrF32 value, std::initializer_list<IrValue*> overflowSources) {
+    if (operand.omod != 0u && outputModifierApplies(6u)) {
+        value = scaleF16Result(operand.omod, value);
+    }
+    return clampF16Result(operand, clampF16Overflow(value, overflowSources));
+}
+
+IrF32 TranslationContext::clampF16Result(const RdnaOperand& operand, IrF32 value) {
     if (!operand.clamp) {
         return value;
     }
     const IrF32 zero(ir.ConstantF32(0.0f));
     const IrU1 positive(ir.Emit(IrOpcode::FPOrdGreaterThan32, IrType::U1, {&value.Value(), &zero.Value()}));
     const IrF32 limited(ir.Emit(IrOpcode::FPMin32, IrType::F32, {&value.Value(), &ir.ConstantF32(1.0f)}));
-    return selectF32(positive, limited, zero);
+    const IrF32 clamped = selectF32(positive, limited, zero);
+    return dx10Clamp() ? clamped : selectF32(IrU1(ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {&value.Value()})), value, clamped);
+}
+
+IrF32 TranslationContext::clampF16Overflow(IrF32 value, std::initializer_list<IrValue*> sources) {
+    if (!fp16Overflow()) {
+        return value;
+    }
+    const IrU32 bits(ir.BitCastU32(value.Value()));
+    const IrU32 magnitude(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)));
+    IrU1 overflow(ir.LogicalAnd(ir.LogicalNot(ir.ULessThan(magnitude.Value(), ir.Constant(0x477ff000u))), ir.ULessThan(magnitude.Value(), ir.Constant(0x7f800001u))));
+    for (IrValue* source : sources) {
+        const IrU1 infinite(ir.IEqual(ir.BitwiseAnd(ir.BitCastU32(*source), ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)));
+        overflow = IrU1(ir.LogicalAnd(overflow.Value(), ir.LogicalNot(infinite.Value())));
+    }
+    const IrU32 largest(ir.BitwiseOr(ir.BitwiseAnd(bits.Value(), ir.Constant(0x80000000u)), ir.Constant(0x477fe000u)));
+    return IrF32(ir.BitCastF32(ir.Select(overflow.Value(), largest.Value(), bits.Value())));
 }
 
 IrU32 TranslationContext::clampF16Bits(const RdnaOperand& operand, IrU32 bits) {
+    if (operand.omod != 0u && outputModifierApplies(6u)) {
+        bits = scaleF16Bits(operand.omod, bits);
+    }
     if (!operand.clamp) {
         return bits;
     }
     const IrU32 magnitude(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu)));
     const IrU1 zero(ir.LogicalOr(ir.UGreaterThan(bits.Value(), ir.Constant(0x7fffu)), ir.UGreaterThan(magnitude.Value(), ir.Constant(0x7c00u))));
     const IrU32 limited(ir.Select(ir.UGreaterThan(magnitude.Value(), ir.Constant(0x3c00u)), ir.Constant(0x3c00u), bits.Value()));
-    return IrU32(ir.Select(zero.Value(), ir.Constant(0u), limited.Value()));
+    const IrU32 clamped(ir.Select(zero.Value(), ir.Constant(0u), limited.Value()));
+    return dx10Clamp() ? clamped : IrU32(ir.Select(ir.UGreaterThan(magnitude.Value(), ir.Constant(0x7c00u)), bits.Value(), clamped.Value()));
 }
 
 IrU32 TranslationContext::readScalarCode(std::uint32_t code) {
@@ -303,6 +565,10 @@ IrU32 TranslationContext::readScalarCode(std::uint32_t code) {
             const std::array<IrU32, 2> mask = ballotMask(IrU1(ir.GetExec()));
             return mask[code - 126u];
         }
+        case 235u:
+        case 236u:
+        case 237u:
+        case 238u: return readRawU32(DecodeRdnaScalarSource(code, 0u));
         default: return IrU32(ir.Constant(0u));
     }
 }
@@ -315,28 +581,104 @@ IrU32 TranslationContext::readRawU32(const RdnaOperand& operand) {
         case RdnaOperandKind::Null:
         case RdnaOperandKind::PopsExitingWaveId: return IrU32(ir.Constant(0u));
         case RdnaOperandKind::ScalarRegister: return IrU32(ir.GetScalarReg(static_cast<ScalarReg>(operand.reg)));
-        case RdnaOperandKind::VectorRegister: return IrU32(ir.GetVectorReg(static_cast<VectorReg>(operand.reg)));
+        case RdnaOperandKind::VectorRegister:
+            vectorsRead.set(operand.reg & 0xffu);
+            return IrU32(ir.GetVectorReg(static_cast<VectorReg>(operand.reg)));
         case RdnaOperandKind::VccLo: return IrU32(ir.GetVccLo());
         case RdnaOperandKind::VccHi: return IrU32(ir.GetVccHi());
         case RdnaOperandKind::M0: return IrU32(ir.GetM0());
-        case RdnaOperandKind::ExecLo: return IrU32(ir.GetExecLo());
-        case RdnaOperandKind::ExecHi: return IrU32(ir.GetExecHi());
+        case RdnaOperandKind::ExecLo: return hostExecWord(0u);
+        case RdnaOperandKind::ExecHi: return hostExecWord(1u);
         case RdnaOperandKind::Scc: return IrU32(ir.Select(ir.GetScc(), ir.Constant(1u), ir.Constant(0u)));
         case RdnaOperandKind::VccZ:
         case RdnaOperandKind::ExecZ: {
             const bool vcc = operand.kind == RdnaOperandKind::VccZ;
-            IrU32 mask(vcc ? ir.GetVccLo() : ir.GetExecLo());
+            IrU32 mask(vcc ? IrU32(ir.GetVccLo()) : hostExecWord(0u));
             if (program.WaveSize() == 64u) {
-                mask = IrU32(ir.BitwiseOr(mask.Value(), vcc ? ir.GetVccHi() : ir.GetExecHi()));
+                mask = IrU32(ir.BitwiseOr(mask.Value(), vcc ? ir.GetVccHi() : hostExecWord(1u).Value()));
             }
             const IrU32 zero(ir.Constant(0u));
             return IrU32(ir.Select(ir.IEqual(mask.Value(), zero.Value()), ir.Constant(1u), zero.Value()));
         }
+        case RdnaOperandKind::SrcSharedBase:
+        case RdnaOperandKind::SrcSharedLimit:
+        case RdnaOperandKind::SrcPrivateBase:
+        case RdnaOperandKind::SrcPrivateLimit: return IrU32(ir.Constant(static_cast<std::uint32_t>(RdnaApertureSourceValue(operand))));
         default: throw std::runtime_error("TranslationContext::readRawU32 invalid decoded operand used as a raw U32 source");
     }
 }
 
+IrU32 TranslationContext::shareVectorWrite(const RdnaOperand& operand, IrU32 merged, IrU32 written, bool readByInstruction) {
+    const auto at = " at pc " + std::to_string(currentProgramCounter);
+    const auto name = "wave-shared VGPR v" + std::to_string(operand.reg);
+    if (currentInstruction == nullptr) throw std::runtime_error("a write to " + name + " outside an instruction is not modeled");
+    switch (currentInstruction->family) {
+        case RdnaInstructionFamily::VOP1:
+        case RdnaInstructionFamily::VOP2:
+        case RdnaInstructionFamily::VOP3:
+        case RdnaInstructionFamily::VOP3P:
+            if (readByInstruction || relativeVectorRead) throw std::runtime_error("a VALU instruction that reads and writes " + name + at + " is not modeled");
+            break;
+        default:
+            if (!execLowInactive && !execHighInactive) throw std::runtime_error("a non-VALU write to " + name + at + " while both halves of EXEC may be active is not modeled");
+            break;
+    }
+    IrValue& partnerValue = ir.Emit(IrOpcode::HalfSwapU32, IrType::U32, {&merged.Value()});
+    IrValue& partnerWritten = ir.Emit(IrOpcode::HalfSwapU32, IrType::U32, {&written.Value()});
+    IrValue& low = ir.ULessThan(ir.Emit(IrOpcode::LaneId, IrType::U32, {}), ir.Constant(32u));
+    IrValue& ownWritten = ir.INotEqual(written.Value(), ir.Constant(0u));
+    IrValue& partnerWrote = ir.INotEqual(partnerWritten, ir.Constant(0u));
+    IrValue& takePartner = ir.LogicalAnd(partnerWrote, ir.LogicalOr(low, ir.LogicalNot(ownWritten)));
+    return IrU32(ir.Select(takePartner, partnerValue, merged.Value()));
+}
+
+void TranslationContext::trackInactiveExecHalves(const RdnaInstruction& inst) {
+    const auto keep = [&] {
+        switch (inst.family) {
+            case RdnaInstructionFamily::VOP1:
+            case RdnaInstructionFamily::VOP2:
+            case RdnaInstructionFamily::VOP3:
+            case RdnaInstructionFamily::VOP3P:
+                return inst.destination.kind == RdnaOperandKind::VectorRegister;
+            case RdnaInstructionFamily::DS:
+            case RdnaInstructionFamily::MUBUF:
+            case RdnaInstructionFamily::MTBUF:
+            case RdnaInstructionFamily::FLAT:
+            case RdnaInstructionFamily::SMEM:
+                return true;
+            case RdnaInstructionFamily::SOPP:
+                return inst.op == RdnaOpcode::SWaitcnt || inst.op == RdnaOpcode::SNop || inst.op == RdnaOpcode::SClause || inst.op == RdnaOpcode::SWaitcntDepctr;
+            default:
+                return false;
+        }
+    };
+    if (keep()) return;
+    const bool execLow = inst.destination.kind == RdnaOperandKind::ExecLo;
+    const bool execHigh = inst.destination.kind == RdnaOperandKind::ExecHi;
+    const auto integer = [](const RdnaOperand& operand) { return operand.kind == RdnaOperandKind::IntegerInlineConstant || operand.kind == RdnaOperandKind::LiteralConstant; };
+    if (inst.op == RdnaOpcode::SMovB32 && (execLow || execHigh) && integer(inst.source0)) {
+        (execLow ? execLowInactive : execHighInactive) = inst.source0.value == 0u;
+        return;
+    }
+    if (inst.op == RdnaOpcode::SMovB64 && execLow && inst.source0.kind == RdnaOperandKind::IntegerInlineConstant) {
+        execLowInactive = inst.source0.value == 0u;
+        execHighInactive = static_cast<std::int32_t>(inst.source0.value) >= 0;
+        return;
+    }
+    if (inst.op == RdnaOpcode::SBfmB64 && execLow && integer(inst.source0) && integer(inst.source1)) {
+        const std::uint32_t size = inst.source0.value & 0x3fu;
+        const std::uint32_t start = inst.source1.value & 0x3fu;
+        const std::uint64_t mask = (size == 0u ? 0ull : (~0ull >> (64u - size))) << start;
+        execLowInactive = static_cast<std::uint32_t>(mask) == 0u;
+        execHighInactive = static_cast<std::uint32_t>(mask >> 32u) == 0u;
+        return;
+    }
+    execLowInactive = false;
+    execHighInactive = false;
+}
+
 void TranslationContext::writeRawU32(const RdnaOperand& operand, IrU32 value) {
+    const bool readByInstruction = operand.kind == RdnaOperandKind::VectorRegister && vectorsRead.test(operand.reg & 0xffu);
     if (operand.kind == RdnaOperandKind::Null) {
         return;
     }
@@ -384,12 +726,17 @@ void TranslationContext::writeRawU32(const RdnaOperand& operand, IrU32 value) {
         case RdnaOperandKind::VectorRegister: {
             const VectorReg reg = static_cast<VectorReg>(operand.reg);
             IrValue& old = ir.GetVectorReg(reg);
+            const bool shared = sharedVectorRegister(operand.reg);
+            IrU32 written(ir.Constant(0u));
             if (operand.dpp) {
                 const auto flags = dppFlags(operand);
                 value = IrU32(ir.Emit(IrOpcode::DppUpdateU32, IrType::U32, {&value.Value(), &old, &ir.GetExec()}, flags));
+                if (shared) written = IrU32(ir.Emit(IrOpcode::DppUpdateU32, IrType::U32, {&ir.Constant(1u), &ir.Constant(0u), &ir.GetExec()}, flags));
             } else {
                 value = IrU32(ir.Select(ir.GetExec(), value.Value(), old));
+                if (shared) written = IrU32(ir.Select(ir.GetExec(), ir.Constant(1u), ir.Constant(0u)));
             }
+            if (shared) value = shareVectorWrite(operand, value, written, readByInstruction);
             ir.SetVectorReg(reg, value.Value());
             break;
         }

@@ -149,6 +149,15 @@ bool isAttributePropagationAlu(RdnaOpcode opcode) {
     }
 }
 
+std::uint32_t scalarBfeU32(std::uint32_t source, std::uint32_t field) {
+    const std::uint32_t count = std::min((field >> 16u) & 0x7fu, 32u);
+    if (count == 0u) {
+        return 0u;
+    }
+    const std::uint32_t shifted = source >> (field & 31u);
+    return count == 32u ? shifted : shifted & ((1u << count) - 1u);
+}
+
 std::int32_t bufferAttributeFromOffset(std::uint32_t rawOffset, std::uint32_t dword) {
     return static_cast<std::int32_t>((rawOffset + dword * 4u) / 16u);
 }
@@ -177,7 +186,17 @@ std::uint32_t embeddedFetchDstSize(const RdnaInstruction& inst) {
 std::uint32_t scalarOperandWidth(const RdnaInstruction& inst, std::uint32_t operandIndex) {
     switch (inst.family) {
     case RdnaInstructionFamily::SMEM:
-        return operandIndex == 0u ? 4u : 1u;
+        if (operandIndex != 0u) return 1u;
+        switch (inst.op) {
+        case RdnaOpcode::SLoadDword:
+        case RdnaOpcode::SLoadDwordx2:
+        case RdnaOpcode::SLoadDwordx4:
+        case RdnaOpcode::SLoadDwordx8:
+        case RdnaOpcode::SLoadDwordx16:
+            return 2u;
+        default:
+            return 4u;
+        }
     case RdnaInstructionFamily::MUBUF:
     case RdnaInstructionFamily::MTBUF:
         return operandIndex == 1u ? 4u : 1u;
@@ -204,6 +223,202 @@ bool touchesSgpr(const RdnaInstruction& inst, std::uint32_t sgpr) {
     if (isScalarOperand(inst.destination)) {
         const auto first = scalarSlot(inst.destination);
         if (sgpr >= first && sgpr < first + std::max(inst.is64Bit ? 2u : 1u, decodedDstSize(inst))) return true;
+    }
+    return false;
+}
+
+bool killsSgpr(const RdnaInstruction& inst, std::uint32_t sgpr) {
+    if (!isScalarOperand(inst.destination)) return false;
+    const auto first = scalarSlot(inst.destination);
+    switch (inst.op) {
+    case RdnaOpcode::SCmovB32:
+    case RdnaOpcode::SCmovB64:
+    case RdnaOpcode::SBitset0B32:
+    case RdnaOpcode::SBitset0B64:
+    case RdnaOpcode::SBitset1B32:
+    case RdnaOpcode::SBitset1B64:
+    case RdnaOpcode::SMovreldB32:
+    case RdnaOpcode::SMovreldB64:
+        return false;
+    case RdnaOpcode::SMovkI32:
+    case RdnaOpcode::VReadlaneB32:
+    case RdnaOpcode::VReadfirstlaneB32:
+        return sgpr == first;
+    case RdnaOpcode::SLoadDword:
+    case RdnaOpcode::SLoadDwordx2:
+    case RdnaOpcode::SLoadDwordx4:
+    case RdnaOpcode::SLoadDwordx8:
+    case RdnaOpcode::SLoadDwordx16:
+    case RdnaOpcode::SBufferLoadDword:
+    case RdnaOpcode::SBufferLoadDwordx2:
+    case RdnaOpcode::SBufferLoadDwordx4:
+    case RdnaOpcode::SBufferLoadDwordx8:
+    case RdnaOpcode::SBufferLoadDwordx16:
+        return sgpr >= first && sgpr < first + decodedDstSize(inst);
+    default:
+        return (inst.family == RdnaInstructionFamily::SOP1 || inst.family == RdnaInstructionFamily::SOP2) && sgpr == first;
+    }
+}
+
+bool isVectorAlu(const RdnaInstruction& inst) {
+    switch (inst.family) {
+    case RdnaInstructionFamily::VOP1:
+    case RdnaInstructionFamily::VOP2:
+    case RdnaInstructionFamily::VOP3:
+    case RdnaInstructionFamily::VOP3P:
+    case RdnaInstructionFamily::VOPC:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool isSequentialProgramControl(RdnaOpcode opcode) {
+    switch (opcode) {
+    case RdnaOpcode::SNop:
+    case RdnaOpcode::SWaitcnt:
+    case RdnaOpcode::SWaitcntDepctr:
+    case RdnaOpcode::SSetprio:
+    case RdnaOpcode::SSendmsg:
+    case RdnaOpcode::SBarrier:
+    case RdnaOpcode::SSleep:
+    case RdnaOpcode::SClause:
+    case RdnaOpcode::SInstPrefetch:
+    case RdnaOpcode::SRoundMode:
+    case RdnaOpcode::SDenormMode:
+    case RdnaOpcode::SIcacheInv:
+    case RdnaOpcode::STtracedata:
+    case RdnaOpcode::SIncperflevel:
+    case RdnaOpcode::SDecperflevel:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool leavesStraightLine(const RdnaInstruction& inst) {
+    if (inst.op == RdnaOpcode::Unknown || inst.op == RdnaOpcode::SSetpcB64 || inst.op == RdnaOpcode::SRfeB64) return true;
+    return inst.family == RdnaInstructionFamily::SOPP && !isSequentialProgramControl(inst.op);
+}
+
+bool readsSgprRange(const RdnaInstruction& inst, std::uint32_t first, std::uint32_t count) {
+    const std::array<const RdnaOperand*, 4> sources{&inst.source0, &inst.source1, &inst.source2, &inst.source3};
+    for (std::uint32_t i = 0u; i < sources.size(); i++) {
+        if (!isScalarOperand(*sources[i])) continue;
+        const auto slot = scalarSlot(*sources[i]);
+        if (slot < first + count && first < slot + scalarOperandWidth(inst, i)) return true;
+    }
+    return false;
+}
+
+bool readsVccImplicitly(const RdnaInstruction& inst) {
+    switch (inst.op) {
+    case RdnaOpcode::VCndmaskB32:
+    case RdnaOpcode::VAddcU32:
+    case RdnaOpcode::VSubCoCiU32:
+    case RdnaOpcode::VSubrevCoCiU32:
+        return !isScalarOperand(inst.source2);
+    case RdnaOpcode::VDivFmasF32:
+    case RdnaOpcode::VDivFmasF64:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool mayReachVgpr(const RdnaInstruction& inst, std::uint32_t reg) {
+    switch (inst.family) {
+    case RdnaInstructionFamily::SOP1:
+    case RdnaInstructionFamily::SOP2:
+    case RdnaInstructionFamily::SOPK:
+    case RdnaInstructionFamily::SOPC:
+    case RdnaInstructionFamily::SMEM:
+    case RdnaInstructionFamily::SOPP:
+        return leavesStraightLine(inst);
+    default:
+        break;
+    }
+    if (!isVectorAlu(inst)) return true;
+    switch (inst.op) {
+    case RdnaOpcode::VMovrelsB32:
+    case RdnaOpcode::VMovreldB32:
+    case RdnaOpcode::VMovrelsdB32:
+    case RdnaOpcode::VMovrelsd2B32:
+    case RdnaOpcode::VSwaprelB32:
+        return true;
+    default:
+        break;
+    }
+    const std::array<const RdnaOperand*, 4> sources{&inst.source0, &inst.source1, &inst.source2, &inst.source3};
+    for (std::uint32_t i = 0u; i < sources.size(); i++) {
+        const auto width = inst.op == RdnaOpcode::VMqsadU32U8 && i == 2u ? 4u : 2u;
+        if (isVectorOperand(*sources[i]) && reg >= sources[i]->reg && reg < sources[i]->reg + width) return true;
+    }
+    return isVectorOperand(inst.destination) && reg >= inst.destination.reg && reg < inst.destination.reg + std::max(embeddedFetchDstSize(inst), 2u);
+}
+
+bool writesExec(const RdnaInstruction& inst) {
+    const auto exec = [](const RdnaOperand& operand) { return operand.kind == RdnaOperandKind::ExecLo || operand.kind == RdnaOperandKind::ExecHi; };
+    if (exec(inst.destination) || exec(inst.destination2)) return true;
+    switch (inst.op) {
+    case RdnaOpcode::SAndSaveexecB32:
+    case RdnaOpcode::SOrSaveexecB32:
+    case RdnaOpcode::SXorSaveexecB32:
+    case RdnaOpcode::SAndn2SaveexecB32:
+    case RdnaOpcode::SOrn2SaveexecB32:
+    case RdnaOpcode::SNandSaveexecB32:
+    case RdnaOpcode::SNorSaveexecB32:
+    case RdnaOpcode::SXnorSaveexecB32:
+    case RdnaOpcode::SAndn1SaveexecB32:
+    case RdnaOpcode::SOrn1SaveexecB32:
+    case RdnaOpcode::SAndn1WrexecB32:
+    case RdnaOpcode::SAndn2WrexecB32:
+    case RdnaOpcode::SAndSaveexecB64:
+    case RdnaOpcode::SOrSaveexecB64:
+    case RdnaOpcode::SXorSaveexecB64:
+    case RdnaOpcode::SAndn2SaveexecB64:
+    case RdnaOpcode::SOrn2SaveexecB64:
+    case RdnaOpcode::SNandSaveexecB64:
+    case RdnaOpcode::SNorSaveexecB64:
+    case RdnaOpcode::SXnorSaveexecB64:
+    case RdnaOpcode::SAndn1SaveexecB64:
+    case RdnaOpcode::SOrn1SaveexecB64:
+    case RdnaOpcode::SAndn1WrexecB64:
+    case RdnaOpcode::SAndn2WrexecB64:
+    case RdnaOpcode::SSubvectorLoopBegin:
+    case RdnaOpcode::SSubvectorLoopEnd:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool setsExecAllOnes(const RdnaInstruction& inst) {
+    const bool allOnes = inst.source0.kind == RdnaOperandKind::IntegerInlineConstant && inst.source0.signedVal == -1;
+    if (!allOnes || inst.destination.kind != RdnaOperandKind::ExecLo) return false;
+    return inst.op == RdnaOpcode::SMovB64;
+}
+
+bool writesSgprMask(const RdnaInstruction& inst, std::uint32_t sgpr, std::uint32_t waveSize) {
+    const auto covers = [&](const RdnaOperand& operand, std::uint32_t width) { return isScalarOperand(operand) && sgpr >= scalarSlot(operand) && sgpr < scalarSlot(operand) + width; };
+    return covers(inst.destination2, 2u) || (isVectorAlu(inst) && covers(inst.destination, waveSize == 64u ? 2u : 1u));
+}
+
+bool carryObserved(const RdnaProgram& program, std::size_t addIndex, std::uint32_t waveSize) {
+    const auto& add = program.instructions[addIndex];
+    if (add.op == RdnaOpcode::VAddNcU32) return false;
+    if (add.op == RdnaOpcode::VSadU32) return false;
+    if (add.destination2.kind == RdnaOperandKind::None || add.destination2.kind == RdnaOperandKind::Null) return false;
+    if (!isScalarOperand(add.destination2)) return true;
+    const auto first = scalarSlot(add.destination2);
+    const std::uint32_t count = waveSize == 64u ? 2u : 1u;
+    for (std::size_t index = addIndex + 1u; index < program.instructions.size(); index++) {
+        const auto& inst = program.instructions[index];
+        if (inst.op == RdnaOpcode::SEndpgm) return false;
+        if (leavesStraightLine(inst) || readsSgprRange(inst, first, count) || (first == kVccLoSlot && readsVccImplicitly(inst))) return true;
+        const bool laneMask = isVectorAlu(inst) && inst.op != RdnaOpcode::VReadlaneB32 && inst.op != RdnaOpcode::VReadfirstlaneB32;
+        const auto rewrites = [&](const RdnaOperand& operand) { return isScalarOperand(operand) && scalarSlot(operand) == first && (count == 1u || laneMask); };
+        if (rewrites(inst.destination) || rewrites(inst.destination2)) return false;
     }
     return false;
 }
@@ -244,8 +459,9 @@ EmbeddedFetchPlan EmbeddedVertexFetchAnalyzer::Analyze(const RdnaProgram& progra
         const bool vertexIndexAccumulator = isVectorOperand(inst.destination) && (inst.destination.reg == 0u || (userDataBaseRegister == 8u && inst.destination.reg == kVertexIndexVgpr));
         const bool instanceIndexAccumulator = isVectorOperand(inst.destination) && (inst.destination.reg == (userDataBaseRegister == 8u ? kInstanceIndexVgpr : 3u));
         std::uint32_t sadZero = 0u;
+        const bool plainNoCarryAdd = inst.op == RdnaOpcode::VAddNcU32 && inst.family == RdnaInstructionFamily::VOP2 && inst.wordCount == 1u;
         const bool indexOffsetAdd = (vertexIndexAccumulator || instanceIndexAccumulator) && isScalarOperand(inst.source0) &&
-            ((inst.op == RdnaOpcode::VAddI32 && isVectorOperand(inst.source1) && inst.source1.reg == inst.destination.reg) ||
+            (((inst.op == RdnaOpcode::VAddI32 || plainNoCarryAdd) && isVectorOperand(inst.source1) && inst.source1.reg == inst.destination.reg) ||
              (userDataBaseRegister == 8u && (inst.destination.reg == kVertexIndexVgpr || inst.destination.reg == kInstanceIndexVgpr) &&
               inst.op == RdnaOpcode::VSadU32 && isVectorOperand(inst.source2) && inst.source2.reg == inst.destination.reg &&
               tryConstantOperand(sgprs, inst.source1, sadZero) && sadZero == 0u));
@@ -354,12 +570,13 @@ EmbeddedFetchPlan EmbeddedVertexFetchAnalyzer::Analyze(const RdnaProgram& progra
                             dst.loadPcs.push_back(inst.programCounter);
                         }
                     } else if (isScalarOperand(inst.source1) && scalarSlot(inst.source1) < sgprs.size() && sgprs[scalarSlot(inst.source1)].kind == SgprValueKind::Attribute && (inst.memoryOffset & 0x3u) == 0u) {
+                        const auto attribute = sgprs[scalarSlot(inst.source1)];
                         for (std::uint32_t i = 0u; i < decodedDstSize(inst) && slot + i < sgprs.size(); i++) {
                             auto& dst = sgprs[slot + i];
                             dst = SgprValue{};
                             dst.kind = SgprValueKind::Buffer;
-                            dst.attributeId = sgprs[scalarSlot(inst.source1)].attributeId;
-                            dst.loadPcs = sgprs[scalarSlot(inst.source1)].loadPcs;
+                            dst.attributeId = attribute.attributeId;
+                            dst.loadPcs = attribute.loadPcs;
                             dst.loadPcs.push_back(inst.programCounter);
                         }
                     } else {
@@ -393,7 +610,7 @@ EmbeddedFetchPlan EmbeddedVertexFetchAnalyzer::Analyze(const RdnaProgram& progra
                             dst.constant = src0 << (src1 & 31u);
                             break;
                         case RdnaOpcode::SBfeU32:
-                            dst.constant = src0 >> (src1 & 31u);
+                            dst.constant = scalarBfeU32(src0, src1);
                             break;
                         default:
                             dst.constant = src0 + src1;
@@ -439,14 +656,61 @@ EmbeddedFetchPlan EmbeddedVertexFetchAnalyzer::Analyze(const RdnaProgram& progra
     plan.instanceOffsetConflict = instanceOffsetConflict;
     const auto shared = [&](std::int32_t sgpr, const std::vector<std::uint32_t>& addPcs) {
         if (sgpr < 0) return false;
+        const auto reg = static_cast<std::uint32_t>(sgpr);
+        const auto isAdd = [&](const RdnaInstruction& inst) { return std::find(addPcs.begin(), addPcs.end(), inst.programCounter) != addPcs.end(); };
+        const auto loopsBack = [&](std::size_t from, std::uint32_t pc) {
+            for (std::size_t i = from; i < program.instructions.size(); i++) {
+                const auto& inst = program.instructions[i];
+                if (IsDirectBranchOpcode(inst.op) && inst.branchTarget <= pc) return true;
+                if (inst.op != RdnaOpcode::SEndpgm && !IsDirectBranchOpcode(inst.op) && leavesStraightLine(inst)) return true;
+            }
+            return false;
+        };
+        std::uint32_t skippedUntil = 0u;
+        for (std::size_t i = 0; i < program.instructions.size(); i++) {
+            const auto& inst = program.instructions[i];
+            if (isAdd(inst)) continue;
+            if (inst.op == RdnaOpcode::SMovrelsB32 || inst.op == RdnaOpcode::SMovrelsB64 || inst.op == RdnaOpcode::SMovrelsd2B32 || inst.op == RdnaOpcode::SMovreldB32 || inst.op == RdnaOpcode::SMovreldB64) return true;
+            if (readsSgprRange(inst, reg, 1u)) return true;
+            if (killsSgpr(inst, reg)) {
+                if (inst.programCounter < skippedUntil) continue;
+                return std::any_of(addPcs.begin(), addPcs.end(), [&](std::uint32_t pc) { return pc > inst.programCounter; }) || loopsBack(i + 1u, inst.programCounter);
+            }
+            if (touchesSgpr(inst, reg)) return true;
+            if (IsDirectBranchOpcode(inst.op)) {
+                if (inst.branchTarget <= inst.programCounter) break;
+                skippedUntil = std::max(skippedUntil, inst.branchTarget);
+                continue;
+            }
+            if (inst.op == RdnaOpcode::SEndpgm) {
+                if (inst.programCounter >= skippedUntil) return false;
+                continue;
+            }
+            if (leavesStraightLine(inst)) break;
+        }
         for (const auto& inst : program.instructions) {
-            if (std::find(addPcs.begin(), addPcs.end(), inst.programCounter) != addPcs.end()) continue;
-            if (touchesSgpr(inst, static_cast<std::uint32_t>(sgpr))) return true;
+            if (isAdd(inst)) continue;
+            if (touchesSgpr(inst, reg)) return true;
         }
         return false;
     };
     plan.vertexOffsetShared = shared(plan.vertexOffsetSgpr, vertexAddPcs);
     plan.instanceOffsetShared = shared(plan.instanceOffsetSgpr, instanceAddPcs);
+    const bool relativeScalarAccess = std::any_of(program.instructions.begin(), program.instructions.end(), [](const RdnaInstruction& inst) {
+        return inst.op == RdnaOpcode::SMovrelsB32 || inst.op == RdnaOpcode::SMovrelsB64 || inst.op == RdnaOpcode::SMovrelsd2B32 || inst.op == RdnaOpcode::SMovreldB32 || inst.op == RdnaOpcode::SMovreldB64;
+    });
+    const auto observed = [&](std::int32_t sgpr, const std::vector<std::uint32_t>& addPcs, std::uint32_t indexVgpr) {
+        if (sgpr < 0) return false;
+        if (addPcs.size() != 1u || relativeScalarAccess) return true;
+        const auto add = std::find_if(program.instructions.begin(), program.instructions.end(), [&](const RdnaInstruction& inst) { return inst.programCounter == addPcs.front(); });
+        if (add == program.instructions.end() || add->destination.reg != indexVgpr || add->destination.clamp || add->clampResult) return true;
+        if (std::any_of(program.instructions.begin(), program.instructions.end(), [&](const RdnaInstruction& inst) { return inst.programCounter != add->programCounter && writesSgprMask(inst, static_cast<std::uint32_t>(sgpr), waveSize); })) return true;
+        const auto reg = add->destination.reg;
+        if (std::any_of(program.instructions.begin(), add, [&](const RdnaInstruction& inst) { return (writesExec(inst) && !setsExecAllOnes(inst)) || mayReachVgpr(inst, reg); })) return true;
+        return carryObserved(program, static_cast<std::size_t>(add - program.instructions.begin()), waveSize);
+    };
+    plan.vertexIndexObserved = observed(plan.vertexOffsetSgpr, vertexAddPcs, kVertexIndexVgpr);
+    plan.instanceIndexObserved = observed(plan.instanceOffsetSgpr, instanceAddPcs, kInstanceIndexVgpr);
 
     return plan;
 }

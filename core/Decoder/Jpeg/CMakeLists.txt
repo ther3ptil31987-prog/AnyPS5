@@ -5,6 +5,12 @@ function(add_jpeg_decoder target runtimeTarget)
 
     include(ExternalProject)
     if(NOT TARGET jpeg_turbo_external)
+        if(BUILD_TESTING AND Python3_EXECUTABLE)
+            add_test(NAME jpeg_external_toolchain COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/test_toolchain.py)
+            set_tests_properties(jpeg_external_toolchain PROPERTIES TIMEOUT 30
+                ENVIRONMENT "CMAKE_GENERATOR=${CMAKE_GENERATOR}")
+        endif()
         set(jpeg_turbo_prefix "${CMAKE_BINARY_DIR}/libjpeg-turbo")
         if(WIN32)
             if(MSVC)
@@ -16,6 +22,15 @@ function(add_jpeg_decoder target runtimeTarget)
             set(jpeg_turbo_library "${jpeg_turbo_prefix}/lib/libturbojpeg.a")
         endif()
         file(MAKE_DIRECTORY "${jpeg_turbo_prefix}/include")
+        set(jpeg_turbo_platform_args)
+        if(CMAKE_TOOLCHAIN_FILE)
+            list(APPEND jpeg_turbo_platform_args "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}")
+        endif()
+        if(APPLE)
+            list(APPEND jpeg_turbo_platform_args
+                -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}
+                -DCMAKE_APPLE_SILICON_PROCESSOR=${CMAKE_APPLE_SILICON_PROCESSOR})
+        endif()
         ExternalProject_Add(jpeg_turbo_external
             SOURCE_DIR "${PROJECT_SOURCE_DIR}/3rdparty/libjpeg-turbo"
             BINARY_DIR "${CMAKE_BINARY_DIR}/libjpeg-turbo-build"
@@ -38,6 +53,7 @@ function(add_jpeg_decoder target runtimeTarget)
                 -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
                 -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER}
                 -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
+                ${jpeg_turbo_platform_args}
             BUILD_BYPRODUCTS
                 "${jpeg_turbo_library}"
         )

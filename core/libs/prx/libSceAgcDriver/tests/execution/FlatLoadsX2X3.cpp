@@ -93,7 +93,7 @@ public:
         block = static_cast<std::uint8_t*>(std::aligned_alloc(BlockBytes, BlockBytes));
 #endif
         Require(block != nullptr, "flat loads x2 x3: cannot allocate the guest block");
-        GuestAllocations::Mutation().Add(block, BlockBytes, true, false);
+        GuestAllocations::Mutation().Add(block, BlockBytes, true, false, true);
     }
 
     ~GuestBlock() {
@@ -116,7 +116,7 @@ private:
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
-    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x01016facu};
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
 }
 
 std::string Hex(std::uint32_t value) {

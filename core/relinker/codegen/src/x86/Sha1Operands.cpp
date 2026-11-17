@@ -20,16 +20,18 @@ Sha1Operands DecodeSha1(const std::uint8_t* data, const std::size_t length) {
             pos += 1;
             continue;
         }
+        if (b == PrefixLock) {
+            throw CodegenException("SHA-1 instruction with a LOCK prefix");
+        }
         if (b == PrefixOperandSize || b == PrefixRepne || b == PrefixRep) {
             throw CodegenException("Not a SHA-1 instruction");
         }
-        if (b != PrefixLock && b != PrefixAddressSize &&
+        if (b != PrefixAddressSize &&
             b != PrefixSegCs && b != PrefixSegSs && b != PrefixSegDs &&
             b != PrefixSegEs && b != PrefixSegFs && b != PrefixSegGs) {
             break;
         }
-        if (b != PrefixLock)
-            prefixes.push_back(b);
+        prefixes.push_back(b);
         rex = 0;
         pos += 1;
     }
@@ -67,6 +69,8 @@ Sha1Operands DecodeSha1(const std::uint8_t* data, const std::size_t length) {
         }
         operands.Function = static_cast<std::uint8_t>(data[immediateOffset] & 3);
     }
+    if (operands.Memory && operands.Memory->RipRelative && immediateOffset + (operands.Operation == Sha1Operation::Rnds4 ? 1 : 0) != length)
+        throw CodegenException("RIP-relative SHA-1 operand does not end the instruction");
     return operands;
 }
 

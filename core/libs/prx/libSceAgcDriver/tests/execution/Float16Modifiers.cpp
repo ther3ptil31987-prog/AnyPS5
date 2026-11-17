@@ -9,7 +9,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
+#include <optional>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -32,6 +35,27 @@ alignas(256) constexpr std::array<std::uint32_t, 62> Code{
     0x02010104, 0xd5e38014, 0x02010104, 0xd5e40015, 0x0a010104, 0xd7540016, 0x0c1a0b04, 0xd7578017,
     0x141a0b04, 0xd7510018, 0x1c1a0b04, 0xd74b0019, 0x0c1a0b04, 0xe0781000, 0x80010a03, 0xe0781010,
     0x80010e03, 0xe0781020, 0x80011203, 0xe0781030, 0x80011603, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 10> Min3Div2{
+    0x34020084u, 0x34060086u, 0xe0381000u, 0x80000401u, 0xbf8c3f70u,
+    0xd751000au, 0x1c1a0b04u,
+    0xe0701000u, 0x80010a03u, 0xbf810000u,
+};
+alignas(256) constexpr std::array<std::uint32_t, 10> Max3Mul2{
+    0x34020084u, 0x34060086u, 0xe0381000u, 0x80000401u, 0xbf8c3f70u,
+    0xd754000au, 0x0c1a0b04u,
+    0xe0701000u, 0x80010a03u, 0xbf810000u,
+};
+alignas(256) constexpr std::array<std::uint32_t, 10> Med3Mul4{
+    0x34020084u, 0x34060086u, 0xe0381000u, 0x80000401u, 0xbf8c3f70u,
+    0xd757000au, 0x141e0d05u,
+    0xe0701000u, 0x80010a03u, 0xbf810000u,
+};
+alignas(256) constexpr std::array<std::uint32_t, 10> DivFixupMul2{
+    0x34020084u, 0x34060086u, 0xe0381000u, 0x80000401u, 0xbf8c3f70u,
+    0xd75f000au, 0x0c1a0b05u,
+    0xe0701000u, 0x80010a03u, 0xbf810000u,
 };
 
 constexpr std::uint32_t Rows[32][4] = {
@@ -127,7 +151,7 @@ void Fill(std::uint32_t tid, std::uint32_t* words) {
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
-    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x01016facu};
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
 }
 
 std::string Hex(std::uint32_t value) {
@@ -150,7 +174,7 @@ void ExpectHalf(std::uint32_t tid, std::uint32_t actual, std::uint32_t expected,
     Expect(tid, actual, expected, name);
 }
 
-void Run(AgcDriver::VulkanDevice& device) {
+void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::optional<ShaderRecompiler::ShaderFloatMode>& floatMode) {
     for (std::uint32_t tid = 0; tid < Threads; ++tid) Fill(tid, &Input[tid * Inputs]);
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(8, 0u);
@@ -158,7 +182,6 @@ void Run(AgcDriver::VulkanDevice& device) {
     const auto output = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
     std::copy(input.begin(), input.end(), userData.begin());
     std::copy(output.begin(), output.end(), userData.begin() + 4);
-    const std::span<const std::uint32_t> code(Code);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
@@ -168,6 +191,7 @@ void Run(AgcDriver::VulkanDevice& device) {
         {0, 0, 0, 128}
     };
     request.useCache = false;
+    request.context.floatMode = floatMode;
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
@@ -187,8 +211,31 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        Run(*device);
+        Run(*device, Code, std::nullopt);
         Check();
+        Run(*device, Code, ShaderRecompiler::ShaderFloatMode{0xf0u, true, true, false});
+        Check();
+        Run(*device, Code, ShaderRecompiler::ShaderFloatMode{0x00u, true, false, false});
+        Require((Output[1] & 0xffffu) == 0xf099u, "float16 modifiers: lane 0 v_add_f16 mul:2 was not scaled");
+        Require((Output[12] & 0xffffu) == 0x77abu, "float16 modifiers: lane 0 v_max3_f16 mul:2 was not scaled");
+        Require((Output[14] & 0xffffu) == 0xe899u, "float16 modifiers: lane 0 v_min3_f16 div:2 was not scaled");
+        Require((Output[15] & 0xffffu) == 0x77abu, "float16 modifiers: lane 0 v_fma_f16 mul:2 was not scaled");
+        const struct {
+            std::span<const std::uint32_t> code;
+            const char* name;
+            std::uint32_t expected;
+        } ternaries[] = {
+            {Min3Div2, "v_min3_f16 div:2", 0xe899u},
+            {Max3Mul2, "v_max3_f16 mul:2", 0x77abu},
+            {Med3Mul4, "v_med3_f16 mul:4", 0x9e5eu},
+            {DivFixupMul2, "v_div_fixup_f16 mul:2", 0xf099u},
+        };
+        for (const auto& [code, name, expected] : ternaries) {
+            Run(*device, code, std::nullopt);
+            Run(*device, code, ShaderRecompiler::ShaderFloatMode{0xf0u, true, true, false});
+            Run(*device, code, ShaderRecompiler::ShaderFloatMode{0x00u, true, false, false});
+            Require((Output[0] & 0xffffu) == expected, std::string("float16 modifiers: lane 0 ") + name + " was not scaled");
+        }
         std::puts("float16 modifiers tests passed");
         return 0;
     } catch (const std::exception& error) {

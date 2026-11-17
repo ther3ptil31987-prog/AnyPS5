@@ -1,40 +1,95 @@
+#include "prx/libSceNpTrophy2/include/Api.hpp"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 
 #include "prx/libSceNpTrophy2/include/NpTrophy2.hpp"
+#include "prx/libSceNpTrophy2/include/TitleTrophies.hpp"
+#include "prx/libSceNpTrophy2/include/TrophyStore.hpp"
 #include "prx/libc/include/General.hpp"
+
+namespace {
+
+void fillPlaceholderDetails(std::int32_t groupId, NpTrophy2GroupDetails* details) {
+    std::memset(details, 0, sizeof(*details));
+    details->group_id = groupId;
+    details->num_trophies = NP_TROPHY2_NUM_TROPHIES;
+    details->num_platinum = NP_TROPHY2_NUM_PLATINUM;
+    details->num_gold = NP_TROPHY2_NUM_GOLD;
+    details->num_silver = NP_TROPHY2_NUM_SILVER;
+    details->num_bronze = NP_TROPHY2_NUM_BRONZE;
+    std::strncpy(details->title, NP_TROPHY2_GROUP_TITLE, sizeof(details->title) - 1);
+}
+
+void fillPlaceholderData(std::int32_t groupId, NpTrophy2GroupData* data) {
+    std::memset(data, 0, sizeof(*data));
+    data->group_id = groupId;
+    data->unlocked_trophies = NP_TROPHY2_UNLOCKED_TROPHIES;
+    data->unlocked_platinum = NP_TROPHY2_UNLOCKED_PLATINUM;
+    data->unlocked_gold = NP_TROPHY2_UNLOCKED_GOLD;
+    data->unlocked_silver = NP_TROPHY2_UNLOCKED_SILVER;
+    data->unlocked_bronze = NP_TROPHY2_UNLOCKED_BRONZE;
+    data->progress_percentage = NP_TROPHY2_PROGRESS_PERCENTAGE;
+}
+
+void fillGroup(const NpTrophy2::TrophyPackage& package, const NpTrophy2::ContextOwner& owner, std::int32_t groupId, const std::string& title, NpTrophy2GroupDetails* details,
+               NpTrophy2GroupData* data) {
+    const auto counts = NpTrophy2::CountTrophies(package, groupId, NpTrophy2::UnlockedBy(owner.userId, owner.serviceLabel));
+    if (details != nullptr) {
+        std::memset(details, 0, sizeof(*details));
+        details->group_id = groupId;
+        details->num_trophies = counts.trophies;
+        details->num_platinum = counts.grades[NpTrophy2::GradePlatinum];
+        details->num_gold = counts.grades[NpTrophy2::GradeGold];
+        details->num_silver = counts.grades[NpTrophy2::GradeSilver];
+        details->num_bronze = counts.grades[NpTrophy2::GradeBronze];
+        NpTrophy2::CopyText(details->title, sizeof(details->title), title);
+    }
+    if (data != nullptr) {
+        std::memset(data, 0, sizeof(*data));
+        data->group_id = groupId;
+        data->unlocked_trophies = counts.unlocked;
+        data->unlocked_platinum = counts.unlockedGrades[NpTrophy2::GradePlatinum];
+        data->unlocked_gold = counts.unlockedGrades[NpTrophy2::GradeGold];
+        data->unlocked_silver = counts.unlockedGrades[NpTrophy2::GradeSilver];
+        data->unlocked_bronze = counts.unlockedGrades[NpTrophy2::GradeBronze];
+        data->progress_percentage = counts.Percentage();
+    }
+}
+
+}
 
 extern "C" {
 
 int APS5_VABI sceNpTrophy2GetGroupInfo(int context, int handle, int group_id, NpTrophy2GroupDetails* details, NpTrophy2GroupData* data) {
-    if (details == nullptr || data == nullptr) {
+    if (details == nullptr && data == nullptr) {
         APS5_INVALID_ARG_EX;
     }
-    (void)context;
     (void)handle;
-    const std::int32_t normalized_group_id = (group_id < 0 ? NP_TROPHY2_GROUP_ID_BASE : group_id);
-    if (details != nullptr) {
-        std::memset(details, 0, sizeof(*details));
-        details->group_id = normalized_group_id;
-        details->num_trophies = NP_TROPHY2_NUM_TROPHIES;
-        details->num_platinum = NP_TROPHY2_NUM_PLATINUM;
-        details->num_gold = NP_TROPHY2_NUM_GOLD;
-        details->num_silver = NP_TROPHY2_NUM_SILVER;
-        details->num_bronze = NP_TROPHY2_NUM_BRONZE;
-        std::strncpy(details->title, NP_TROPHY2_GROUP_TITLE, sizeof(details->title) - 1);
+    const auto owner = NpTrophy2::FindContext(context);
+    const auto* package = owner ? NpTrophy2::Package(owner->serviceLabel) : nullptr;
+    NpTrophy2GroupDetails localDetails{};
+    NpTrophy2GroupData localData{};
+    if (package == nullptr) {
+        const std::int32_t normalized_group_id = (group_id < 0 ? NP_TROPHY2_GROUP_ID_BASE : group_id);
+        if (details != nullptr) fillPlaceholderDetails(normalized_group_id, &localDetails);
+        if (data != nullptr) fillPlaceholderData(normalized_group_id, &localData);
+    } else {
+        const auto group = package->groups.find(group_id);
+        if (group == package->groups.end()) {
+            throw std::invalid_argument(std::string(__func__) + ": group " + std::to_string(group_id) + " is not in " + NpTrophy2::PackagePath(owner->serviceLabel));
+        }
+        fillGroup(*package, *owner, group->first, group->second, details != nullptr ? &localDetails : nullptr, data != nullptr ? &localData : nullptr);
     }
-    if (data != nullptr) {
-        std::memset(data, 0, sizeof(*data));
-        data->group_id = normalized_group_id;
-        data->unlocked_trophies = NP_TROPHY2_UNLOCKED_TROPHIES;
-        data->unlocked_platinum = NP_TROPHY2_UNLOCKED_PLATINUM;
-        data->unlocked_gold = NP_TROPHY2_UNLOCKED_GOLD;
-        data->unlocked_silver = NP_TROPHY2_UNLOCKED_SILVER;
-        data->unlocked_bronze = NP_TROPHY2_UNLOCKED_BRONZE;
-        data->progress_percentage = NP_TROPHY2_PROGRESS_PERCENTAGE;
+    if (details != nullptr && !GuestCopyOut_nid_no_patch(details, &localDetails, sizeof(localDetails))) {
+        APS5_INVALID_ARG_EX;
+    }
+    if (data != nullptr && !GuestCopyOut_nid_no_patch(data, &localData, sizeof(localData))) {
+        APS5_INVALID_ARG_EX;
     }
     return SCE_NP_TROPHY2_OK;
 }
@@ -43,29 +98,37 @@ int APS5_VABI sceNpTrophy2GetGroupInfoArray(int context, int handle, uint32_t of
     if (count == nullptr) {
         APS5_INVALID_ARG_EX;
     }
-    (void)context;
     (void)handle;
-    const uint32_t out_count = (offset == 0 && limit != 0 ? 1u : 0u);
-    *count = out_count;
-    if (out_count != 0 && details_array != nullptr) {
-        std::memset(details_array, 0, sizeof(*details_array));
-        details_array->group_id = NP_TROPHY2_GROUP_ID_BASE;
-        details_array->num_trophies = NP_TROPHY2_NUM_TROPHIES;
-        details_array->num_platinum = NP_TROPHY2_NUM_PLATINUM;
-        details_array->num_gold = NP_TROPHY2_NUM_GOLD;
-        details_array->num_silver = NP_TROPHY2_NUM_SILVER;
-        details_array->num_bronze = NP_TROPHY2_NUM_BRONZE;
-        std::strncpy(details_array->title, NP_TROPHY2_GROUP_TITLE, sizeof(details_array->title) - 1);
+    const auto owner = NpTrophy2::FindContext(context);
+    const auto* package = owner ? NpTrophy2::Package(owner->serviceLabel) : nullptr;
+    uint32_t written = 0;
+    NpTrophy2GroupDetails localDetails{};
+    NpTrophy2GroupData localData{};
+    const auto copyOut = [&] {
+        return (details_array == nullptr || GuestCopyOut_nid_no_patch(&details_array[written], &localDetails, sizeof(localDetails))) &&
+               (data_array == nullptr || GuestCopyOut_nid_no_patch(&data_array[written], &localData, sizeof(localData)));
+    };
+    if (package == nullptr) {
+        if (offset == 0 && limit != 0) {
+            if (details_array != nullptr) fillPlaceholderDetails(NP_TROPHY2_GROUP_ID_BASE, &localDetails);
+            if (data_array != nullptr) fillPlaceholderData(NP_TROPHY2_GROUP_ID_BASE, &localData);
+            if (!copyOut()) {
+                APS5_INVALID_ARG_EX;
+            }
+            written = 1;
+        }
+    } else {
+        auto group = package->groups.begin();
+        std::advance(group, std::min<std::size_t>(offset, package->groups.size()));
+        for (; group != package->groups.end() && written < limit; ++group, ++written) {
+            fillGroup(*package, *owner, group->first, group->second, details_array != nullptr ? &localDetails : nullptr, data_array != nullptr ? &localData : nullptr);
+            if (!copyOut()) {
+                APS5_INVALID_ARG_EX;
+            }
+        }
     }
-    if (out_count != 0 && data_array != nullptr) {
-        std::memset(data_array, 0, sizeof(*data_array));
-        data_array->group_id = NP_TROPHY2_GROUP_ID_BASE;
-        data_array->unlocked_trophies = NP_TROPHY2_UNLOCKED_TROPHIES;
-        data_array->unlocked_platinum = NP_TROPHY2_UNLOCKED_PLATINUM;
-        data_array->unlocked_gold = NP_TROPHY2_UNLOCKED_GOLD;
-        data_array->unlocked_silver = NP_TROPHY2_UNLOCKED_SILVER;
-        data_array->unlocked_bronze = NP_TROPHY2_UNLOCKED_BRONZE;
-        data_array->progress_percentage = NP_TROPHY2_PROGRESS_PERCENTAGE;
+    if (!GuestCopyOut_nid_no_patch(count, &written, sizeof(written))) {
+        APS5_INVALID_ARG_EX;
     }
     return SCE_NP_TROPHY2_OK;
 }
@@ -76,7 +139,10 @@ int APS5_VABI sceNpTrophy2GetGroupIcon(int context, int handle, int group_id, vo
     (void)group_id;
     (void)buffer;
     if (size != nullptr) {
-        *size = NP_TROPHY2_ICON_SIZE_NONE;
+        const std::size_t iconSize = NP_TROPHY2_ICON_SIZE_NONE;
+        if (!GuestCopyOut_nid_no_patch(size, &iconSize, sizeof(iconSize))) {
+            APS5_INVALID_ARG_EX;
+        }
     }
     throw std::runtime_error(std::string(__func__) + ": icon file not found");
 }

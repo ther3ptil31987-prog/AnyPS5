@@ -1,0 +1,399 @@
+#ifndef CORE_LIBS_PRX_LIBC_INCLUDE_SONYCRT_HPP
+#define CORE_LIBS_PRX_LIBC_INCLUDE_SONYCRT_HPP
+
+#include <bit>
+#include <cfenv>
+#include <cerrno>
+#include <climits>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <limits>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+
+#include "SceTypes.hpp"
+#include "prx/libc/include/Api.hpp"
+#include "prx/libc/include/GuestTime.hpp"
+#include "prx/libc/include/general/VabiMacros.hpp"
+
+extern "C" {
+GuestTm* APS5_VABI localtime_s_nid_postfix(const std::int64_t* timer, GuestTm* result);
+extern FileStream* __stderrp_nid_postfix;
+}
+
+using SonyConstraintHandler = void (APS5_VABI *)(const char* message, void* pointer, int error);
+
+std::mutex& SonyConstraintMutex();
+SonyConstraintHandler& SonyConstraintHandlerSlot();
+void APS5_VABI SonyDefaultConstraintHandler(const char* message, void* pointer, int error);
+extern "C" void SonyInvokeConstraintHandler_nid_no_patch(const char* message, void* pointer, int error);
+extern "C" void SonyIgnoreHandlerS_nid_no_patch(const char* message, void* pointer, int error);
+extern "C" void* SonySetConstraintHandlerS_nid_no_patch(void* handler);
+extern "C" SonyLconv* SonyLocaleconv_nid_no_patch(void);
+
+namespace {
+
+struct SonyHostTimeZone {
+    std::int64_t standardEast;
+    std::int64_t daylight;
+};
+
+#ifdef _WIN32
+inline void SonyRefreshHostZone_nid_no_patch() {
+    _tzset();
+    const char* zone = std::getenv("TZ");
+    if (zone != nullptr && zone[0] != 0) {
+        int daylight = 0;
+        _get_daylight(&daylight);
+        if (daylight != 0) _dstbias = -3600;
+    }
+}
+#endif
+
+inline SonyHostTimeZone SonyHostZoneAt_nid_no_patch(std::int64_t utcTime) {
+    std::tm local{};
+    constexpr std::int64_t cycleSeconds = 146097LL * 86400LL;
+#ifdef _WIN32
+    constexpr std::int64_t lastHostSecond = 32535215999LL;
+    const std::int64_t cycles = utcTime >= 0 && utcTime <= lastHostSecond ? 0 : (utcTime >= 0 ? utcTime / cycleSeconds : -((-(utcTime + 1)) / cycleSeconds + 1));
+    const std::time_t t = static_cast<std::time_t>(utcTime - cycles * cycleSeconds);
+    SonyRefreshHostZone_nid_no_patch();
+    if (localtime_s(&local, &t) != 0) throw std::runtime_error(std::string(__func__) + ": no host local time for " + std::to_string(utcTime));
+    long standardBias = 0;
+    long daylightBias = 0;
+    _get_timezone(&standardBias);
+    _get_dstbias(&daylightBias);
+    return {-static_cast<std::int64_t>(standardBias), local.tm_isdst > 0 ? -static_cast<std::int64_t>(daylightBias) : 0};
+#else
+    std::time_t t = static_cast<std::time_t>(utcTime);
+    ::tzset();
+    if (localtime_r(&t, &local) == nullptr) {
+        const std::int64_t offset = utcTime % cycleSeconds;
+        t = static_cast<std::time_t>(offset < 0 ? offset + cycleSeconds : offset);
+        if (localtime_r(&t, &local) == nullptr) throw std::runtime_error(std::string(__func__) + ": no host local time for " + std::to_string(utcTime));
+    }
+    const std::int64_t daylight = local.tm_isdst > 0 ? static_cast<std::int64_t>(local.tm_gmtoff) + ::timezone : 0;
+    return {static_cast<std::int64_t>(local.tm_gmtoff) - daylight, daylight};
+#endif
+}
+
+inline std::int64_t SonyHostDaylightAmount_nid_no_patch(std::int64_t utcTime) {
+    constexpr std::int64_t monthSeconds = 2629746;
+    for (int month = 0; month <= 11; ++month) {
+        for (const int direction : {1, -1}) {
+            const SonyHostTimeZone zone = SonyHostZoneAt_nid_no_patch(utcTime + direction * month * monthSeconds);
+            if (zone.daylight != 0) return zone.daylight;
+        }
+    }
+    return 0;
+}
+
+template<typename TInteger>
+inline TInteger ParseInteger(const char* text, char** end, int base, TInteger (*parse)(const char*, char**, int)) {
+#ifdef _WIN32
+    if constexpr (std::is_unsigned_v<TInteger>) {
+        const int saved = errno;
+        errno = 0;
+        const TInteger value = parse(text, end, base);
+        if (errno == ERANGE) return std::numeric_limits<TInteger>::max();
+        if (errno == 0) errno = saved;
+        return value;
+    }
+#endif
+#ifdef __APPLE__
+    const int saved = errno;
+    char* parsedEnd = nullptr;
+    const TInteger value = parse(text, &parsedEnd, base);
+    if (parsedEnd == text && errno == EINVAL && (base == 0 || (base >= 2 && base <= 36))) errno = saved;
+    if (end != nullptr) *end = parsedEnd;
+    return value;
+#else
+    return parse(text, end, base);
+#endif
+}
+
+inline void SonyInvokeConstraintHandler(const char* message, void* pointer, int error) {
+    SonyInvokeConstraintHandler_nid_no_patch(message, pointer, error);
+}
+
+inline char* SonyStrtokS(char* str, std::size_t* remaining, const char* delimiters, char** context) {
+    if (!remaining || !context || !delimiters || *remaining > (SIZE_MAX >> 3) || (!str && !*context)) {
+        SonyInvokeConstraintHandler("strtok_s: bad argument", nullptr, EINVAL);
+        return nullptr;
+    }
+    if (!str) str = *context;
+    const auto isDelimiter = [delimiters](char value) {
+        for (const char* delimiter = delimiters; *delimiter != '\0'; ++delimiter)
+            if (*delimiter == value) return true;
+        return false;
+    };
+    const std::size_t available = *remaining;
+    std::size_t skipped = 0;
+    if (available == 0) {
+        SonyInvokeConstraintHandler("strtok_s: missing token", nullptr, EINVAL);
+        return nullptr;
+    }
+    while (str[skipped] != '\0' && isDelimiter(str[skipped])) {
+        if (++skipped == available) {
+            SonyInvokeConstraintHandler("strtok_s: missing token", nullptr, EINVAL);
+            return nullptr;
+        }
+    }
+    char* const token = str + skipped;
+    const std::size_t left = available - skipped;
+    *remaining = left;
+    if (*token == '\0') {
+        *context = token;
+        return nullptr;
+    }
+    std::size_t length = 0;
+    while (token[length] != '\0' && !isDelimiter(token[length])) {
+        if (++length == left) {
+            SonyInvokeConstraintHandler("strtok_s: missing delimiter", nullptr, EINVAL);
+            return nullptr;
+        }
+    }
+    char* next = token + length;
+    *remaining = left - length;
+    if (*next != '\0') {
+        *next++ = '\0';
+        *remaining = left - length - 1;
+    }
+    *context = next;
+    return token;
+}
+
+inline int SonyAsctimeViolation(const char* message, char* buffer) {
+    if (buffer) buffer[0] = '\0';
+    SonyInvokeConstraintHandler(message, nullptr, EINVAL);
+    return EINVAL;
+}
+
+inline bool SonyAsctimeDestination(const char* buffer, std::size_t size) {
+    return buffer && size != 0 && size <= (SIZE_MAX >> 3);
+}
+
+inline int SonyFormatAsctime(char* buffer, std::size_t size, const GuestTm& time, const char* badArgument) {
+    static const char* const days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char* const months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    const std::int64_t year = std::int64_t{time.tm_year} + 1900;
+    if (size < 26 || time.tm_wday < 0 || time.tm_wday > 6 || time.tm_mon < 0 || time.tm_mon > 11 ||
+        time.tm_mday < 1 || time.tm_mday > 31 || time.tm_hour < 0 || time.tm_hour > 23 ||
+        time.tm_min < 0 || time.tm_min > 59 || time.tm_sec < 0 || time.tm_sec > 60 ||
+        time.tm_yday < 0 || time.tm_yday > 365 || year < 0 || year > 9999) {
+        return SonyAsctimeViolation(badArgument, buffer);
+    }
+    std::snprintf(buffer, 26, "%.3s %.3s %2d %.2d:%.2d:%.2d %04d\n", days[time.tm_wday], months[time.tm_mon],
+        time.tm_mday, time.tm_hour, time.tm_min, time.tm_sec, static_cast<int>(year));
+    return 0;
+}
+
+inline int SonyCtimeS(char* buffer, std::size_t size, const std::int64_t* time) {
+    if (!SonyAsctimeDestination(buffer, size)) return SonyAsctimeViolation("ctime_s: bad destination argument", nullptr);
+    if (size < 26 || !time) return SonyAsctimeViolation("ctime_s: bad argument", buffer);
+    GuestTm parts{};
+    if (!localtime_s_nid_postfix(time, &parts)) {
+        buffer[0] = '\0';
+        return EINVAL;
+    }
+    return SonyFormatAsctime(buffer, size, parts, "ctime_s: bad argument");
+}
+
+inline int SonyAsctimeS(char* buffer, std::size_t size, const GuestTm* time) {
+    if (!SonyAsctimeDestination(buffer, size)) return SonyAsctimeViolation("asctime_s: bad destination argument", nullptr);
+    if (!time) return SonyAsctimeViolation("asctime_s: bad argument", buffer);
+    return SonyFormatAsctime(buffer, size, *time, "asctime_s: bad argument");
+}
+
+constexpr std::size_t SonyRsizeMax = (std::size_t{1} << 61) - 1;
+
+inline int SonySafeViolation(const char* function, const char* reason, int error) {
+    char message[64];
+    std::snprintf(message, sizeof(message), "%s: %s", function, reason);
+    SonyInvokeConstraintHandler(message, nullptr, error);
+    return error;
+}
+
+template<typename TChar>
+bool SonySafeOverlaps(const TChar* first, std::size_t firstCount, const TChar* second, std::size_t secondCount) {
+    const auto left = reinterpret_cast<std::uintptr_t>(first);
+    const auto right = reinterpret_cast<std::uintptr_t>(second);
+    return left < right + secondCount * sizeof(TChar) && right < left + firstCount * sizeof(TChar);
+}
+
+template<typename TChar>
+int SonyCopyStringS(const char* function, TChar* dest, std::size_t destsz, const TChar* src, std::size_t count, bool counted) {
+    if (!dest || destsz == 0 || destsz > SonyRsizeMax) return SonySafeViolation(function, "bad destination argument", 22);
+    if (!src || (counted && count > SonyRsizeMax)) {
+        dest[0] = 0;
+        return SonySafeViolation(function, "bad argument", 22);
+    }
+    std::size_t length = 0;
+    while (length < count && src[length] != 0) ++length;
+    if (length >= destsz) {
+        dest[0] = 0;
+        return SonySafeViolation(function, "buffer too small", 34);
+    }
+    if (SonySafeOverlaps(dest, length + 1, src, length < count ? length + 1 : length)) {
+        dest[0] = 0;
+        return SonySafeViolation(function, "buffer overlap", 22);
+    }
+    std::memcpy(dest, src, length * sizeof(TChar));
+    dest[length] = 0;
+    return 0;
+}
+
+template<typename TChar>
+int SonyAppendStringS(const char* function, TChar* dest, std::size_t destsz, const TChar* src, std::size_t count, bool counted, bool terminators) {
+    if (!dest || destsz == 0 || destsz > SonyRsizeMax) return SonySafeViolation(function, "bad destination argument", 22);
+    std::size_t used = 0;
+    while (used < destsz && dest[used] != 0) ++used;
+    if ((!counted && used == destsz) || !src || (counted && count > SonyRsizeMax)) {
+        dest[0] = 0;
+        return SonySafeViolation(function, "bad argument", 22);
+    }
+    std::size_t length = 0;
+    while (length < count && src[length] != 0) ++length;
+    if (length >= destsz - used) {
+        dest[0] = 0;
+        return SonySafeViolation(function, "buffer too small", 34);
+    }
+    const std::size_t written = terminators ? length + 1 : length;
+    const std::size_t read = terminators && length < count ? length + 1 : length;
+    if (SonySafeOverlaps(dest + used, written, src, read)) {
+        dest[0] = 0;
+        return SonySafeViolation(function, "buffer overlap", 22);
+    }
+    std::memcpy(dest + used, src, length * sizeof(TChar));
+    dest[used + length] = 0;
+    return 0;
+}
+
+template<typename TChar>
+int SonyCopyMemoryS(const char* function, TChar* dest, std::size_t destsz, const TChar* src, std::size_t count, bool overlapping) {
+    if (!dest || destsz > SonyRsizeMax) return SonySafeViolation(function, "bad destination argument", 22);
+    if (!src || count > SonyRsizeMax) {
+        std::memset(dest, 0, destsz * sizeof(TChar));
+        return SonySafeViolation(function, "bad argument", 22);
+    }
+    if (count > destsz) {
+        std::memset(dest, 0, destsz * sizeof(TChar));
+        return SonySafeViolation(function, "buffer too small", 34);
+    }
+    if (!overlapping && SonySafeOverlaps(dest, count, src, count)) {
+        std::memset(dest, 0, destsz * sizeof(TChar));
+        return SonySafeViolation(function, "buffer overlap", 22);
+    }
+    std::memmove(dest, src, count * sizeof(TChar));
+    return 0;
+}
+
+inline int SonyWcscpyS(std::uint16_t* dest, std::size_t size, const std::uint16_t* src) {
+    return SonyCopyStringS("wcscpy_s", dest, size, src, SIZE_MAX, false);
+}
+
+inline std::size_t SonyMbstowcs(std::uint16_t* dest, const char* src, std::size_t size) {
+    if (!src) return 0;
+    if (!dest) return std::strlen(src);
+    std::size_t converted = 0;
+    while (converted < size) {
+        const auto value = static_cast<unsigned char>(src[converted]);
+        dest[converted] = value;
+        if (value == 0) return converted;
+        ++converted;
+    }
+    return converted;
+}
+
+inline int SonyFpclassifyd(double value) {
+    const std::uint64_t magnitude = std::bit_cast<std::uint64_t>(value) & 0x7fffffffffffffffull;
+    if (magnitude > 0x7ff0000000000000ull) return 2;
+    if (magnitude == 0x7ff0000000000000ull) return 1;
+    if (magnitude == 0) return 0;
+    if (magnitude < 0x0010000000000000ull) return -2;
+    return -1;
+}
+
+inline double SonySinh(double x, double y) {
+    return y * std::sinh(x);
+}
+
+inline int SonyFltrounds(void) {
+    switch (std::fegetround()) {
+    case FE_TONEAREST: return 1;
+    case FE_DOWNWARD: return 3;
+    case FE_UPWARD: return 2;
+    case FE_TOWARDZERO: return 0;
+    default: return 1;
+    }
+}
+
+inline unsigned __int128 SonyUdivmod128(unsigned __int128 dividend, unsigned __int128 divisor, unsigned __int128* remainderOut) {
+    unsigned __int128 quotient = 0;
+    unsigned __int128 remainder = 0;
+    for (int i = 127; i >= 0; --i) {
+        remainder = (remainder << 1) | ((dividend >> i) & 1);
+        if (remainder >= divisor) {
+            remainder -= divisor;
+            quotient |= (unsigned __int128)1 << i;
+        }
+    }
+    *remainderOut = remainder;
+    return quotient;
+}
+
+inline unsigned __int128 SonyUdivti3(unsigned __int128 dividend, unsigned __int128 divisor) {
+    if (divisor == 0) throw std::runtime_error("__udivti3: integer divide by zero");
+    unsigned __int128 remainder = 0;
+    return SonyUdivmod128(dividend, divisor, &remainder);
+}
+
+inline unsigned __int128 SonyUmodti3(unsigned __int128 dividend, unsigned __int128 divisor) {
+    if (divisor == 0) {
+        char message[96];
+        std::snprintf(message, sizeof(message), "__umodti3: integer divide by zero (0x%016llx%016llx %% 0)",
+            (unsigned long long)(dividend >> 64), (unsigned long long)dividend);
+        throw std::runtime_error(message);
+    }
+    unsigned __int128 remainder = 0;
+    SonyUdivmod128(dividend, divisor, &remainder);
+    return remainder;
+}
+
+inline __int128 SonyDivti3(__int128 dividend, __int128 divisor) {
+    if (divisor == 0) throw std::runtime_error("__divti3: integer divide by zero");
+    const bool negative = (dividend < 0) != (divisor < 0);
+    const unsigned __int128 magnitudeDividend = dividend < 0
+        ? (unsigned __int128)0 - (unsigned __int128)dividend
+        : (unsigned __int128)dividend;
+    const unsigned __int128 magnitudeDivisor = divisor < 0
+        ? (unsigned __int128)0 - (unsigned __int128)divisor
+        : (unsigned __int128)divisor;
+    const unsigned __int128 magnitude = SonyUdivti3(magnitudeDividend, magnitudeDivisor);
+    return (__int128)(negative ? (unsigned __int128)0 - magnitude : magnitude);
+}
+
+inline __int128 SonyModti3(__int128 dividend, __int128 divisor) {
+    if (divisor == 0) throw std::runtime_error("__modti3: integer divide by zero");
+    const bool negative = dividend < 0;
+    const unsigned __int128 magnitudeDividend = negative
+        ? (unsigned __int128)0 - (unsigned __int128)dividend
+        : (unsigned __int128)dividend;
+    const unsigned __int128 magnitudeDivisor = divisor < 0
+        ? (unsigned __int128)0 - (unsigned __int128)divisor
+        : (unsigned __int128)divisor;
+    unsigned __int128 remainder = 0;
+    SonyUdivmod128(magnitudeDividend, magnitudeDivisor, &remainder);
+    return (__int128)(negative ? (unsigned __int128)0 - remainder : remainder);
+}
+
+}
+
+#endif

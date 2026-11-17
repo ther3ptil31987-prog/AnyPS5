@@ -1,13 +1,48 @@
 #include "SpirvBackend/SpirvAnalysis.hpp"
+#include "RdnaDecoder/RdnaInstruction.hpp"
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace ShaderRecompiler {
 
 namespace {
+
+bool ReadsNeighbourLanes(const IrProgram& program, const IrValue& inst) {
+    switch (inst.Opcode()) {
+    case IrOpcode::ImageQueryLod:
+    case IrOpcode::DppMoveU32:
+    case IrOpcode::DppUpdateU32:
+    case IrOpcode::SwizzleU32:
+    case IrOpcode::BpermuteU32:
+    case IrOpcode::PermuteU32:
+    case IrOpcode::HalfSwapU32:
+    case IrOpcode::Permlane16U32:
+    case IrOpcode::ReadLane:
+    case IrOpcode::ReadFirstLane:
+    case IrOpcode::Ballot:
+    case IrOpcode::WqmU64:
+        return true;
+    case IrOpcode::ImageSampleImplicitLod:
+    case IrOpcode::ImageSampleRaw: {
+        const auto flags = program.Resources().memoryInfo.at(inst.Flags<MemoryFlags>().index).imageSampleFlags;
+        return (flags & (RdnaImageSampleFlagDerivative | RdnaImageSampleFlagLod | RdnaImageSampleFlagLevelZero)) == 0u;
+    }
+    default:
+        return false;
+    }
+}
+
+bool ReadsOffsetBarycentric(const IrValue& inst) {
+    if (inst.Opcode() != IrOpcode::GetBuiltin) return false;
+    const auto* kind = inst.Argument(0)->Resolve();
+    if (kind == nullptr || !kind->HasImmediate()) return false;
+    const auto input = static_cast<StageInputKind>(kind->ImmediateU32());
+    return BarycentricInputOf(input) != input;
+}
 
 bool UniformSource(const IrValue& value) {
     switch (value.Opcode()) {
@@ -37,16 +72,21 @@ bool LaneSource(const IrProgram& program, const IrValue& value) {
     case IrOpcode::LaneId:
     case IrOpcode::GetAttribute:
     case IrOpcode::GetInterpolationParameter:
+    case IrOpcode::GetInterpolationParameterF16:
     case IrOpcode::GetTessellationAttribute:
     case IrOpcode::DppMoveU32:
     case IrOpcode::DppUpdateU32:
     case IrOpcode::Permlane16U32:
     case IrOpcode::PermuteU32:
     case IrOpcode::BpermuteU32:
+    case IrOpcode::HalfSwapU32:
     case IrOpcode::SwizzleU32:
     case IrOpcode::WriteLane:
     case IrOpcode::DataAppend:
     case IrOpcode::DataConsume:
+    case IrOpcode::LoadVectorWindow:
+    case IrOpcode::DataOrderedCount:
+    case IrOpcode::DataOrderedSwap:
         return true;
     case IrOpcode::GetBuiltin: {
         const auto* kind = value.Argument(0)->Resolve();
@@ -83,6 +123,15 @@ public:
         return result;
     }
 
+    std::optional<std::uint64_t> OfWhere(const IrValue* value, const IrValue* condition) {
+        if (condition != nullptr) condition = condition->Resolve();
+        if (condition != assumed) {
+            bounds.clear();
+            assumed = condition;
+        }
+        return Of(value);
+    }
+
 private:
     static constexpr std::size_t MaxDepth = 256;
     static constexpr std::uint64_t Max32 = 0xffffffffull;
@@ -101,6 +150,8 @@ private:
         switch (value.Opcode()) {
         case IrOpcode::LaneId:
             return 63u;
+        case IrOpcode::BitCount32:
+            return 32u;
         case IrOpcode::IAdd32: {
             const auto a = argument(0), b = argument(1);
             if (!a || !b) return std::nullopt;
@@ -144,32 +195,86 @@ private:
             if (!a || !b) return std::nullopt;
             return std::max(*a, *b);
         }
-        case IrOpcode::SelectU32: {
-            const auto a = argument(1), b = argument(2);
-            if (!a || !b) return std::nullopt;
-            return std::max(*a, *b);
-        }
+        case IrOpcode::SelectU32:
+            return merged(value);
         case IrOpcode::BitFieldUExtract: {
             const auto width = argument(2);
             if (width && *width < 32u) return (1ull << *width) - 1u;
             return argument(0);
         }
-        case IrOpcode::Phi: {
-            std::uint64_t result = 0;
-            for (std::size_t index = 0; index < value.ArgumentCount(); ++index) {
-                const auto incoming = Of(value.Argument(index));
-                if (!incoming) return std::nullopt;
-                result = std::max(result, *incoming);
-            }
-            return result;
-        }
+        case IrOpcode::Phi:
+            return merged(value);
         default:
             return std::nullopt;
         }
     }
 
+    static bool same(const IrValue* a, const IrValue* b, std::uint32_t depth = 0) {
+        if (a != nullptr) a = a->Resolve();
+        if (b != nullptr) b = b->Resolve();
+        if (a == nullptr || b == nullptr) return false;
+        if (depth == 0u && (a->HasImmediate() || b->HasImmediate())) return false;
+        if (a == b) return true;
+        if (a->HasImmediate() || b->HasImmediate()) return a->HasImmediate() && b->HasImmediate() && a->Type() == b->Type() && a->ImmediateU32() == b->ImmediateU32();
+        if (depth > 8u || a->Opcode() != b->Opcode() || a->ArgumentCount() != b->ArgumentCount()) return false;
+        switch (a->Opcode()) {
+        case IrOpcode::LogicalAnd:
+        case IrOpcode::LogicalOr:
+        case IrOpcode::LogicalNot:
+        case IrOpcode::IEqual32:
+        case IrOpcode::INotEqual32:
+        case IrOpcode::BitwiseAnd32:
+        case IrOpcode::ShiftRightLogical32:
+            break;
+        default:
+            return false;
+        }
+        for (std::size_t index = 0; index < a->ArgumentCount(); ++index) {
+            if (!same(a->Argument(index), b->Argument(index), depth + 1u)) return false;
+        }
+        return true;
+    }
+
+    std::optional<std::uint64_t> merged(const IrValue& root) {
+        std::vector<const IrValue*> members{&root};
+        std::vector<const IrValue*> leaves;
+        bool bounded = true;
+        for (std::size_t next = 0; next < members.size() && bounded; ++next) {
+            const auto& member = *members[next];
+            const bool select = member.Opcode() == IrOpcode::SelectU32;
+            const std::size_t end = select && assumed != nullptr && member.ArgumentCount() == 3u && same(member.Argument(0), assumed) ? 2u : member.ArgumentCount();
+            for (std::size_t index = select ? 1u : 0u; index < end; ++index) {
+                const IrValue* incoming = member.Argument(index);
+                if (incoming != nullptr) incoming = incoming->Resolve();
+                if (incoming == nullptr) {
+                    bounded = false;
+                    break;
+                }
+                if (incoming->HasImmediate() || (incoming->Opcode() != IrOpcode::Phi && incoming->Opcode() != IrOpcode::SelectU32)) {
+                    leaves.push_back(incoming);
+                    continue;
+                }
+                if (std::find(members.begin(), members.end(), incoming) != members.end()) continue;
+                if (!visiting.insert(incoming).second || members.size() >= MaxDepth) {
+                    bounded = false;
+                    break;
+                }
+                members.push_back(incoming);
+            }
+        }
+        std::uint64_t result = 0;
+        for (std::size_t index = 0; index < leaves.size() && bounded; ++index) {
+            const auto leaf = Of(leaves[index]);
+            if (!leaf) bounded = false;
+            else result = std::max(result, *leaf);
+        }
+        for (std::size_t index = 1; index < members.size(); ++index) visiting.erase(members[index]);
+        return bounded ? std::optional<std::uint64_t>(result) : std::nullopt;
+    }
+
     std::unordered_map<const IrValue*, std::optional<std::uint64_t>> bounds;
     std::unordered_set<const IrValue*> visiting;
+    const IrValue* assumed = nullptr;
 };
 
 std::uint32_t SharedAccessDwords(IrOpcode opcode) {
@@ -222,14 +327,20 @@ std::uint32_t FunctionLdsDwords(const IrProgram& program) {
     std::uint64_t needed = 0;
     for (const IrBlock* block : program.BlockOrder()) {
         for (const IrValue* inst : block->Instructions()) {
-            if (SharedAccessOf(inst->Opcode()) == SharedAccess::None) continue;
+            const auto access = SharedAccessOf(inst->Opcode());
+            if (access == SharedAccess::None) continue;
             const auto index = inst->Flags<MemoryFlags>().index;
             if (index >= program.Resources().memoryInfo.size()) return FunctionLdsDwordLimit;
             const auto& memory = program.Resources().memoryInfo[index];
             if (memory.kind != ResourceKind::Lds) continue;
+            if (access == SharedAccess::Append || access == SharedAccess::Consume) {
+                needed = std::max<std::uint64_t>(needed, (std::uint64_t{memory.offset} >> 2u) + 1u);
+                if (needed >= FunctionLdsDwordLimit) return FunctionLdsDwordLimit;
+                continue;
+            }
             const auto dwords = SharedAccessDwords(inst->Opcode());
             if (dwords == 0u || inst->ArgumentCount() == 0) return FunctionLdsDwordLimit;
-            const auto address = bound.Of(inst->Argument(0));
+            const auto address = bound.OfWhere(inst->Argument(0), inst->Argument(inst->ArgumentCount() - 1u));
             if (!address || *address + memory.offset > 0xffffffffull) return FunctionLdsDwordLimit;
             needed = std::max(needed, ((*address + memory.offset) >> 2u) + dwords);
             if (needed >= FunctionLdsDwordLimit) return FunctionLdsDwordLimit;
@@ -279,9 +390,9 @@ std::optional<LaneAffine> LaneAffineOf(const IrValue* value, std::uint32_t depth
 
 }
 
-std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const IrProgram& program) {
+std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const IrProgram& program, std::uint32_t dwords) {
     std::unordered_map<const IrValue*, std::uint32_t> addresses;
-    if (FunctionLdsDwords(program) >= FunctionLdsDwordLimit) return {};
+    if (dwords >= FunctionLdsDwordLimit) return {};
     std::optional<std::uint64_t> stride;
     for (const IrBlock* block : program.BlockOrder()) {
         for (const IrValue* inst : block->Instructions()) {
@@ -299,19 +410,43 @@ std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const
     return addresses;
 }
 
+bool IsSplittableBufferAtomic64(const IrValue* inst) {
+    switch (inst->Opcode()) {
+    case IrOpcode::BufferAtomicOr64:
+    case IrOpcode::BufferAtomicAnd64:
+    case IrOpcode::BufferAtomicXor64:
+        return !inst->HasUses();
+    default:
+        return false;
+    }
+}
+
 SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
+    bool storageWrites = false;
     SpirvRequirements requirements {};
+    std::optional<IrOpcode> splitOpcode;
     for (const IrBlock* block : program.BlockOrder()) {
         for (const IrValue* inst : block->Instructions()) {
             const auto addressAccess = AddressOpcodeInfoOf(inst->Opcode()).access;
             if ((BufferAccessOf(inst->Opcode()) == BufferAccess::Atomic || addressAccess == AddressAccess::Atomic) && inst->Type() == IrType::U64) {
                 requirements.bufferInt64Atomics = true;
+                requirements.addressInt64Atomics = requirements.addressInt64Atomics || addressAccess == AddressAccess::Atomic;
+                if (!IsSplittableBufferAtomic64(inst)) {
+                    requirements.bufferInt64AtomicsExact = true;
+                } else if (!splitOpcode) {
+                    splitOpcode = inst->Opcode();
+                } else if (*splitOpcode != inst->Opcode()) {
+                    requirements.bufferInt64AtomicsExact = true;
+                }
             }
             if (IsImageAtomic64Opcode(inst->Opcode())) {
                 requirements.imageInt64Atomics = true;
             }
-            if (IsFloat64Opcode(inst->Opcode())) {
+            if (inst->Opcode() == IrOpcode::FPInterpolateF32 || inst->Opcode() == IrOpcode::FPInterpolateF16) {
+                requirements.float64Interpolation = true;
+            } else if (IsFloat64Opcode(inst->Opcode())) {
                 requirements.float64 = true;
+                requirements.float64NeedsDevice = requirements.float64NeedsDevice || !IsIntegerFloat64Opcode(inst->Opcode());
             }
             if (addressAccess != AddressAccess::None) {
                 const auto memoryIndex = inst->Flags<MemoryFlags>().index;
@@ -324,6 +459,13 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                     }
                     requirements.functionScratch = true;
                 }
+                if (program.Resources().memoryInfo.at(memoryIndex).kind == ResourceKind::Flat && program.Resources().stage == IrShaderStage::Compute && program.Info().scratchDwords != 0u) {
+                    requirements.functionScratch = true;
+                }
+                if (program.Resources().memoryInfo.at(memoryIndex).kind == ResourceKind::Flat && program.Resources().stage == IrShaderStage::Compute && addressAccess == AddressAccess::Atomic && inst->Type() == IrType::U64) {
+                    requirements.ldsLock = true;
+                    requirements.subgroupBallot = true;
+                }
             }
             if (BufferAccessOf(inst->Opcode()) != BufferAccess::None) {
                 const auto memoryIndex = inst->Flags<MemoryFlags>().index;
@@ -332,24 +474,19 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                 }
                 const auto& memory = program.Resources().memoryInfo.at(memoryIndex);
                 requirements.coherentBuffers = requirements.coherentBuffers || (memory.coherent && !memory.gpuDescriptor);
-                if (memory.gpuDescriptor) {
-                    if (program.Resources().stage != IrShaderStage::Compute) {
-                        throw std::runtime_error("GPU-selected buffer descriptors outside compute shaders are not implemented");
-                    }
-                    requirements.subgroupLocalInvocationId = true;
-                } else if (memory.kind == ResourceKind::Buffer) {
-                    if (memory.resource >= program.Info().buffers.size()) {
-                        throw std::runtime_error("buffer operation has invalid resource metadata");
-                    }
-                    if ((program.Info().buffers.at(memory.resource).packedStride & (1u << 20u)) != 0u) {
-                        if (program.Resources().stage != IrShaderStage::Compute) {
-                            throw std::runtime_error("buffer ADD_TID is only valid for compute shaders");
-                        }
-                        requirements.subgroupLocalInvocationId = true;
-                    }
+                const bool pair = inst->Opcode() == IrOpcode::LoadBufferU32x2 || inst->Opcode() == IrOpcode::StoreBufferU32x2;
+                requirements.coherentBufferPairs = requirements.coherentBufferPairs || (pair && memory.coherent && !memory.gpuDescriptor);
+                if (!memory.planningOnly) {
+                    requirements.subgroupLocalInvocationId = requirements.subgroupLocalInvocationId || program.Resources().stage == IrShaderStage::Compute;
                 }
             }
+            const auto bufferAccess = BufferAccessOf(inst->Opcode());
+            const auto imageAccess = ImageOpcodeInfoOf(inst->Opcode()).access;
             const auto sharedAccess = SharedAccessOf(inst->Opcode());
+            storageWrites = storageWrites ||
+                (bufferAccess != BufferAccess::None && bufferAccess != BufferAccess::Read) ||
+                (addressAccess != AddressAccess::None && addressAccess != AddressAccess::Read) ||
+                (imageAccess != ImageAccess::None && imageAccess != ImageAccess::Read) || sharedAccess != SharedAccess::None;
             if (sharedAccess == SharedAccess::Atomic && inst->Type() == IrType::U64) {
                 requirements.sharedInt64Atomics = true;
             }
@@ -361,6 +498,9 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                 const auto kind = program.Resources().memoryInfo.at(index).kind;
                 if (kind != ResourceKind::Lds && kind != ResourceKind::Gds) {
                     throw std::runtime_error("shared operation has invalid resource kind");
+                }
+                if (sharedAccess == SharedAccess::Atomic && inst->Type() == IrType::U64 && kind == ResourceKind::Gds) {
+                    requirements.gdsInt64Atomics = true;
                 }
                 if (program.Resources().stage != IrShaderStage::Compute && program.Resources().stage != IrShaderStage::Mesh && kind == ResourceKind::Lds) {
                     requirements.functionLds = true;
@@ -374,6 +514,8 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                     requirements.subgroupLocalInvocationId = true;
                 }
             }
+            requirements.neighbourLaneReads = requirements.neighbourLaneReads || ReadsNeighbourLanes(program, *inst);
+            requirements.offsetBarycentricReads = requirements.offsetBarycentricReads || ReadsOffsetBarycentric(*inst);
             switch (inst->Opcode()) {
             case IrOpcode::Ballot:
                 requirements.subgroupBallot = true;
@@ -402,7 +544,8 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
             }
             case IrOpcode::SwizzleU32:
             case IrOpcode::PermuteU32:
-            case IrOpcode::BpermuteU32: {
+            case IrOpcode::BpermuteU32:
+            case IrOpcode::HalfSwapU32: {
                 requirements.subgroupBallot = true;
                 requirements.subgroupShuffle = true;
                 requirements.subgroupLocalInvocationId = true;
@@ -439,7 +582,7 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
     }
     if (requirements.functionLds) {
         requirements.functionLdsDwords = FunctionLdsDwords(program);
-        requirements.functionLdsAddresses = FunctionLdsLaneAddresses(program);
+        requirements.functionLdsAddresses = FunctionLdsLaneAddresses(program, requirements.functionLdsDwords);
         if (!requirements.functionLdsAddresses.empty()) {
             std::uint64_t needed = 0;
             for (const auto& [inst, address] : requirements.functionLdsAddresses) {
@@ -449,6 +592,12 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
             requirements.functionLdsDwords = static_cast<std::uint32_t>(std::max<std::uint64_t>((needed + 63u) & ~63ull, 64u));
         }
     }
+    const auto& info = program.Info();
+    const auto writtenImage = [](const ImageResource& image) { return image.written || image.atomic || image.atomic64 || image.targetMerge; };
+    requirements.readOnlyStorage = !storageWrites && program.Resources().stage == IrShaderStage::Pixel && !info.bdaWrites && !info.usesFaultBuffer && !info.usesDma &&
+        std::ranges::none_of(info.buffers, [](const BufferResource& buffer) { return buffer.written || buffer.atomic; }) &&
+        std::ranges::none_of(info.images, writtenImage) && std::ranges::none_of(info.runtimeImageModes, [&](const auto& modes) { return std::ranges::any_of(modes, writtenImage); });
+    requirements.coherentBufferAlias = requirements.coherentBuffers && !program.Metadata().invalidatesCaches;
     return requirements;
 }
 
@@ -469,12 +618,13 @@ std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program) {
         changed = false;
         for (const IrBlock* block : program.BlockOrder()) {
             for (const IrValue* inst : block->Instructions()) {
+                auto& entry = varying[inst];
+                if (entry) continue;
                 bool lanes = !UniformSource(*inst) && LaneSource(program, *inst);
                 for (std::size_t index = 0; !lanes && !UniformSource(*inst) && index < inst->ArgumentCount(); index++) {
                     if (inst->Argument(index) != nullptr) lanes = isVarying(inst->Argument(index));
                 }
-                auto& entry = varying[inst];
-                if (lanes && !entry) {
+                if (lanes) {
                     entry = true;
                     changed = true;
                 }
@@ -486,6 +636,10 @@ std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program) {
         if (!lanes) uniform.insert(value);
     }
     return uniform;
+}
+
+bool IsIntegerFloat64Opcode(IrOpcode opcode) {
+    return opcode == IrOpcode::FPAdd64 || opcode == IrOpcode::FPMul64 || opcode == IrOpcode::ConvertF32F64 || opcode == IrOpcode::ConvertF64F32;
 }
 
 }

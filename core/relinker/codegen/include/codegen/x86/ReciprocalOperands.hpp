@@ -16,9 +16,12 @@ struct ReciprocalOperands {
     ReciprocalOperation Operation;
     std::uint8_t Destination;
     std::uint8_t Source;
+    bool Vex;
+    bool Scalar;
+    std::uint8_t Upper;
 };
 
-[[nodiscard]] std::optional<ReciprocalOperands> DecodeVexReciprocal(const std::uint8_t* data, std::size_t length);
+[[nodiscard]] std::optional<ReciprocalOperands> DecodeReciprocal(const std::uint8_t* data, std::size_t length);
 
 }
 

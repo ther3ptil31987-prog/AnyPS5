@@ -1,12 +1,7 @@
 add_library(libSceContentExport SHARED EXCLUDE_FROM_ALL Export.cpp)
 target_include_directories(libSceContentExport PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(libSceContentExport PRIVATE libkernel_sys)
 configure_windows_unwind(libSceContentExport)
-
-if(MINGW)
-    foreach(runtimeLinkFlag IN ITEMS -static-libgcc -static-libstdc++ -static)
-        string(REPLACE "${runtimeLinkFlag}" "" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
-    endforeach()
-endif()
 
 if(BUILD_TESTING)
     add_test_executable(guest_content_export_tests ${LIBS_INCLUDE_DIR}/tests/GuestContentExport.cpp)
@@ -16,6 +11,16 @@ if(BUILD_TESTING)
     add_test(NAME guest_content_export COMMAND guest_content_export_tests)
     if(WIN32)
         set_tests_properties(guest_content_export PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(guest_content_delete_tests ${LIBS_INCLUDE_DIR}/tests/GuestContentDelete.cpp)
+    target_include_directories(guest_content_delete_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_content_delete_tests PRIVATE libSceContentDelete libc)
+    configure_windows_unwind(guest_content_delete_tests)
+    add_test(NAME guest_content_delete COMMAND guest_content_delete_tests)
+    if(WIN32)
+        set_tests_properties(guest_content_delete PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

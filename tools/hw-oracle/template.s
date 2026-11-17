@@ -40,13 +40,17 @@ probe:
 .amdhsa_kernel probe
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_kernarg_size 16
-  .amdhsa_group_segment_fixed_size 4096
+  .amdhsa_group_segment_fixed_size @LDS@
   .amdhsa_next_free_vgpr 128
   .amdhsa_next_free_sgpr 48
   .amdhsa_wavefront_size32 @WAVE32@
   .amdhsa_float_denorm_mode_32 @DENORM@
   .amdhsa_float_denorm_mode_16_64 @DENORM16@
   .amdhsa_ieee_mode @IEEE@
+  .amdhsa_dx10_clamp @DX10_CLAMP@
+  .amdhsa_float_round_mode_32 @ROUND32@
+  .amdhsa_float_round_mode_16_64 @ROUND16@
+  .amdhsa_fp16_overflow @FP16_OVERFLOW@
 .end_amdhsa_kernel
 
 .amdgpu_metadata
@@ -56,7 +60,7 @@ amdhsa.kernels:
   - .name: probe
     .symbol: probe.kd
     .kernarg_segment_size: 16
-    .group_segment_fixed_size: 4096
+    .group_segment_fixed_size: @LDS@
     .private_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .wavefront_size: @WAVESIZE@

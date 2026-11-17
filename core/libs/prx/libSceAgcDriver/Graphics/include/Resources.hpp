@@ -12,6 +12,7 @@ public:
     ~Buffer();
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
+    static std::shared_ptr<Buffer> WithinDeviceLocalHeadroom(const Context& context, std::size_t size, VkBufferUsageFlags usage);
     VkBuffer Handle() const;
     VkDeviceAddress DeviceAddress() const;
     // Host-visible buffers only: a device-local one (properties without HOST_VISIBLE, the staging
@@ -21,6 +22,7 @@ public:
     void Invalidate();
 
 private:
+    Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool headroom);
     void initializeAddress(VkBufferUsageFlags usage);
     void release() noexcept;
     Context context;
@@ -29,12 +31,13 @@ private:
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapping = nullptr;
     std::size_t size;
-    // The VkBuffer's own size, `size` rounded up to its pool class (see BufferPool::Capacity).
     std::size_t capacity;
     // Fully made (or taken from the pool), so release returns it to the pool instead of destroying
     // the handles a failed construction left.
     bool ready = false;
     VkDeviceSize allocationBytes = 0;
+    VkDeviceSize offset = 0;
+    bool slab = false;
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
     std::shared_ptr<BufferPool> cache;
@@ -62,6 +65,8 @@ private:
     VkDeviceSize allocationBytes = 0;
     VkBufferUsageFlags usage;
     std::shared_ptr<BufferPool> cache;
+    bool hostPlaced = false;
+    bool ready = false;
 };
 
 // Records a whole-range buffer copy.
@@ -88,7 +93,11 @@ private:
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memoryBytes = 0;
+    std::uint32_t memoryType = 0;
 };
+
+void NoteGuestWorkOnCommandBuffer(VkCommandBuffer commands);
 
 class CommandBatch {
 public:

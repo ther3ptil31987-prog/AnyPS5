@@ -3,6 +3,7 @@
 
 #include "IntermediateRepresentation/IrMetadata.hpp"
 #include "Recompiler.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -40,18 +41,6 @@ struct ShaderBufferResource {
     [[nodiscard]] std::uint8_t Type() const { return (fields[3] >> 30u) & 0x3u; }
 };
 
-struct ShaderColorComponentMapping {
-    static constexpr std::uint8_t Identity = 0xe4u;
-    std::uint8_t packed = Identity;
-
-    [[nodiscard]] std::uint32_t Map(std::uint32_t component) const {
-        return (packed >> (component * 2u)) & 0x3u;
-    }
-    [[nodiscard]] bool IsIdentity() const {
-        return packed == Identity;
-    }
-};
-
 struct ShaderVertexInputBuffer {
     static constexpr int MaxAttributes = 32;
 
@@ -71,13 +60,8 @@ struct ShaderVertexDestination {
     std::uint32_t fetchIndex = 0;
 };
 
-struct ShaderStageRuntime {
-    const CompiledShaderInfo* program = nullptr;
-    ResourceSnapshot resources;
-
-    [[nodiscard]] explicit operator bool() const {
-        throw std::runtime_error("shader input helper not implemented");
-    }
+struct ShaderDepthRemap {
+    std::uint32_t mode = 0;
 };
 
 struct ShaderClipSpaceTransform {
@@ -103,6 +87,8 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
     std::uint32_t maxPrimitives = 0;
     std::uint32_t provokingVertex = 0;
     std::uint32_t esgsItemSize = 0;
+    std::uint32_t outputPrimitiveSize = 3;
+    bool capturedInput = false;
 
     [[nodiscard]] std::uint32_t InputPrimitiveSize() const {
         return inputPrimitive == 1u ? 1u : inputPrimitive == 2u ? 2u : 3u;
@@ -121,11 +107,16 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 struct ShaderTessellationInputInfo {
     std::uint32_t inputControlPoints = 0;
     std::uint32_t outputControlPoints = 0;
-    std::uint32_t lsStride = 0;
-    std::uint32_t hsStride = 0;
     std::uint32_t domain = 0;
     std::uint32_t partitioning = 0;
     std::uint32_t outputTopology = 0;
+    std::uint32_t patchesPerGroup = 256;
+    std::uint32_t primitiveGroupSize = 0;
+    bool breakAtInstance = false;
+    std::uint32_t instancePatches = 0;
+    bool drawParameters = false;
+    bool mergedHull = false;
+    std::uint32_t geometryItemDwords = 0;
 };
 
 struct ShaderVertexInputInfo {
@@ -134,15 +125,20 @@ struct ShaderVertexInputInfo {
     ShaderBufferResource resources[MaxResources];
     ShaderVertexDestination resourcesDst[MaxResources];
     ShaderVertexInputBuffer buffers[MaxResources];
-    ShaderStageRuntime stage;
     IrShaderStage logicalStage = IrShaderStage::Vertex;
     int resourcesNum = 0;
     int fetchAttribReg = 0;
     int fetchBufferReg = 0;
     int buffersNum = 0;
     std::uint32_t scratchSizeDwords = 0;
+    std::uint32_t hostSubgroupSize = 64;
     std::uint32_t paClVsOutCntl = 0;
+    bool pointList = false;
+    float pointSize = 1.0f;
+    float pointSizeMin = 0.0f;
+    float pointSizeMax = 0.0f;
     ShaderClipSpaceTransform clipSpace;
+    ShaderDepthRemap depthRemap;
     ShaderMeshInputInfo mesh;
     ShaderTessellationInputInfo tess;
     bool fetchExternal = false;
@@ -155,7 +151,6 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
     int threadIdsNum = 0;
     int workgroupRegister = 0;
     bool tgSizeEn = false;
-    ShaderStageRuntime stage;
 };
 
 struct ShaderPixelInputInfo {
@@ -169,26 +164,66 @@ struct ShaderPixelInputInfo {
         return vgprs;
     }();
     std::uint8_t targetOutputMode[8] = {};
-    std::array<ShaderColorComponentMapping, 8> targetExportMapping = {};
     std::uint32_t scratchSizeDwords = 0;
     bool psPosX = false;
     bool psPosY = false;
     bool psPosZ = false;
     bool psPosW = false;
     bool psFrontFace = false;
+    bool psFrontFaceAllBits = false;
     bool psAncillary = false;
     bool psNoPerspective = false;
     bool psPixelKillEnable = false;
     bool psDepthExportEnable = false;
+    float psDepthExportMin = 0.0f;
+    float psDepthExportMax = 1.0f;
     bool psSampleMaskExportEnable = false;
+    bool psStencilRefExportEnable = false;
+    bool psStencilOperationValueExport = false;
     bool psSampleShading = false;
     bool psEarlyZ = false;
     bool psExecuteOnNoop = false;
     ConservativeZExport psConservativeZExport = ConservativeZExport::AnyZ;
-    ShaderStageRuntime stage;
+    bool psOrderedPixelShader = false;
+    bool psAlphaToCoverage = false;
+    bool psDitheredAlphaToCoverage = false;
+    std::uint8_t psDitheredAlphaSamples = 8;
+    std::uint8_t quadPixelMask = 0xf;
+    std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
+    bool psIteratesSamples = false;
+    PixelPositionLocation psPositionLocation = PixelPositionLocation::Center;
+    std::array<std::uint8_t, 32> sampleLocations{};
+    std::vector<TargetMerge> merges;
+    std::uint8_t mergeSamples = 1;
+    bool mergeDepthStencilWrites = false;
+    bool mergeDepthStencilTests = false;
+    std::array<std::uint32_t, 4> sampleOrder{};
 
     bool HasPositionInput() const {
         return psPosX || psPosY || psPosZ || psPosW;
+    }
+
+    [[nodiscard]] bool SampleLocationsOffCenter() const {
+        return std::ranges::any_of(sampleLocations, [](std::uint8_t location) { return location != 0u; });
+    }
+
+    [[nodiscard]] bool SampleLocationsVary() const {
+        for (std::size_t index = 8; index < sampleLocations.size(); ++index) {
+            if (sampleLocations[index] != sampleLocations[index % 8u]) return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool ReordersSamples() const {
+        return std::ranges::any_of(sampleOrder, [](std::uint32_t order) { return order != 0u && order != 0x76543210u; });
+    }
+
+    [[nodiscard]] bool QuadSampleMaskPartial() const {
+        return std::ranges::any_of(quadSampleMask, [](std::uint16_t mask) { return mask != 0xffffu; });
+    }
+
+    [[nodiscard]] bool QuadMasked() const {
+        return quadPixelMask != 0xf || QuadSampleMaskPartial();
     }
 
     [[nodiscard]] bool InputIsDefault(std::uint32_t input) const {
@@ -203,12 +238,36 @@ struct ShaderPixelInputInfo {
         return input < 32u && ((customInterpolationMask & (1u << input)) != 0u || InputIsPassthrough(input));
     }
 
+    [[nodiscard]] bool InputIsFlat(std::uint32_t input) const {
+        return input < inputNum && input < 32u && (interpolatorSettings[input] & 0x400u) != 0u && !InputIsCustom(input);
+    }
+
     [[nodiscard]] std::uint32_t InputSlot(std::uint32_t input) const {
         return input < 32u ? interpolatorSettings[input] & 0x1fu : input;
     }
 
     [[nodiscard]] std::uint32_t InputDefaultBits(std::uint32_t input, std::uint32_t component) const {
         const auto value = input < 32u ? (interpolatorSettings[input] >> 8u) & 0x3u : 0u;
+        const bool one = component == 3u ? (value & 0x1u) != 0u : (value & 0x2u) != 0u;
+        return one ? 0x3f800000u : 0u;
+    }
+
+    [[nodiscard]] bool InputIsFp16(std::uint32_t input) const {
+        return input < inputNum && input < 32u && (interpolatorSettings[input] & 0x80000u) != 0u;
+    }
+
+    [[nodiscard]] bool InputHalfIsDefault(std::uint32_t input, bool high) const {
+        if (!high) {
+            return InputIsDefault(input);
+        }
+        return input < inputNum && input < 32u && (interpolatorSettings[input] & 0x100000u) != 0u;
+    }
+
+    [[nodiscard]] std::uint32_t InputHalfDefaultBits(std::uint32_t input, std::uint32_t component, bool high) const {
+        if (!high) {
+            return InputDefaultBits(input, component);
+        }
+        const auto value = input < 32u ? (interpolatorSettings[input] >> 21u) & 0x3u : 0u;
         const bool one = component == 3u ? (value & 0x1u) != 0u : (value & 0x2u) != 0u;
         return one ? 0x3f800000u : 0u;
     }

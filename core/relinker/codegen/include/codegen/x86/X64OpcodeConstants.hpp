@@ -20,6 +20,7 @@ inline constexpr std::uint8_t PrefixAddressSize = 0x67;
 inline constexpr std::uint8_t RexMin = 0x40;
 inline constexpr std::uint8_t RexMax = 0x4F;
 inline constexpr std::uint8_t RexWBit = 0x08;
+inline constexpr std::uint8_t RexBBit = 0x01;
 
 inline constexpr std::uint8_t TwoByteOpcodeEscape = 0x0F;
 
@@ -43,6 +44,7 @@ inline constexpr std::uint8_t OneByteArpl = 0x62;
 inline constexpr std::uint8_t OneByteMovsxd = 0x63;
 inline constexpr std::uint8_t OneByteModRmRangeIMin = 0x84;
 inline constexpr std::uint8_t OneByteModRmRangeIMax = 0x8F;
+inline constexpr std::uint8_t OneByteLea = 0x8D;
 inline constexpr std::uint8_t OneByteGrp2Rm8Imm8 = 0xC0;
 inline constexpr std::uint8_t OneByteGrp2RmImm8 = 0xC1;
 inline constexpr std::uint8_t OneByteVex3 = 0xC4;
@@ -107,9 +109,13 @@ inline constexpr std::uint8_t OneByteLoopMax = 0xE2;
 inline constexpr std::uint8_t OneByteInOutImm8Min = 0xE4;
 inline constexpr std::uint8_t OneByteInOutImm8Max = 0xE7;
 inline constexpr std::uint8_t OneByteInt = 0xCD;
+inline constexpr std::uint8_t OneByteInt3 = 0xCC;
+inline constexpr std::uint8_t OneByteNop = 0x90;
 inline constexpr std::uint8_t OneByteRetImm16 = 0xC2;
 inline constexpr std::uint8_t OneByteRetFarImm16 = 0xCA;
 inline constexpr std::uint8_t OneByteEnter = 0xC8;
+inline constexpr std::uint8_t OneByteMovMoffsMin = 0xA0;
+inline constexpr std::uint8_t OneByteMovMoffsMax = 0xA3;
 
 inline constexpr std::uint8_t TwoByteJccRel32Min = 0x80;
 inline constexpr std::uint8_t TwoByteJccRel32Max = 0x8F;
@@ -117,7 +123,7 @@ inline constexpr std::uint8_t TwoByteMovImm8ModRm = 0xBA;
 inline constexpr std::uint8_t TwoByteCmovRangeMin = 0x40;
 inline constexpr std::uint8_t TwoByteCmovRangeMax = 0x4F;
 inline constexpr std::uint8_t TwoByteModRmRangeAMin = 0xA3;
-inline constexpr std::uint8_t TwoByteModRmRangeAMax = 0xAB;
+inline constexpr std::uint8_t TwoByteModRmRangeAMax = 0xA7;
 inline constexpr std::uint8_t TwoByteModRmRangeBMin = 0xB0;
 inline constexpr std::uint8_t TwoByteModRmRangeBMax = 0xB7;
 inline constexpr std::uint8_t TwoByteModRmRangeCMin = 0xBC;
@@ -144,6 +150,7 @@ inline constexpr std::uint8_t TwoByteMovdMovq = 0x7E;
 inline constexpr std::uint8_t TwoByteMovqMmxXmm = 0x6F;
 inline constexpr std::uint8_t TwoByteMovdqu = 0x7F;
 inline constexpr std::uint8_t TwoByteGrp7 = 0x01;
+inline constexpr std::uint8_t TwoByteMaskmov = 0xF7;
 inline constexpr std::uint8_t TwoByteShiftImm8Min = 0x70;
 inline constexpr std::uint8_t TwoByteShiftImm8Max = 0x73;
 inline constexpr std::uint8_t ThreeByteEscape38 = 0x38;
@@ -168,10 +175,13 @@ inline constexpr std::uint8_t TwoByteGrp6 = 0x00;
 inline constexpr std::uint8_t TwoByteLar = 0x02;
 inline constexpr std::uint8_t TwoByteLsl = 0x03;
 inline constexpr std::uint8_t TwoBytePrefetchw = 0x0D;
+inline constexpr std::uint8_t TwoByte3DNow = 0x0F;
 inline constexpr std::uint8_t TwoByteMovCrDrMin = 0x20;
 inline constexpr std::uint8_t TwoByteMovCrDrMax = 0x23;
 inline constexpr std::uint8_t TwoBytePopcnt = 0xB8;
+inline constexpr std::uint8_t TwoByteUd0 = 0xFF;
 inline constexpr std::uint8_t TwoByteUd1 = 0xB9;
+inline constexpr std::uint8_t TwoByteBts = 0xAB;
 inline constexpr std::uint8_t TwoByteBtc = 0xBB;
 inline constexpr std::uint8_t TwoByteXaddRm8 = 0xC0;
 inline constexpr std::uint8_t TwoByteMovnti = 0xC3;
@@ -208,16 +218,21 @@ inline constexpr std::uint8_t ModRmRmRipRelative = 0x05;
 inline constexpr std::uint8_t Grp3RegTestMax = 0x01;
 inline constexpr std::uint8_t SibBaseMask = 0x07;
 inline constexpr std::uint8_t SibBaseDisp32 = 0x05;
+inline constexpr std::uint8_t SibIndexMask = 0x38;
+inline constexpr std::uint8_t SibIndexNone = 0x20;
 
 inline constexpr std::size_t Disp8Size = 1;
 inline constexpr std::size_t Disp32Size = 4;
 
-inline constexpr std::size_t Rel32InstructionLength = 5;
 
 inline constexpr std::size_t Vex2PrefixLength = 2;
 inline constexpr std::size_t Vex3PrefixLength = 3;
 inline constexpr std::uint8_t Vex3MapMask = 0x1F;
 inline constexpr std::uint8_t Vex3Map0F3A = 0x03;
+inline constexpr std::uint8_t XopPrefix = 0x8F;
+inline constexpr std::uint8_t XopMapMin = 0x08;
+inline constexpr std::uint8_t XopMap8 = 0x08;
+inline constexpr std::uint8_t XopMapA = 0x0A;
 
 }
 

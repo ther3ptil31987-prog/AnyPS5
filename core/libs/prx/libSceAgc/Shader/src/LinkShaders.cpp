@@ -1,11 +1,13 @@
+#include "prx/libSceAgc/Shader/include/PrimState.hpp"
+#include "prx/libSceAgc/Shader/include/LinkShaders.hpp"
+#include "prx/libSceAgc/Shader/include/InterpolantMapping.hpp"
 #include "SceShaders.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include <array>
 #include <algorithm>
-
-extern "C" int APS5_VABI sceAgcCreatePrimState(ShaderRegister*, ShaderRegister*, const Shader*, const Shader*, std::uint32_t);
-extern "C" int APS5_VABI sceAgcCreateInterpolantMapping(ShaderRegister*, const Shader*, const Shader*);
 
 extern "C" int APS5_VABI sceAgcLinkShaders(ShaderRegister* context, ShaderRegister* primitive,
     const void* reserved, const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) {
@@ -20,10 +22,17 @@ extern "C" int APS5_VABI sceAgcLinkShaders(ShaderRegister* context, ShaderRegist
 
     // The simple vertex/pixel pipeline combines two primitive context registers
     // and 32 interpolant registers. Publish only after both helpers succeed.
+    AgcDriver::ShaderPreparationScope transaction({vertex, pixel});
     std::array<ShaderRegister, 34> contextValues{};
     std::array<ShaderRegister, 3> primitiveValues{};
     sceAgcCreatePrimState(contextValues.data(), primitiveValues.data(), nullptr, vertex, primitiveType);
-    sceAgcCreateInterpolantMapping(contextValues.data() + 2, vertex, pixel);
+    sceAgcCreateInterpolantMapping_0100(contextValues.data() + 2, vertex, pixel);
+    if (pixel != nullptr) {
+        const std::array<const Shader*, 2> stages{vertex, pixel};
+        AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, contextValues, primitiveValues);
+    }
+    AgcDriverResolveGraphicsAbi_nid_postfix(vertex, pixel, primitiveType);
+    transaction.Commit();
     std::copy(contextValues.begin(), contextValues.end(), context);
     std::copy(primitiveValues.begin(), primitiveValues.end(), primitive);
     return 0;

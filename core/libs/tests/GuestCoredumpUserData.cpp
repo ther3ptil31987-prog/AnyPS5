@@ -1,0 +1,199 @@
+#include "prx/libkernel/include/Api.hpp"
+#include "ProcessParametersFixture.hpp"
+#include "prx/libc/include/general/VabiMacros.hpp"
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+namespace {
+alignas(16) std::array<std::byte, 0x40> process{};
+constexpr int64_t InvalidArgument = static_cast<int32_t>(0x81180000u);
+constexpr int64_t NotInCoredumpHandler = static_cast<int32_t>(0x81180003u);
+bool handlerRan = false;
+int handlerContext = 0;
+
+int APS5_VABI Handler(void*) {
+    handlerRan = true;
+    return 0;
+}
+
+void Require(bool value) { if (!value) std::abort(); }
+
+template <typename TCall>
+bool Throws(TCall call, const char* function) {
+    try { call(); }
+    catch (const std::runtime_error& error) { return std::strstr(error.what(), function) != nullptr; }
+    return false;
+}
+
+void RequireWritesRefused(const std::array<unsigned char, 64>& region) {
+    Require(sceCoredumpWriteUserData(region.data(), region.size()) == NotInCoredumpHandler);
+    Require(sceCoredumpWriteUserData(region.data(), 1) == NotInCoredumpHandler);
+    int64_t fromThread = 0;
+    std::thread([&] { fromThread = sceCoredumpWriteUserData(region.data(), region.size()); }).join();
+    Require(fromThread == NotInCoredumpHandler);
+}
+
+void RequireWriteLoadRefused() {
+    static std::array<unsigned char, 0x100000> large{};
+    Require(sceCoredumpSetUserDataType(1) == 0);
+    for (int call = 0; call < 1000; ++call) Require(sceCoredumpWriteUserData(large.data(), 1) == NotInCoredumpHandler);
+    Require(sceCoredumpWriteUserData(large.data(), 0x10000) == NotInCoredumpHandler);
+    Require(sceCoredumpWriteUserData(large.data(), large.size()) == NotInCoredumpHandler);
+    Require(sceCoredumpWriteUserData(large.data(), 1) == NotInCoredumpHandler);
+    std::atomic<int> wrong{0};
+    std::vector<std::thread> threads;
+    for (int index = 0; index < 20; ++index) {
+        threads.emplace_back([&] {
+            for (int call = 0; call < 50; ++call) {
+                if (sceCoredumpWriteUserData(large.data(), 1) != NotInCoredumpHandler) wrong.fetch_add(1);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    Require(wrong.load() == 0);
+}
+
+void RequireAttachesRefused(const std::array<unsigned char, 64>& region) {
+    Require(sceCoredumpAttachUserFile(1, "/app0/eboot.bin") == NotInCoredumpHandler);
+    Require(sceCoredumpAttachUserFile(0xFFFFFFFFu, "") == NotInCoredumpHandler);
+    Require(sceCoredumpAttachMemoryRegionAsUserFile(999, region.data(), region.size(), "region.txt") == NotInCoredumpHandler);
+    Require(sceCoredumpAttachMemoryRegionAsUserFile(0, region.data(), 1, "") == NotInCoredumpHandler);
+    int fromThread = 0;
+    std::thread([&] { fromThread = sceCoredumpAttachMemoryRegionAsUserFile(2, region.data(), region.size(), "thread.txt"); }).join();
+    Require(fromThread == NotInCoredumpHandler);
+}
+
+void RequireSecondRegistrationRefused() {
+    constexpr std::size_t stackSize = 0x10000;
+    Require(sceCoredumpRegisterCoredumpHandler(reinterpret_cast<std::uint64_t>(&Handler), stackSize, 0) == 0);
+    Require(sceCoredumpRegisterCoredumpHandler(reinterpret_cast<std::uint64_t>(&Handler), stackSize, 0) == static_cast<int>(0x81180002u));
+    Require(sceCoredumpUnregisterCoredumpHandler() == 0);
+    Require(sceCoredumpUnregisterCoredumpHandler() == static_cast<int>(0x81180001u));
+}
+
+void RequireEarlyTerminatorSkipsUnreadableMiddle() {
+    std::size_t page = 0;
+    char* memory = nullptr;
+#ifdef _WIN32
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    page = info.dwPageSize;
+    memory = static_cast<char*>(VirtualAlloc(nullptr, page * 3, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    Require(memory != nullptr);
+    DWORD previous = 0;
+    Require(VirtualProtect(memory + page, page, PAGE_NOACCESS, &previous) != 0);
+#else
+    const auto pageSize = sysconf(_SC_PAGESIZE);
+    Require(pageSize > 0);
+    page = static_cast<std::size_t>(pageSize);
+    auto* mapping = mmap(nullptr, page * 3, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(mapping != MAP_FAILED);
+    memory = static_cast<char*>(mapping);
+    Require(mprotect(memory + page, page, PROT_NONE) == 0);
+#endif
+    memory[page - 2] = 'a';
+    memory[page - 1] = '\0';
+    memory[3 * page - 1] = 'x';
+    sceCoredumpDebugTextOut(memory + page - 2, static_cast<int>(2 * page + 2));
+#ifdef _WIN32
+    Require(VirtualFree(memory, 0, MEM_RELEASE) != 0);
+#else
+    Require(munmap(memory, page * 3) == 0);
+#endif
+}
+}
+
+int main() {
+    const std::uint64_t processSize = process.size();
+    const std::uint32_t processMagic = 0x4942524f;
+    const std::uint32_t sdkVersion = 0x06500000;
+    std::memcpy(process.data(), &processSize, sizeof(processSize));
+    std::memcpy(process.data() + 8, &processMagic, sizeof(processMagic));
+    std::memcpy(process.data() + 16, &sdkVersion, sizeof(sdkVersion));
+    Require(ProcessParametersFixture::Install(process.data(), process.size()));
+    std::array<unsigned char, 64> region{};
+    for (size_t index = 0; index < region.size(); ++index) region[index] = static_cast<unsigned char>(index * 5 + 1);
+    const auto original = region;
+    const char text[] = "coredump text\n";
+    Require(sceCoredumpUnregisterCoredumpHandler() == static_cast<int>(0x81180001u));
+    Require(sceCoredumpRegisterCoredumpHandler(0, 0x4000, 0) == InvalidArgument);
+    for (const std::size_t stackSize : {std::size_t{0}, std::size_t{0x3fff}, std::size_t{0x20000000}, SIZE_MAX}) {
+        Require(sceCoredumpRegisterCoredumpHandler(reinterpret_cast<std::uint64_t>(&Handler), stackSize, 0) == InvalidArgument);
+    }
+    Require(sceCoredumpAttachUserFile(0x40000000u, "") == NotInCoredumpHandler);
+
+    Require(NotInCoredumpHandler < 0);
+    Require(sceCoredumpSetUserDataType(0) == 0);
+    RequireWriteLoadRefused();
+    RequireWritesRefused(region);
+    RequireAttachesRefused(region);
+    sceCoredumpDebugTextOut(text, static_cast<int>(sizeof(text) - 1));
+    sceCoredumpDebugTextOut(text, 8);
+    sceCoredumpDebugTextOut(text, 0);
+    sceCoredumpDebugTextOut(nullptr, 0);
+
+    Require(sceCoredumpRegisterCoredumpHandler(reinterpret_cast<uint64_t>(&Handler), 16 * 1024, reinterpret_cast<uint64_t>(&handlerContext)) == 0);
+    Require(sceCoredumpRegisterCoredumpHandler(0, 0, 0) == static_cast<int>(0x81180002u));
+    Require(sceCoredumpAttachUserFile(0x40000000u, "") == InvalidArgument);
+    Require(sceCoredumpAttachMemoryRegionAsUserFile(0x40000000u, nullptr, -1, "") == InvalidArgument);
+    RequireWritesRefused(region);
+    RequireAttachesRefused(region);
+    sceCoredumpDebugTextOut(text, static_cast<int>(sizeof(text) - 1));
+
+    Require(!handlerRan);
+
+    Require(sceCoredumpWriteUserData(nullptr, region.size()) == InvalidArgument);
+    Require(sceCoredumpWriteUserData(nullptr, 0) == InvalidArgument);
+    Require(sceCoredumpWriteUserData(region.data(), 0) == NotInCoredumpHandler);
+    Require(sceCoredumpWriteUserData(region.data(), INT32_MAX) == NotInCoredumpHandler);
+    Require(sceCoredumpWriteUserData(region.data(), std::size_t{INT32_MAX} + 1) == InvalidArgument);
+    Require(sceCoredumpWriteUserData(region.data(), SIZE_MAX) == InvalidArgument);
+    Require(Throws([&] { sceCoredumpDebugTextOut(nullptr, 4); }, "sceCoredumpDebugTextOut"));
+    Require(Throws([&] { sceCoredumpDebugTextOut(text, -1); }, "sceCoredumpDebugTextOut"));
+    const auto* unreadable = reinterpret_cast<const char*>(std::uintptr_t{0x10});
+    sceCoredumpDebugTextOut(unreadable, 0);
+    Require(sceCoredumpAttachUserFile(1, unreadable) == InvalidArgument);
+    Require(Throws([&] { sceCoredumpDebugTextOut(unreadable, 4); }, "sceCoredumpDebugTextOut"));
+    RequireEarlyTerminatorSkipsUnreadableMiddle();
+    Require(sceCoredumpAttachUserFile(1, nullptr) == InvalidArgument);
+    Require(sceCoredumpAttachMemoryRegionAsUserFile(1, nullptr, region.size(), "a.txt") == NotInCoredumpHandler);
+    Require(sceCoredumpAttachMemoryRegionAsUserFile(1, region.data(), 0, "a.txt") == NotInCoredumpHandler);
+    Require(sceCoredumpAttachMemoryRegionAsUserFile(1, region.data(), -1, "a.txt") == 0);
+    Require(sceCoredumpAttachMemoryRegionAsUserFile(1, region.data(), region.size(), nullptr) == InvalidArgument);
+
+    Require(sceCoredumpUnregisterCoredumpHandler() == 0);
+    RequireWritesRefused(region);
+    RequireAttachesRefused(region);
+    Require(region == original);
+    Require(sceCoredumpUnregisterCoredumpHandler() == static_cast<int>(0x81180001u));
+    Require(sceCoredumpAttachUserFile(0x40000000u, "") == InvalidArgument);
+    for (const std::uint32_t version : {0x064fffffu, 0x06500000u, 0x12000000u}) {
+        std::memcpy(process.data() + 16, &version, sizeof(version));
+        Require(sceCoredumpRegisterCoredumpHandler(reinterpret_cast<std::uint64_t>(&Handler), 0x4000, 0) == 0);
+        for (const std::uint32_t flags : {0u, 0xffffu, 0x10000u, 0x40000000u, 0x40000001u, 0x80000000u, 0xc0000000u, UINT32_MAX}) {
+            const bool invalid = version >= 0x06500000 && (flags & 0xc0000000u) == 0x40000000u;
+            Require(sceCoredumpAttachUserFile(flags, "") == (invalid ? InvalidArgument : NotInCoredumpHandler));
+            Require(sceCoredumpAttachMemoryRegionAsUserFile(flags, nullptr, 0, "") == (invalid ? InvalidArgument : NotInCoredumpHandler));
+            Require(sceCoredumpAttachMemoryRegionAsUserFile(flags, nullptr, -1, "") == (invalid ? InvalidArgument : 0));
+            Require(sceCoredumpAttachMemoryRegionAsUserFile(flags, nullptr, -1, nullptr) == InvalidArgument);
+        }
+        Require(sceCoredumpUnregisterCoredumpHandler() == 0);
+    }
+    RequireSecondRegistrationRefused();
+    Require(!handlerRan);
+    return 0;
+}

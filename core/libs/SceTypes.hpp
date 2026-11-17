@@ -16,6 +16,23 @@ struct alignas(16) __m128 { float v[4]; };
 
 using Bool = std::uint8_t;
 
+struct SonyLconv {
+    char* monetary[7];
+    char chars[14];
+    char pad[2];
+    char* decimal_point;
+    char* grouping;
+    char* thousands_sep;
+    char* frac_grouping;
+    char* frac_sep;
+    char* false_text;
+    char* true_text;
+    char* no_text;
+    char* yes_text;
+};
+static_assert(offsetof(SonyLconv, decimal_point) == 0x48);
+static_assert(sizeof(SonyLconv) == 0x90);
+
 using KernelModule = std::int32_t;
 using KernelCpumask = std::uint64_t;
 using KernelUseconds = unsigned int;
@@ -78,6 +95,14 @@ struct KernelAioRwRequest {
     std::int32_t fd;
 };
 
+struct KernelAioSchedulingParam {
+    std::int32_t schedulingWindowSize;
+    std::int32_t delayedCountLimit;
+    std::uint32_t enableSplit;
+    std::uint32_t splitSize;
+    std::uint32_t splitChunkSize;
+};
+
 struct KernelBatchMapEntry {
     void* start;
     std::uint64_t offset;
@@ -135,18 +160,23 @@ struct VirtualQueryInfo {
     std::uint64_t offset;
     std::int32_t protection;
     std::int32_t memory_type;
-    std::uint32_t is_flexible : 1;
-    std::uint32_t is_direct : 1;
-    std::uint32_t is_stack : 1;
-    std::uint32_t is_pooled : 1;
-    std::uint32_t is_committed : 1;
-    std::uint32_t is_gpu_prt : 1;
-    std::uint32_t amm_usage : 1;
-    std::uint32_t reserved : 1;
+    std::uint8_t is_flexible : 1;
+    std::uint8_t is_direct : 1;
+    std::uint8_t is_stack : 1;
+    std::uint8_t is_pooled : 1;
+    std::uint8_t is_committed : 1;
+    std::uint8_t is_gpu_prt : 1;
+    std::uint8_t amm_usage : 1;
+    std::uint8_t reserved : 1;
     char name[32];
     std::uint8_t gpu_mask_id;
     std::uint8_t reserved2;
 };
+static_assert(sizeof(VirtualQueryInfo) == 72);
+static_assert(alignof(VirtualQueryInfo) == 8);
+static_assert(offsetof(VirtualQueryInfo, name) == 33);
+static_assert(offsetof(VirtualQueryInfo, gpu_mask_id) == 65);
+static_assert(offsetof(VirtualQueryInfo, reserved2) == 66);
 
 struct KernelSemaPrivate;
 struct KernelEventFlagPrivate;
@@ -205,6 +235,19 @@ struct ModuleSegmentInfo {
     std::int32_t prot;
 };
 
+struct ModuleInfo {
+    std::uint64_t st_size;
+    char name[256];
+    ModuleSegmentInfo segments[4];
+    std::uint32_t segment_count;
+    std::uint8_t fingerprint[20];
+};
+static_assert(offsetof(ModuleInfo, name) == 0x8);
+static_assert(offsetof(ModuleInfo, segments) == 0x108);
+static_assert(offsetof(ModuleInfo, segment_count) == 0x148);
+static_assert(offsetof(ModuleInfo, fingerprint) == 0x14C);
+static_assert(sizeof(ModuleInfo) == 0x160);
+
 struct ModuleInfoEx {
     std::uint64_t st_size;
     char name[256];
@@ -241,6 +284,12 @@ struct ModuleInfoForUnwind {
     std::uint64_t seg0_addr;
     std::uint64_t seg0_size;
 };
+
+struct InternalSegmentInfo {
+    std::uint64_t address;
+    std::uint64_t size;
+};
+static_assert(sizeof(InternalSegmentInfo) == 0x10);
 
 struct MallocReplace {
     std::uint64_t size = sizeof(MallocReplace);
@@ -284,7 +333,7 @@ struct VaList {
 };
 #pragma pack(pop)
 
-using FiberEntry = void* (*)(std::uint64_t, void*);
+using FiberEntry = void (APS5_VABI*)(std::uint64_t argOnInitialize, std::uint64_t argOnRun);
 
 struct FiberOptParam {
     std::uint32_t magic;
@@ -382,6 +431,48 @@ using AcmBatchId = std::uint32_t;
 struct AcmBatchError {
     std::uint32_t reserved[8];
 };
+
+struct AcmReverbBuffer {
+    void* samples;
+    const void* blockMetadata;
+};
+
+struct AcmReverbInput {
+    std::uint32_t blockSize;
+    std::uint32_t blockCount;
+    std::uint32_t channelCount;
+    std::uint32_t sampleFormat;
+    std::uint32_t currentBlock;
+    std::uint32_t availableBlocks;
+    const AcmReverbBuffer* const* history;
+    const void* const* inputChannels;
+    std::uint32_t pendingBlocks;
+};
+
+struct AcmReverbFilter {
+    std::uint32_t blockSize;
+    std::uint32_t blockCount;
+    std::uint32_t channelCount;
+    std::uint32_t sampleFormat;
+    const void* blockMetadata;
+    const AcmReverbBuffer* const* channels;
+};
+
+struct AcmReverbOutput {
+    std::uint32_t blockSize;
+    std::uint32_t channelCount;
+    void* const* samples;
+    void* const* workspace;
+    float gain;
+    float previousGain;
+    void* const* previousSamples;
+};
+
+static_assert(sizeof(AcmReverbBuffer) == 16);
+static_assert(offsetof(AcmReverbInput, history) == 24);
+static_assert(offsetof(AcmReverbInput, pendingBlocks) == 40);
+static_assert(sizeof(AcmReverbFilter) == 32);
+static_assert(offsetof(AcmReverbOutput, previousSamples) == 32);
 
 struct AcmBatchInfo {
     void* buffer;
@@ -508,6 +599,47 @@ struct AudioOut2MasteringStatesHeader {
     std::uint32_t states_id;
 };
 
+struct AudioOut2MasteringStatesDescriptor {
+    std::uint32_t id;
+    std::uint32_t size;
+};
+
+struct AudioOut2MasteringCompressorStates {
+    AudioOut2MasteringStatesDescriptor descriptor;
+    std::uint32_t reserved[2];
+    float input_rms[3][8];
+    float compression_coeff[3][8];
+};
+
+struct AudioOut2MasteringCompressorStatesV2 {
+    AudioOut2MasteringStatesDescriptor descriptor;
+    std::uint32_t reserved[2];
+    float input_rms[4][8];
+    float compression_coeff[4][8];
+};
+
+struct AudioOut2MasteringLimiterStates {
+    AudioOut2MasteringStatesDescriptor descriptor;
+    std::uint32_t reserved[2];
+    float input_peak[8];
+    float output_peak[8];
+    float gain_peak[8];
+};
+
+struct AudioOut2MasteringStates {
+    AudioOut2MasteringStatesHeader states_header;
+    std::uint32_t reserved[3];
+    AudioOut2MasteringCompressorStates compressor_states;
+    AudioOut2MasteringLimiterStates limiter_states;
+};
+
+struct AudioOut2MasteringStatesV2 {
+    AudioOut2MasteringStatesHeader states_header;
+    std::uint32_t reserved[3];
+    AudioOut2MasteringCompressorStatesV2 compressor_states;
+    AudioOut2MasteringLimiterStates limiter_states;
+};
+
 struct AudioOutOutputParam {
     int handle;
     const void* ptr;
@@ -523,6 +655,13 @@ struct AudioOutPortState {
     std::uint64_t activeState;
 };
 
+struct AudioOutSystemState {
+    float loudness;
+    std::uint8_t reserved8[4];
+    std::uint64_t reserved[3];
+};
+static_assert(sizeof(AudioOutSystemState) == 32);
+
 struct Audio3dOpenParameters {
     std::uint64_t size_this;
     std::uint32_t granularity;
@@ -532,6 +671,13 @@ struct Audio3dOpenParameters {
     std::uint32_t buffer_mode;
     std::uint32_t pad;
     std::uint32_t num_beds;
+};
+
+struct Audio3dAttribute {
+    std::uint32_t attribute_id;
+    std::uint32_t pad;
+    const void* value;
+    std::uint64_t value_size;
 };
 
 using AudioPropagationHandle = std::uint64_t;
@@ -624,10 +770,13 @@ struct AvPlayerVideoEx {
     std::uint8_t luma_bit_depth;
     std::uint8_t chroma_bit_depth;
     bool video_full_range_flag;
-    std::uint8_t reserved1[37];
+    std::uint8_t reserved1[5];
+    double frame_rate;
+    std::uint8_t reserved2[24];
 };
 static_assert(sizeof(AvPlayerVideoEx) == 80);
 static_assert(offsetof(AvPlayerVideoEx, crop_left_offset) == 20 && offsetof(AvPlayerVideoEx, pitch) == 36);
+static_assert(offsetof(AvPlayerVideoEx, frame_rate) == 48);
 
 struct AvPlayerTimedTextEx {
     std::uint8_t language_code[4];
@@ -833,12 +982,59 @@ struct AudiodecM4aacInfo {
     std::int32_t i_result;
 };
 
+struct VoiceEvent {
+    std::int32_t type;
+    std::uint32_t reserved;
+    void* userData;
+    union {
+        struct {
+            std::uint16_t count;
+            std::uint16_t ports[7];
+        } dataReady;
+        struct {
+            std::uint16_t port;
+            std::uint8_t state;
+            std::uint8_t reserved[13];
+        } deviceState;
+    };
+};
+
+using VoiceEventHandler = void (APS5_VABI*)(const VoiceEvent* event);
+
+struct VoiceThreadsParams {
+    std::uint32_t mode;
+    std::int32_t firstPriority;
+    std::uint64_t firstAffinity;
+    std::int32_t secondPriority;
+    std::uint32_t reserved20;
+    std::uint64_t secondAffinity;
+    std::int32_t thirdPriority;
+    std::uint32_t reserved36;
+    std::uint64_t thirdAffinity;
+};
+
+static_assert(sizeof(VoiceEvent) == 32);
+static_assert(offsetof(VoiceEvent, userData) == 8);
+static_assert(offsetof(VoiceEvent, dataReady) == 16);
+static_assert(offsetof(VoiceEvent, deviceState) == 16);
+static_assert(sizeof(VoiceThreadsParams) == 48);
+static_assert(offsetof(VoiceThreadsParams, firstAffinity) == 8);
+static_assert(offsetof(VoiceThreadsParams, secondPriority) == 16);
+static_assert(offsetof(VoiceThreadsParams, secondAffinity) == 24);
+static_assert(offsetof(VoiceThreadsParams, thirdPriority) == 32);
+static_assert(offsetof(VoiceThreadsParams, thirdAffinity) == 40);
+
 struct VoiceInitParam {
     std::int32_t app_type;
-    std::uint64_t on_event;
+    VoiceEventHandler on_event;
     void* user_data;
-    std::uint8_t reserved[32 - sizeof(std::int32_t) - sizeof(std::uint64_t) - sizeof(void*)];
+    std::uint8_t reserved[16];
 };
+
+static_assert(sizeof(VoiceInitParam) == 40);
+static_assert(offsetof(VoiceInitParam, on_event) == 8);
+static_assert(offsetof(VoiceInitParam, user_data) == 16);
+static_assert(offsetof(VoiceInitParam, reserved) == 24);
 
 struct VoicePortParam {
     std::int32_t port_type;
@@ -861,6 +1057,30 @@ struct VoicePortInfo {
     std::uint16_t edge_count;
     std::uint16_t reserved;
 };
+
+struct NpAuthClientId;
+
+struct NpAuthAuthorizedAppCodeParameter {
+    std::uint64_t size;
+    std::int32_t userId;
+    const NpAuthClientId* clientId;
+    const char* scope;
+    std::uint32_t option;
+};
+
+static_assert(sizeof(NpAuthAuthorizedAppCodeParameter) == 40);
+static_assert(offsetof(NpAuthAuthorizedAppCodeParameter, clientId) == 16);
+static_assert(offsetof(NpAuthAuthorizedAppCodeParameter, scope) == 24);
+static_assert(offsetof(NpAuthAuthorizedAppCodeParameter, option) == 32);
+
+struct VoiceResourceInfo {
+    std::uint16_t maxVoiceInputPorts;
+    std::uint16_t maxVoiceOutputPorts;
+    std::uint16_t maxDeviceInputPorts;
+    std::uint16_t maxDeviceOutputPorts;
+};
+
+static_assert(sizeof(VoiceResourceInfo) == 8);
 
 struct VoiceStartParam {
     void* container;
@@ -1047,8 +1267,8 @@ struct ImeKeycode {
     std::uint64_t timestamp;
 };
 
-using ImeTextFilter = std::int32_t (*)(char16_t* out_text, std::uint32_t* out_text_length, const char16_t* source_text, std::uint32_t source_text_length);
-using ImeExtKeyboardFilter = int (*)(const ImeKeycode* source_keycode, std::uint16_t* out_keycode, std::uint32_t* out_status, void* reserved);
+using ImeTextFilter = std::int32_t (APS5_VABI*)(char16_t* outText, std::uint32_t* outTextLength, const char16_t* sourceText, std::uint32_t sourceTextLength);
+using ImeExtKeyboardFilter = int (APS5_VABI*)(const ImeKeycode* sourceKeycode, std::uint16_t* outKeycode, std::uint32_t* outStatus, void* reserved);
 
 struct ImeExtendedParam {
     std::uint32_t option;
@@ -1130,7 +1350,7 @@ struct ImeEvent {
     ImeEventParam param;
 };
 
-using EventHandler = void (*)(void* arg, const ImeEvent* event);
+using EventHandler = void (APS5_VABI *)(void* arg, const ImeEvent* event);
 
 struct Param {
     std::int32_t user_id;
@@ -1210,20 +1430,38 @@ struct NetEpollEvent {
     NetEpollData data;
 };
 
-struct NetCtlNatInfo { std::uint8_t opaque[128]; };
+struct NetCtlNatInfo {
+    std::uint32_t size;
+    std::int32_t stun_status;
+    std::int32_t nat_type;
+    std::uint32_t mapped_addr;
+};
+
+static_assert(sizeof(NetCtlNatInfo) == 16);
 
 union NetCtlInfo { std::uint8_t opaque[256]; };
 
-using NetCtlCallback = void (*)(int, void*);
+struct NetCtlIfStat {
+    std::uint32_t device;
+    std::uint64_t tx_bytes;
+    std::uint64_t rx_bytes;
+    std::uint32_t reserved[8];
+};
 
-struct HttpEpoll {};
+using NetCtlCallback = void (APS5_VABI *)(int, void*);
+
+struct HttpEpoll;
 using HttpEpollHandle = HttpEpoll*;
-using HttpsCallback = int (*)(int, unsigned int, void* const*, int, void*);
+using HttpsCallback = int (APS5_VABI*)(int, unsigned int, void* const*, int, void*);
+using HttpRedirectCallback = int (APS5_VABI*)(int, std::int32_t, std::int32_t*, const char*, void*);
+using HttpCookieRecvCallback = int (APS5_VABI*)(int, const char*, const char*, std::uint64_t, void*);
+using HttpAuthInfoCallback = int (APS5_VABI*)(int, int, const char*, char*, char*, int, std::uint8_t**, std::uint64_t*, int*, void*);
 
 struct HttpNBEvent { std::uint8_t opaque[64]; };
 
 struct SceHttpUriElement {
     int opaque = 0;
+    std::uint32_t pad0 = 0;
     char* scheme = nullptr;
     char* username = nullptr;
     char* password = nullptr;
@@ -1233,6 +1471,7 @@ struct SceHttpUriElement {
     char* fragment = nullptr;
     std::uint16_t port = 0;
     std::uint8_t reserved[10]{};
+    std::uint32_t pad1 = 0;
 };
 
 struct Http2AsyncResult {
@@ -1243,11 +1482,48 @@ struct Http2AsyncResult {
     void* reserved;
 };
 
+struct Http2AsyncOption {
+    KernelEqueue equeue;
+    int user_event_id;
+    std::uint8_t padding[4];
+    void* user_data;
+    void* reserved;
+};
+
 struct NpTitleId { char data[13]; char pad[3]; };
 struct NpTitleSecret { std::uint8_t data[128]; };
 struct NpContentRestriction { std::uint8_t opaque[128]; };
 struct NpOnlineId { char data[17]; char pad[3]; };
-struct NpId { NpOnlineId online_id; std::uint8_t opaque[4]; };
+
+struct SharePlayConnectionInfoA {
+    std::int32_t status;
+    std::int32_t mode;
+    NpOnlineId hostOnlineId;
+    NpOnlineId visitorOnlineId;
+    std::uint64_t hostAccountId;
+    std::uint64_t visitorAccountId;
+    std::int32_t hostUserId;
+    std::int32_t visitorUserId;
+};
+static_assert(sizeof(SharePlayConnectionInfoA) == 72 && offsetof(SharePlayConnectionInfoA, hostAccountId) == 48 && offsetof(SharePlayConnectionInfoA, hostUserId) == 64);
+struct SharePlayConnectionInfo {
+    std::int32_t status;
+    std::int32_t mode;
+    NpOnlineId hostOnlineId;
+    NpOnlineId visitorOnlineId;
+    std::int32_t hostUserId;
+    std::int32_t visitorUserId;
+};
+static_assert(sizeof(SharePlayConnectionInfo) == 56 && offsetof(SharePlayConnectionInfo, hostUserId) == 48);
+struct NpId {
+    union {
+        NpOnlineId handle;
+        NpOnlineId online_id;
+    };
+    std::uint8_t opt[8];
+    std::uint8_t reserved[8];
+};
+static_assert(sizeof(NpId) == 36);
 struct NpCreateAsyncRequestParameter { std::uint8_t opaque[64]; };
 struct NpCheckPremiumParameter { std::uint8_t opaque[64]; };
 struct NpCheckPremiumResult { std::uint8_t opaque[64]; };
@@ -1257,6 +1533,24 @@ struct NpUnifiedEntitlementLabel {
     char padding[3];
 };
 
+struct NpServiceEntitlementLabel {
+    char data[7];
+    std::uint8_t reserved[13];
+};
+
+struct NpEntitlementAccessTransactionId {
+    char data[65];
+    std::uint8_t reserved[7];
+};
+
+struct NpEntitlementAccessListParameter;
+struct NpEntitlementAccessUnifiedInfo;
+struct NpEntitlementAccessServiceInfo;
+
+static_assert(sizeof(NpUnifiedEntitlementLabel) == 20);
+static_assert(sizeof(NpServiceEntitlementLabel) == 20);
+static_assert(sizeof(NpEntitlementAccessTransactionId) == 72);
+
 struct NpEntitlementAccessInitParam { char reserved[32]; };
 struct NpEntitlementAccessBootParam { char reserved[32]; };
 
@@ -1264,6 +1558,10 @@ struct NpEntitlementAccessAddcontEntitlementInfo {
     NpUnifiedEntitlementLabel entitlement_label;
     std::uint32_t package_type;
     std::uint32_t download_status;
+};
+
+struct NpEntitlementAccessEntitlementKey {
+    std::uint8_t data[16];
 };
 
 
@@ -1278,10 +1576,6 @@ struct NpUniversalDataSystemMemoryStat {
     std::size_t max_inuse_size;
     std::size_t current_inuse_size;
 };
-
-struct NpUniversalDataSystemEvent {};
-struct NpUniversalDataSystemEventPropertyObject {};
-struct NpUniversalDataSystemEventPropertyArray {};
 
 struct NpUniversalDataSystemStorageStat {
     std::size_t in_events;
@@ -1301,6 +1595,11 @@ struct NpGameIntentData {
     std::uint8_t padding[7];
 };
 
+struct NpGameIntentInitParam {
+    std::size_t size;
+    std::uint8_t reserved[32];
+};
+
 struct NpGameIntentInfo {
     std::size_t size;
     std::int32_t user_id;
@@ -1316,6 +1615,26 @@ struct NpWebApi2ResponseInformationOption {
     std::size_t error_object_size;
     std::size_t response_data_size;
 };
+
+struct NpWebApi2IntInitializeArgs {
+    std::int32_t lib_http_ctx_id;
+    std::int32_t reserved;
+    std::uint64_t pool_size;
+    const char* name;
+    std::uint64_t struct_size;
+};
+static_assert(sizeof(NpWebApi2IntInitializeArgs) == 32);
+
+struct NpWebApi2IntInitialize2Args {
+    std::int32_t lib_http_ctx_id;
+    std::int32_t reserved;
+    std::uint64_t pool_size;
+    const char* name;
+    std::uint32_t push_config_group;
+    std::int32_t reserved2;
+    std::uint64_t struct_size;
+};
+static_assert(sizeof(NpWebApi2IntInitialize2Args) == 40);
 
 struct GameUpdateCheckParam {
     std::size_t size;
@@ -1375,9 +1694,20 @@ struct SaveDataMountInfo {
 };
 
 struct SceSaveDataTitleId { char data[10]; char pad[2]; };
-struct SceSaveDataDirName { char data[33]; char pad[3]; };
-struct SaveDataSearchInfo { std::uint8_t opaque[128]; };
-struct SaveDataMemoryData { void* buf; std::size_t buf_size; std::size_t offset; };
+struct SceSaveDataDirName { char data[32]; };
+struct SaveDataSearchInfo {
+    std::uint64_t blocks;
+    std::uint64_t free_blocks;
+    std::uint8_t reserved[32];
+};
+static_assert(sizeof(SaveDataSearchInfo) == 48);
+struct SaveDataMemoryData {
+    void* buf;
+    std::size_t buf_size;
+    std::size_t offset;
+    std::uint8_t reserved[40];
+};
+static_assert(sizeof(SaveDataMemoryData) == 64);
 
 struct SaveDataMount3 {
     int user_id;
@@ -1389,6 +1719,16 @@ struct SaveDataMount3 {
     int pad2;
     std::int32_t resource;
     std::uint8_t reserved[32];
+};
+
+struct SaveDataMount2 {
+    int user_id;
+    int pad;
+    const SceSaveDataDirName* dir_name;
+    std::uint64_t blocks;
+    std::uint32_t mount_mode;
+    std::uint8_t reserved[32];
+    int pad2;
 };
 
 struct SaveDataDirNameSearchCond {
@@ -1490,6 +1830,8 @@ struct SaveDataEvent {
     std::uint8_t reserved[40];
 };
 
+using SaveDataEventCallback = void (APS5_VABI *)(const SaveDataEvent* event, void* userdata);
+
 struct SaveDataBackup {
     std::int32_t user_id;
     std::int32_t pad;
@@ -1497,6 +1839,47 @@ struct SaveDataBackup {
     const SceSaveDataDirName* dir_name;
     const void* fingerprint;
     std::uint8_t reserved[32];
+};
+
+struct SaveDataCheckBackupData {
+    std::int32_t user_id;
+    std::int32_t pad;
+    const SceSaveDataTitleId* title_id;
+    const SceSaveDataDirName* dir_name;
+    SaveDataParam* param;
+    SaveDataIcon* icon;
+    std::uint8_t reserved[32];
+};
+
+struct SaveDataRestoreBackupData {
+    std::int32_t user_id;
+    std::int32_t pad;
+    const SceSaveDataTitleId* title_id;
+    const SceSaveDataDirName* dir_name;
+    const void* fingerprint;
+    std::uint32_t unused;
+    std::uint8_t reserved[32];
+    std::int32_t pad2;
+};
+static_assert(offsetof(SaveDataCheckBackupData, title_id) == 0x08);
+static_assert(offsetof(SaveDataCheckBackupData, dir_name) == 0x10);
+static_assert(offsetof(SaveDataCheckBackupData, param) == 0x18);
+static_assert(offsetof(SaveDataCheckBackupData, icon) == 0x20);
+static_assert(offsetof(SaveDataCheckBackupData, reserved) == 0x28);
+static_assert(sizeof(SaveDataCheckBackupData) == 0x48);
+static_assert(offsetof(SaveDataRestoreBackupData, title_id) == 0x08);
+static_assert(offsetof(SaveDataRestoreBackupData, dir_name) == 0x10);
+static_assert(offsetof(SaveDataRestoreBackupData, fingerprint) == 0x18);
+static_assert(offsetof(SaveDataRestoreBackupData, unused) == 0x20);
+static_assert(offsetof(SaveDataRestoreBackupData, reserved) == 0x24);
+static_assert(offsetof(SaveDataRestoreBackupData, pad2) == 0x44);
+static_assert(sizeof(SaveDataRestoreBackupData) == 0x48);
+
+struct SaveDataConvert {
+    std::int32_t user_id;
+    std::int32_t pad;
+    const SceSaveDataDirName* dir_name;
+    std::uint8_t unknown[48];
 };
 
 struct AppContentInitParam { char reserved[32]; };
@@ -1509,6 +1892,34 @@ struct AppContentBootParam {
 
 struct AppContentMountPoint { char data[16]; };
 
+using ContentExportMallocCallback = void* (APS5_VABI *)(std::size_t size, void* userData);
+using ContentExportFreeCallback = void (APS5_VABI *)(void* memory, void* userData);
+using ContentExportDataCallback = std::int32_t (APS5_VABI *)(const void** data, std::size_t* size, void* userData);
+
+struct ContentExportInitParam {
+    ContentExportMallocCallback mallocFunc;
+    ContentExportFreeCallback freeFunc;
+    void* userData;
+};
+
+static_assert(sizeof(ContentExportInitParam) == 24);
+static_assert(offsetof(ContentExportInitParam, freeFunc) == 8);
+static_assert(offsetof(ContentExportInitParam, userData) == 16);
+
+struct ContentExportSfParam {
+    std::size_t size;
+    const char* metadata;
+    const std::int64_t* contentIds;
+    std::uint32_t contentCount;
+    std::uint32_t option;
+};
+
+static_assert(sizeof(ContentExportSfParam) == 32);
+static_assert(offsetof(ContentExportSfParam, metadata) == 8);
+static_assert(offsetof(ContentExportSfParam, contentIds) == 16);
+static_assert(offsetof(ContentExportSfParam, contentCount) == 24);
+static_assert(offsetof(ContentExportSfParam, option) == 28);
+
 struct ContentExportInitParam2 {
     void* malloc_func;
     void* free_func;
@@ -1518,7 +1929,49 @@ struct ContentExportInitParam2 {
     std::int64_t reserved1;
 };
 
+struct ContentExportParam {
+    char title[257];
+    char comment[257];
+    char content_type[65];
+};
+static_assert(sizeof(ContentExportParam) == 579);
+
+struct ContentExportCallbackParam {
+    std::size_t content_length;
+    void* func;
+    void* user_data;
+};
+
 struct ContentSearchInitParam { std::size_t memory_size; };
+
+struct ContentSearchColumnValue {
+    std::uint32_t size;
+    std::int64_t value;
+};
+
+struct ContentSearchContentColumn {
+    std::int32_t column_type;
+    std::int32_t column_operator;
+    const ContentSearchColumnValue* value;
+    std::int32_t logical_connector;
+};
+
+struct ContentSearchContentColumnSet {
+    const ContentSearchContentColumn* columns;
+    std::int32_t columns_length;
+    std::int32_t logical_connector;
+};
+
+struct ContentSearchContentOrderByCondition {
+    std::int32_t column_type;
+    std::int32_t sort_type;
+};
+
+static_assert(sizeof(ContentSearchColumnValue) == 16);
+static_assert(sizeof(ContentSearchContentColumn) == 24);
+static_assert(offsetof(ContentSearchContentColumn, logical_connector) == 16);
+static_assert(sizeof(ContentSearchContentColumnSet) == 16);
+static_assert(sizeof(ContentSearchContentOrderByCondition) == 8);
 
 struct PngEncCreateParam {
     std::uint32_t this_size;
@@ -1584,6 +2037,32 @@ struct PngDecImageInfo {
     std::uint32_t image_flag;
 };
 
+struct PngDecInputChunk {
+    const void* data;
+    std::uint32_t size;
+    std::uint32_t reserved;
+};
+
+using PngDecInputCallback = std::int32_t (APS5_VABI *)(PngDecInputChunk*, void*);
+
+struct PngDecInputControlParam {
+    PngDecInputCallback input;
+    void* input_argument;
+    void* image_mem_addr;
+    std::uint32_t image_mem_size;
+    std::uint16_t operation;
+    std::uint16_t pixel_format;
+    std::uint16_t alpha_value;
+    std::uint16_t reserved;
+    std::uint32_t image_pitch;
+};
+
+struct SystemLoggerLogData {
+    std::uint8_t data[0x40];
+    std::uint32_t size;
+    std::uint8_t reserved[0x20];
+};
+
 struct JpegEncCreateParam {
     std::uint32_t size;
     std::uint32_t attr;
@@ -1611,23 +2090,29 @@ struct JpegEncOutputInfo {
 };
 
 struct JpegDecCreateParam {
-    std::uint32_t size;
+    std::uint32_t this_size;
     std::uint32_t attribute;
+    std::uint32_t max_image_width;
 };
 
 struct JpegDecParseParam {
     const void* jpeg_mem_addr;
     std::uint32_t jpeg_mem_size;
-    std::uint32_t reserved0;
+    std::uint16_t decode_mode;
+    std::uint16_t down_scale;
 };
 
 struct JpegDecDecodeParam {
     const void* jpeg_mem_addr;
     void* image_mem_addr;
+    void* coefficient_mem_addr;
     std::uint32_t jpeg_mem_size;
     std::uint32_t image_mem_size;
+    std::uint32_t coefficient_mem_size;
+    std::uint16_t decode_mode;
+    std::uint16_t down_scale;
     std::uint16_t pixel_format;
-    std::uint16_t reserved0;
+    std::uint16_t alpha_value;
     std::uint32_t image_pitch;
 };
 
@@ -1635,8 +2120,36 @@ struct JpegDecImageInfo {
     std::uint32_t image_width;
     std::uint32_t image_height;
     std::uint16_t color_space;
-    std::uint16_t bit_depth;
-    std::uint32_t image_flag;
+    std::uint16_t component_number;
+    std::uint8_t component_id[4];
+    std::uint8_t sampling_factor[4];
+    std::uint32_t coefficient_mem_size;
+    std::uint32_t suitable_csc_attribute;
+    std::uint32_t output_image_width;
+    std::uint32_t output_image_height;
+};
+
+struct JpegDecInputChunk {
+    const void* data;
+    std::uint32_t size;
+    std::uint32_t reserved;
+};
+
+using JpegDecInputCallback = std::int32_t (APS5_VABI *)(JpegDecInputChunk*, void*);
+
+struct JpegDecInputControlParam {
+    JpegDecInputCallback input;
+    void* input_argument;
+    void* image_mem_addr;
+    void* coefficient_mem_addr;
+    std::uint32_t image_mem_size;
+    std::uint32_t coefficient_mem_size;
+    std::uint16_t operation;
+    std::uint16_t down_scale;
+    std::uint16_t pixel_format;
+    std::uint16_t alpha_value;
+    std::uint32_t image_pitch;
+    std::uint32_t reserved;
 };
 
 struct PlayGoInitParams {
@@ -1663,11 +2176,22 @@ union PlayGoOptionalChunk {
 };
 
 struct PlayGoDialogResult {
+    std::int32_t errorCode;
     std::int32_t result;
-    std::int32_t reserved[9];
+    std::uint8_t reserved[32];
 };
 
-using RudpEventHandler = void (*)(int ctx_id, int event_id, int error_code, void* arg);
+struct RudpPollEvent {
+    std::int32_t contextId;
+    std::uint16_t events;
+    std::uint16_t returnedEvents;
+};
+
+static_assert(sizeof(RudpPollEvent) == 8);
+static_assert(offsetof(RudpPollEvent, events) == 4);
+static_assert(offsetof(RudpPollEvent, returnedEvents) == 6);
+
+using RudpEventHandler = void (APS5_VABI*)(int ctxId, int eventId, int errorCode, void* arg);
 
 struct SystemServiceStatus {
     std::int32_t event_num = 0;
@@ -1686,6 +2210,15 @@ struct SystemServiceDisplaySafeAreaInfo {
     float ratio;
     std::uint8_t reserved[128];
 };
+
+struct SystemServicePlayerDialogParam {
+    std::uint64_t size;
+    std::int32_t mode;
+    std::int32_t user_id;
+    std::uint64_t target_account_id;
+    std::uint8_t reserved[40];
+};
+static_assert(sizeof(SystemServicePlayerDialogParam) == 0x40);
 
 struct SystemServiceHdrToneMapLuminance {
     float max_full_frame_tone_map_luminance;
@@ -1727,6 +2260,13 @@ struct SystemGestureTouchRecognizerInformation {
 
 struct SystemGestureTouchEvent { std::uint8_t reserve[168]; };
 
+struct SystemGestureTouchPadData {
+    std::int32_t pad_handle;
+    std::int32_t report_number;
+    const PadData* pad_data_buffer;
+    std::uint8_t reserve[8];
+};
+
 struct UserServiceLoginUserIdList { int user_id[4]; };
 
 struct UserServiceRegisteredUserIdList { int user_id[16]; };
@@ -1748,11 +2288,15 @@ struct UserServiceGamePresets {
     std::uint32_t audio_language;
 };
 
-struct UltMutexOptParam {
-    std::uint32_t reserved_header[2];
+struct alignas(8) UltMutexOptParam {
+    std::uint32_t header[3];
+    std::uint32_t buildVersion;
     std::uint32_t attribute;
-    std::uint32_t reserved0;
+    std::uint32_t reserved[27];
 };
+
+static_assert(sizeof(UltMutexOptParam) == 128);
+static_assert(offsetof(UltMutexOptParam, attribute) == 16);
 
 struct UltUlthreadRuntimeOptParam { std::uint8_t bytes[128]; };
 
@@ -1804,6 +2348,42 @@ struct VideoOutVblankStatus {
     std::uint8_t pad1[6] = {};
 };
 
+struct VideoOutBufferAttribute {
+    std::uint32_t pixel_format;
+    std::uint32_t tiling_mode;
+    std::uint32_t aspect_ratio;
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t pitch_in_pixel;
+    std::uint32_t option;
+    std::uint32_t reserved0;
+    std::uint64_t reserved1;
+};
+static_assert(sizeof(VideoOutBufferAttribute) == 40);
+
+struct VideoOutFlipStatusPs4 {
+    std::uint64_t count = 0;
+    std::uint64_t processTime = 0;
+    std::uint64_t tsc = 0;
+    std::int64_t flipArg = 0;
+    std::uint64_t submitTsc = 0;
+    std::uint64_t reserved0 = 0;
+    std::int32_t gcQueueNum = 0;
+    std::int32_t flipPendingNum = 0;
+    std::int32_t currentBuffer = 0;
+    std::uint32_t reserved1 = 0;
+};
+static_assert(sizeof(VideoOutFlipStatusPs4) == 64);
+
+struct VideoOutVblankStatusPs4 {
+    std::uint64_t count = 0;
+    std::uint64_t processTime = 0;
+    std::uint64_t tsc = 0;
+    std::uint8_t flags = 0;
+    std::uint8_t pad[7] = {};
+};
+static_assert(sizeof(VideoOutVblankStatusPs4) == 32);
+
 struct VideoOutOutputStatus {
     std::uint32_t resolution = 0;
     std::uint32_t dynamicRange = 0;
@@ -1812,12 +2392,30 @@ struct VideoOutOutputStatus {
     std::uint64_t reserved[3] = {};
 };
 
+struct VideoOutResolutionStatus {
+    std::uint32_t fullWidth = 0;
+    std::uint32_t fullHeight = 0;
+    std::uint32_t paneWidth = 0;
+    std::uint32_t paneHeight = 0;
+    std::uint64_t refreshRate = 0;
+    float screenSizeInInch = 0.0f;
+    std::uint16_t flags = 0;
+    std::uint16_t reserved0 = 0;
+    std::uint32_t reserved1[3] = {};
+};
+static_assert(sizeof(VideoOutResolutionStatus) == 48 && offsetof(VideoOutResolutionStatus, refreshRate) == 16 && offsetof(VideoOutResolutionStatus, screenSizeInInch) == 24);
+
 struct VideoOutOutputOptions { std::uint32_t internalData[16] = {}; };
 
 struct VideoOutColorSettings {
     float gamma = 1.0f;
     std::uint32_t reserved[3] = {};
 };
+
+struct VideoOutColorSpaceConversionSettings {
+    std::uint32_t internalData[8] = {};
+};
+static_assert(sizeof(VideoOutColorSpaceConversionSettings) == 32);
 
 
 using atexit_func_t = void (*)();
@@ -1837,12 +2435,6 @@ struct LibcHeapInfo {
 };
 
 using Info = LibcHeapInfo;
-
-#define VA_ARGS \
-    std::uint64_t rdi, std::uint64_t rsi, std::uint64_t rdx, std::uint64_t rcx, \
-    std::uint64_t r8, std::uint64_t r9, std::uint64_t overflow_arg_area, \
-    __m128 xmm0, __m128 xmm1, __m128 xmm2, __m128 xmm3, \
-    __m128 xmm4, __m128 xmm5, __m128 xmm6, __m128 xmm7, ...
 
 struct Packet {
     std::uint32_t* addr;

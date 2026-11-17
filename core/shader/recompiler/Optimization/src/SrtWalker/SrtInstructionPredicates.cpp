@@ -1,18 +1,44 @@
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 
+#include <algorithm>
+#include <vector>
+
 namespace ShaderRecompiler::Detail {
 
 bool IsRawRead(const IrResourcePlan& program, const IrValue& inst) {
-    const auto op = inst.Opcode();
+    return IsRawRead(program, inst.Opcode(), inst.Flags<MemoryFlags>().index);
+}
+
+bool IsRawRead(const IrResourcePlan& program, IrOpcode op, std::uint32_t index) {
     if (op != IrOpcode::LoadAddressU32 && op != IrOpcode::ReadConstBuffer) {
         return false;
     }
-    const auto index = inst.Flags<MemoryFlags>().index;
     if (index >= program.memoryInfo.size()) {
         return false;
     }
     const auto kind = program.memoryInfo[index].kind;
     return (op == IrOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) || (op == IrOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer);
+}
+
+bool IsMemoryRead(IrOpcode opcode) {
+    return opcode == IrOpcode::ReadConst || opcode == IrOpcode::LoadAddressU32 || opcode == IrOpcode::ReadConstBuffer;
+}
+
+bool LoadedFromMemory(const IrValue& handle) {
+    std::vector<const IrValue*> pending;
+    std::vector<const IrValue*> visited;
+    for (std::size_t index = 0; index < handle.ArgumentCount(); ++index) pending.push_back(handle.Argument(index));
+    while (!pending.empty()) {
+        const IrValue* value = pending.back();
+        pending.pop_back();
+        if (value == nullptr) continue;
+        value = value->Resolve();
+        if (value->HasImmediate() || std::find(visited.begin(), visited.end(), value) != visited.end()) continue;
+        visited.push_back(value);
+        if (IsMemoryRead(value->Opcode())) return true;
+        for (std::size_t index = 0; index < value->ArgumentCount(); ++index) pending.push_back(value->Argument(index));
+    }
+    return false;
 }
 
 bool IsDescriptorHandle(IrOpcode opcode) {
@@ -27,6 +53,17 @@ bool IsDescriptorHandle(IrOpcode opcode) {
 
 bool IsRuntimeSelect(IrOpcode opcode) {
     return opcode == IrOpcode::SelectU1 || opcode == IrOpcode::SelectU32 || opcode == IrOpcode::SelectF32;
+}
+
+bool ActiveMaskImplies(const IrValue* mask, const IrValue* condition) {
+    if (mask == nullptr || condition == nullptr) return false;
+    mask = mask->Resolve();
+    condition = condition->Resolve();
+    if (mask == condition) return true;
+    if (mask->Opcode() == IrOpcode::LogicalAnd && mask->ArgumentCount() == 2) {
+        return ActiveMaskImplies(mask->Argument(0), condition) || ActiveMaskImplies(mask->Argument(1), condition);
+    }
+    return false;
 }
 
 bool IsRuntimeUniformOp(IrOpcode opcode) {
@@ -49,6 +86,7 @@ bool IsRuntimeUniformOp(IrOpcode opcode) {
         case IrOpcode::ISub64:
         case IrOpcode::IMul32:
         case IrOpcode::IMul64:
+        case IrOpcode::SMin32:
         case IrOpcode::UMin32:
         case IrOpcode::ShiftLeftLogical32:
         case IrOpcode::ShiftLeftLogical64:
@@ -61,12 +99,17 @@ bool IsRuntimeUniformOp(IrOpcode opcode) {
         case IrOpcode::BitwiseOr32:
         case IrOpcode::BitwiseXor32:
         case IrOpcode::BitwiseNot32:
+        case IrOpcode::BitCount32:
+        case IrOpcode::FindILsb32:
+        case IrOpcode::FindUMsb32:
         case IrOpcode::SelectU1:
         case IrOpcode::SelectU32:
         case IrOpcode::SelectF32:
+        case IrOpcode::SLessThan32:
         case IrOpcode::ULessThan32:
         case IrOpcode::IEqual32:
         case IrOpcode::UGreaterThan32:
+        case IrOpcode::UGreaterThanEqual32:
         case IrOpcode::INotEqual32:
         case IrOpcode::LogicalOr:
         case IrOpcode::LogicalAnd:
@@ -76,9 +119,56 @@ bool IsRuntimeUniformOp(IrOpcode opcode) {
         case IrOpcode::FPOrdGreaterThanEqual32:
         case IrOpcode::FPIsNan32:
         case IrOpcode::FPMul32:
+        case IrOpcode::NanPropagateF32:
         case IrOpcode::FPTrunc32: return true;
         default: return false;
     }
+}
+
+namespace {
+
+bool holdsFoldableValue(IrValue* value, std::uint32_t depth, std::vector<const IrValue*>& seen) {
+    value = value->Resolve();
+    if (value->HasImmediate()) {
+        return false;
+    }
+    switch (value->Opcode()) {
+        case IrOpcode::GetShaderBase:
+        case IrOpcode::GetExec:
+        case IrOpcode::GetExecLo:
+        case IrOpcode::GetExecHi:
+        case IrOpcode::Ballot:
+        case IrOpcode::LaneId:
+        case IrOpcode::ImageRead:
+        case IrOpcode::ImageSampleExplicitLod:
+        case IrOpcode::ImageSampleImplicitLod:
+        case IrOpcode::ImageSampleRaw: return true;
+        default: break;
+    }
+    if (depth == 0u) {
+        return false;
+    }
+    if (value->IsPhi()) {
+        if (std::ranges::find(seen, value) != seen.end()) {
+            return false;
+        }
+        seen.push_back(value);
+    } else if (!IsRuntimeUniformOp(value->Opcode()) && value->Opcode() != IrOpcode::CompositeExtractU32x4 && value->Opcode() != IrOpcode::WqmU64) {
+        return false;
+    }
+    for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
+        if (holdsFoldableValue(value->Argument(index), depth - 1u, seen)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}
+
+bool HoldsFoldableValue(IrValue* value, std::uint32_t depth) {
+    std::vector<const IrValue*> seen;
+    return holdsFoldableValue(value, depth, seen);
 }
 
 }

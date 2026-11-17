@@ -68,28 +68,7 @@ void ClearVerticalLayout(std::uint8_t* outWords) {
 }
 
 const StyleStateBlock* ResolveSurfaceStyleState(const StyleStateBlock* cachedState, const FontRenderSurface* surface, StyleStateBlock& temporary) {
-    const auto* systemUse = reinterpret_cast<const RenderSurfaceSystemUse*>(surface->reserved_q);
-    if ((surface->styleFlag & 0x1) == 0 || !ValidStyleFrame(systemUse->styleframe)) return cachedState;
-    const FontStyleFrame* frame = systemUse->styleframe;
-    temporary = *cachedState;
-    if ((frame->flags1 & STYLE_FRAME_FLAG_SCALE) != 0) {
-        temporary.scale_unit = frame->scaleUnit;
-        temporary.scale_w = frame->scalePixelW;
-        temporary.scale_h = frame->scalePixelH;
-        temporary.dpi_x = frame->hDpi ? frame->hDpi : 0x48;
-        temporary.dpi_y = frame->vDpi ? frame->vDpi : 0x48;
-    } else {
-        const std::uint32_t wantX = frame->hDpi == 0 ? temporary.dpi_x : frame->hDpi;
-        const std::uint32_t wantY = frame->vDpi == 0 ? temporary.dpi_y : frame->vDpi;
-        temporary.dpi_x = wantX != 0 ? 0x48 : 0;
-        temporary.dpi_y = wantY != 0 ? 0x48 : 0;
-    }
-    if ((frame->flags1 & STYLE_FRAME_FLAG_SLANT) != 0) temporary.slant_ratio = frame->slantRatio;
-    if ((frame->flags1 & STYLE_FRAME_FLAG_WEIGHT) != 0) {
-        temporary.effect_weight_x = frame->effectWeightX;
-        temporary.effect_weight_y = frame->effectWeightY;
-    }
-    return &temporary;
+    return ApplyStyleFrame(cachedState, SurfaceStyleFrame(surface), temporary);
 }
 
 void FillImageMetrics(FontRenderOutput* result, const FontGlyphMetrics* metrics, float x, float y) {
@@ -118,9 +97,19 @@ void FillImageMetrics(FontRenderOutput* result, const FontGlyphMetrics* metrics,
     result->ImageMetrics.height = static_cast<std::uint32_t>(std::max(0, top - bottom));
 }
 
-int RenderGlyphIndexToSurface(FontObj& obj, std::uint32_t glyphIndex, FontRenderSurface* surface, float x, float y, FontGlyphMetrics* metrics, FontRenderOutput* result) {
+void ApplyRenderSlant(FT_GlyphSlot slot, float slantRatio, FontGlyphMetrics& metrics, float scaleX) {
+    if (slantRatio == 0.0f || slot->format != FT_GLYPH_FORMAT_OUTLINE || slot->outline.n_points == 0) return;
+    const FT_Matrix transform{0x10000, TruncateFloatToInt(slantRatio * 65536.0f), 0, 0x10000};
+    FT_Outline_Transform(&slot->outline, &transform);
+    FT_BBox bounds{};
+    FT_Outline_Get_CBox(&slot->outline, &bounds);
+    metrics.width = static_cast<float>(static_cast<double>(bounds.xMax) - static_cast<double>(bounds.xMin)) * ONE_OVER_64 * scaleX;
+    metrics.Horizontal.bearingX = static_cast<float>(bounds.xMin) * ONE_OVER_64 * scaleX;
+}
+
+int RenderGlyphIndexToSurface(FontObj& obj, std::uint32_t glyphIndex, float slantRatio, FontRenderSurface* surface, float x, float y, FontGlyphMetrics* metrics, FontRenderOutput* result) {
     ClearRenderOutputs(metrics, result);
-    if (!surface->buffer || surface->width <= 0 || surface->height <= 0 || surface->widthByte <= 0 || surface->pixelSizeByte <= 0) return SCE_FONT_ERROR_NO_SUPPORT_SURFACE;
+    if (!surface->buffer || surface->width < 0 || surface->height < 0 || surface->widthByte < 0 || surface->pixelSizeByte <= 0) return SCE_FONT_ERROR_NO_SUPPORT_SURFACE;
     const int bytesPerPixel = surface->pixelSizeByte;
     if (bytesPerPixel != 1 && bytesPerPixel != 4) return SCE_FONT_ERROR_NO_SUPPORT_SURFACE;
     const auto face = static_cast<FT_Face>(obj.ft_face);
@@ -132,18 +121,21 @@ int RenderGlyphIndexToSurface(FontObj& obj, std::uint32_t glyphIndex, FontRender
         delta.x += static_cast<FT_Pos>(RoundMulFixed(obj.shift_units_x, static_cast<std::int64_t>(face->size->metrics.x_scale)));
         delta.y += static_cast<FT_Pos>(RoundMulFixed(obj.shift_units_y, static_cast<std::int64_t>(face->size->metrics.y_scale)));
     }
-    FT_Set_Transform(face, nullptr, &delta);
-    const FT_Error error = FT_Load_Glyph(face, glyphIndex, FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP | FT_LOAD_VERTICAL_LAYOUT | FT_LOAD_RENDER);
     FT_Set_Transform(face, nullptr, nullptr);
+    FT_Error error = FT_Load_Glyph(face, glyphIndex, FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP | FT_LOAD_VERTICAL_LAYOUT);
     if (error != 0 || !face->glyph) return SCE_FONT_ERROR_NO_SUPPORT_GLYPH;
     const FT_GlyphSlot slot = face->glyph;
-    const int glyphW = static_cast<int>(slot->bitmap.width);
-    const int glyphH = static_cast<int>(slot->bitmap.rows);
     metrics->width = static_cast<float>(slot->metrics.width) / 64.0f;
     metrics->height = static_cast<float>(slot->metrics.height) / 64.0f;
     metrics->Horizontal.bearingX = static_cast<float>(slot->metrics.horiBearingX) / 64.0f;
     metrics->Horizontal.bearingY = static_cast<float>(slot->metrics.horiBearingY) / 64.0f;
     metrics->Horizontal.advance = static_cast<float>(slot->metrics.horiAdvance) / 64.0f;
+    ApplyRenderSlant(slot, slantRatio, *metrics, 1.0f);
+    if (slot->format == FT_GLYPH_FORMAT_OUTLINE) FT_Outline_Translate(&slot->outline, delta.x, delta.y);
+    error = FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL);
+    if (error != 0) return SCE_FONT_ERROR_NO_SUPPORT_GLYPH;
+    const int glyphW = static_cast<int>(slot->bitmap.width);
+    const int glyphH = static_cast<int>(slot->bitmap.rows);
     std::vector<std::uint8_t> bitmap(static_cast<std::size_t>(glyphW) * static_cast<std::size_t>(glyphH));
     if (glyphW > 0 && glyphH > 0) {
         const int pitch = slot->bitmap.pitch;
@@ -365,9 +357,9 @@ int Font::ComputeVerticalLayout(FontHandle handle, const StyleStateBlock* style,
     return SCE_FONT_OK;
 }
 
-int Font::GetCharGlyphMetrics(FontHandle handle, std::uint32_t code, FontGlyphMetrics* metrics, bool useCachedStyle) {
+int Font::GetCharGlyphMetrics(FontHandle handle, std::uint32_t code, FontGlyphMetrics* metrics, bool useCachedStyle, float* usedScaleW, float* usedScaleH) {
     const auto clearMetrics = [&] {
-        if (metrics) *metrics = {};
+        if (metrics) CopyOutGuest(metrics, FontGlyphMetrics{});
     };
     auto* font = GetNativeFont(handle);
     if (!font || font->magic != HANDLE_MAGIC) {
@@ -378,7 +370,7 @@ int Font::GetCharGlyphMetrics(FontHandle handle, std::uint32_t code, FontGlyphMe
         clearMetrics();
         return SCE_FONT_ERROR_NO_SUPPORT_CODE;
     }
-    if (!metrics) return SCE_FONT_ERROR_INVALID_PARAMETER;
+    if (!metrics || !CopyOutGuest(metrics, FontGlyphMetrics{})) return SCE_FONT_ERROR_INVALID_PARAMETER;
     std::uint32_t previousFontLock = 0;
     if (!AcquireFontLock(font, previousFontLock)) {
         clearMetrics();
@@ -404,10 +396,10 @@ int Font::GetCharGlyphMetrics(FontHandle handle, std::uint32_t code, FontGlyphMe
     float scaleH = 0.0f;
     const int scaleRc = StyleStateGetScalePixel(style, &scaleW, &scaleH);
     if (scaleRc != SCE_FONT_OK) return finish(scaleRc);
-    const FT_Face face = state->face;
-    if (!face) return finish(SCE_FONT_ERROR_NO_SUPPORT_FUNCTION);
-    const FT_UInt glyphIndex = ResolveGlyphIndexWithFallback(face, code);
-    if (glyphIndex == 0) return finish(SCE_FONT_ERROR_NO_SUPPORT_GLYPH);
+    if (!state->face) return finish(SCE_FONT_ERROR_NO_SUPPORT_FUNCTION);
+    FT_UInt glyphIndex = 0;
+    const FT_Face face = FaceForCode(*state, code, &glyphIndex);
+    if (!face) return finish(SCE_FONT_ERROR_NO_SUPPORT_GLYPH);
     const auto charW = static_cast<FT_F26Dot6>(static_cast<std::int32_t>(scaleW * 64.0f));
     const auto charH = static_cast<FT_F26Dot6>(static_cast<std::int32_t>(scaleH * 64.0f));
     FT_F26Dot6 usedW = charW;
@@ -423,15 +415,52 @@ int Font::GetCharGlyphMetrics(FontHandle handle, std::uint32_t code, FontGlyphMe
     const float ratioX = ratio(charW, usedW);
     const float ratioY = ratio(charH, usedH);
     const FT_GlyphSlot slot = face->glyph;
-    metrics->width = static_cast<float>(slot->metrics.width) / 64.0f * ratioX;
-    metrics->height = static_cast<float>(slot->metrics.height) / 64.0f * ratioY;
-    metrics->Horizontal.bearingX = static_cast<float>(slot->metrics.horiBearingX) / 64.0f * ratioX;
-    metrics->Horizontal.bearingY = static_cast<float>(slot->metrics.horiBearingY) / 64.0f * ratioY;
-    metrics->Horizontal.advance = static_cast<float>(slot->metrics.horiAdvance) / 64.0f * ratioX;
-    metrics->Vertical.bearingX = 0.0f;
-    metrics->Vertical.bearingY = 0.0f;
-    metrics->Vertical.advance = 0.0f;
+    FontGlyphMetrics localMetrics{};
+    localMetrics.width = static_cast<float>(slot->metrics.width) / 64.0f * ratioX;
+    localMetrics.height = static_cast<float>(slot->metrics.height) / 64.0f * ratioY;
+    localMetrics.Horizontal.bearingX = static_cast<float>(slot->metrics.horiBearingX) / 64.0f * ratioX;
+    localMetrics.Horizontal.bearingY = static_cast<float>(slot->metrics.horiBearingY) / 64.0f * ratioY;
+    localMetrics.Horizontal.advance = static_cast<float>(slot->metrics.horiAdvance) / 64.0f * ratioX;
+    const bool vertical = FT_HAS_VERTICAL(face);
+    const FT_Pos vertBearingX = vertical ? slot->metrics.vertBearingX : slot->metrics.horiBearingX - slot->metrics.horiAdvance / 2;
+    const FT_Pos vertBearingY = vertical ? slot->metrics.vertBearingY : (slot->metrics.vertAdvance - slot->metrics.height) / 2;
+    localMetrics.Vertical.bearingX = static_cast<float>(vertBearingX) / 64.0f * ratioX;
+    localMetrics.Vertical.bearingY = static_cast<float>(vertBearingY) / 64.0f * ratioY;
+    localMetrics.Vertical.advance = static_cast<float>(slot->metrics.vertAdvance) / 64.0f * ratioY;
+    if (useCachedStyle) ApplyRenderSlant(slot, style->slant_ratio, localMetrics, ratioX);
+    if (!CopyOutGuest(metrics, localMetrics)) return finish(SCE_FONT_ERROR_INVALID_PARAMETER);
+    if (usedScaleW) *usedScaleW = scaleW;
+    if (usedScaleH) *usedScaleH = scaleH;
     return finish(SCE_FONT_OK);
+}
+
+const FontStyleFrame* Font::SurfaceStyleFrame(const FontRenderSurface* surface) {
+    const auto* systemUse = reinterpret_cast<const RenderSurfaceSystemUse*>(surface->reserved_q);
+    if ((surface->styleFlag & 0x1) == 0 || !ValidStyleFrame(systemUse->styleframe)) return nullptr;
+    return systemUse->styleframe;
+}
+
+const StyleStateBlock* Font::ApplyStyleFrame(const StyleStateBlock* base, const FontStyleFrame* frame, StyleStateBlock& temporary) {
+    if (!frame) return base;
+    temporary = *base;
+    if ((frame->flags1 & STYLE_FRAME_FLAG_SCALE) != 0) {
+        temporary.scale_unit = frame->scaleUnit;
+        temporary.scale_w = frame->scalePixelW;
+        temporary.scale_h = frame->scalePixelH;
+        temporary.dpi_x = frame->hDpi ? frame->hDpi : 0x48;
+        temporary.dpi_y = frame->vDpi ? frame->vDpi : 0x48;
+    } else {
+        const std::uint32_t wantX = frame->hDpi == 0 ? temporary.dpi_x : frame->hDpi;
+        const std::uint32_t wantY = frame->vDpi == 0 ? temporary.dpi_y : frame->vDpi;
+        temporary.dpi_x = wantX;
+        temporary.dpi_y = wantY;
+    }
+    if ((frame->flags1 & STYLE_FRAME_FLAG_SLANT) != 0) temporary.slant_ratio = frame->slantRatio;
+    if ((frame->flags1 & STYLE_FRAME_FLAG_WEIGHT) != 0) {
+        temporary.effect_weight_x = frame->effectWeightX;
+        temporary.effect_weight_y = frame->effectWeightY;
+    }
+    return &temporary;
 }
 
 int Font::RenderCharGlyphImageCore(FontHandle handle, std::uint32_t code, FontRenderSurface* surface, float x, float y, FontGlyphMetrics* metrics, FontRenderOutput* result) {
@@ -445,13 +474,21 @@ int Font::RenderCharGlyphImageCore(FontHandle handle, std::uint32_t code, FontRe
     auto* font = GetNativeFont(handle);
     if (font->magic != HANDLE_MAGIC) return fail(SCE_FONT_ERROR_INVALID_FONT_HANDLE);
     if (!font->renderer) return fail(SCE_FONT_ERROR_NOT_BOUND_RENDERER);
+    StyleStateBlock surfaceStyle{};
+    return RenderCodeWithStyle(handle, code, ResolveSurfaceStyleState(&font->cached_style.state, surface, surfaceStyle), surface, x, y, metrics, result);
+}
+
+int Font::RenderCodeWithStyle(FontHandle handle, std::uint32_t code, const StyleStateBlock* style, FontRenderSurface* surface, float x, float y, FontGlyphMetrics* metrics, FontRenderOutput* result) {
+    const auto fail = [&](int rc) {
+        ClearRenderOutputs(metrics, result);
+        return rc;
+    };
+    auto* font = GetNativeFont(handle);
     auto* library = static_cast<FontLibNative*>(font->library);
     if (!library || library->magic != LIBRARY_MAGIC) return fail(SCE_FONT_ERROR_INVALID_FONT_HANDLE);
     const SysDriver* driver = library->sys_driver;
     if (!driver || !driver->glyph_index || !driver->set_char_with_dpi || !driver->set_char_default_dpi) return fail(SCE_FONT_ERROR_FATAL);
     const std::uint32_t modeLow = font->flags & 0x0Fu;
-    StyleStateBlock surfaceStyle{};
-    const StyleStateBlock* style = ResolveSurfaceStyleState(&font->cached_style.state, surface, surfaceStyle);
     FontObj* obj = nullptr;
     std::uint32_t lockWord = 0;
     auto* entry = AcquireFontCtxEntry(FontContext(library, font), font->open_info.ctx_entry_index, modeLow, &obj, &lockWord);
@@ -472,19 +509,23 @@ int Font::RenderCharGlyphImageCore(FontHandle handle, std::uint32_t code, FontRe
     obj->shift_units_y = 0;
     obj->layout_seed_pair = 0;
     StyleStateGetScalePixel(style, &obj->scale_x_0x50, &obj->scale_y_0x54);
-    float outScaleX = 0.0f;
-    float outScaleY = 0.0f;
-    int rc;
-    if (style->scale_unit == 0) {
-        rc = driver->set_char_default_dpi(obj, style->scale_w, style->scale_h, &outScaleX, &outScaleY);
-    } else {
-        rc = driver->set_char_with_dpi(obj, style->dpi_x ? style->dpi_x : 0x48, style->dpi_y ? style->dpi_y : 0x48, style->scale_w, style->scale_h, &outScaleX, &outScaleY);
-    }
-    if (rc != SCE_FONT_OK) return finish(SCE_FONT_ERROR_NO_SUPPORT_GLYPH);
+    const auto setCharSize = [&](FontObj* target) {
+        float outScaleX = 0.0f;
+        float outScaleY = 0.0f;
+        if (style->scale_unit == 0) return driver->set_char_default_dpi(target, style->scale_w, style->scale_h, &outScaleX, &outScaleY);
+        return driver->set_char_with_dpi(target, style->dpi_x ? style->dpi_x : 0x48, style->dpi_y ? style->dpi_y : 0x48, style->scale_w, style->scale_h, &outScaleX, &outScaleY);
+    };
+    if (setCharSize(obj) != SCE_FONT_OK) return finish(SCE_FONT_ERROR_NO_SUPPORT_GLYPH);
     std::uint32_t glyphIndex = 0;
-    rc = driver->glyph_index(obj, code, &glyphIndex);
-    if (rc != SCE_FONT_OK || glyphIndex == 0) return finish(SCE_FONT_ERROR_NO_SUPPORT_GLYPH);
-    return finish(RenderGlyphIndexToSurface(*obj, glyphIndex, surface, x, y, metrics, result));
+    if (driver->glyph_index(obj, code, &glyphIndex) == SCE_FONT_OK && glyphIndex != 0) return finish(RenderGlyphIndexToSurface(*obj, glyphIndex, style->slant_ratio, surface, x, y, metrics, result));
+    const FontState* state = TryGetState(handle);
+    FT_UInt fallbackIndex = 0;
+    const FT_Face fallbackFace = state ? FallbackFaceForCode(*state, code, &fallbackIndex) : nullptr;
+    if (!fallbackFace) return finish(SCE_FONT_ERROR_NO_SUPPORT_GLYPH);
+    FontObj fallback = *obj;
+    fallback.ft_face = fallbackFace;
+    if (setCharSize(&fallback) != SCE_FONT_OK) return finish(SCE_FONT_ERROR_NO_SUPPORT_GLYPH);
+    return finish(RenderGlyphIndexToSurface(fallback, fallbackIndex, style->slant_ratio, surface, x, y, metrics, result));
 }
 
 bool Font::BuildTrueOutline(GeneratedGlyph& glyph) {
@@ -492,9 +533,9 @@ bool Font::BuildTrueOutline(GeneratedGlyph& glyph) {
     if (!state || !state->face) return false;
     const auto* font = GetNativeFont(glyph.owner);
     if (font->magic != HANDLE_MAGIC) return false;
-    const FT_Face face = state->face;
-    const FT_UInt glyphIndex = FT_Get_Char_Index(face, glyph.codepoint);
-    if (glyphIndex == 0) return false;
+    FT_UInt glyphIndex = 0;
+    const FT_Face face = FaceForCode(*state, glyph.codepoint, &glyphIndex);
+    if (!face) return false;
     const auto charW = static_cast<FT_F26Dot6>(static_cast<std::int32_t>(glyph.glyph.scale_x * 64.0f));
     const auto charH = static_cast<FT_F26Dot6>(static_cast<std::int32_t>(glyph.glyph.base_scale * 64.0f));
     if (FT_Set_Char_Size(face, charW, charH, 72, 72) != 0) return false;
@@ -519,4 +560,110 @@ bool Font::BuildTrueOutline(GeneratedGlyph& glyph) {
     glyph.outline.contours_cnt = static_cast<std::int16_t>(glyph.outlineContours.size());
     glyph.outlineInitialized = true;
     return true;
+}
+
+int Font::ComputeFontMetrics(FontHandle handle, std::uint32_t form, FontMetrics* metrics) {
+    auto* font = GetNativeFont(handle);
+    auto* library = font ? static_cast<FontLibNative*>(font->library) : nullptr;
+    if (!library || !FontContext(library, font)) return SCE_FONT_ERROR_INVALID_FONT_HANDLE;
+    const SysDriver* driver = library->sys_driver;
+    if (!driver || !driver->set_char_with_dpi || !driver->set_char_default_dpi || !driver->font_metrics) return SCE_FONT_ERROR_INVALID_FONT_HANDLE;
+    const std::uint32_t fontId = font->open_info.ctx_entry_index;
+    if (static_cast<std::int32_t>(fontId) < 0) {
+        metrics->form = form;
+        metrics->ascender = 0.0f;
+        metrics->descender = 0.0f;
+        metrics->lineGap = 0.0f;
+        metrics->maxAdvance = 0.0f;
+        metrics->verticalDescender = 0.0f;
+        metrics->verticalAscender = 0.0f;
+        return SCE_FONT_OK;
+    }
+    const std::uint32_t modeLow = font->flags & 0x0Fu;
+    FontObj* head = nullptr;
+    std::uint32_t lockWord = 0;
+    auto* entry = AcquireFontCtxEntry(FontContext(library, font), fontId, modeLow, &head, &lockWord);
+    if (!entry) return SCE_FONT_ERROR_INVALID_FONT_HANDLE;
+    FontObj* match = FindSubFont(head, font->open_info.sub_font_index);
+    int rc = SCE_FONT_ERROR_FATAL;
+    if ((lockWord & OPEN_BIT) != 0 && (lockWord & COUNT_MASK) != 0 && match) {
+        float scaleX = font->style.scale_w;
+        float scaleY = font->style.scale_h;
+        match->font_handle = handle;
+        match->shift_units_x = 0;
+        match->shift_units_y = 0;
+        rc = SetDriverCharSize(driver, match, &font->style, scaleX, scaleY);
+        if (rc == SCE_FONT_OK) rc = driver->font_metrics(match, form, metrics);
+    }
+    ReleaseFontCtxEntryLock(entry, modeLow, lockWord);
+    return rc == SCE_FONT_OK ? rc : SCE_FONT_ERROR_INVALID_FONT_HANDLE;
+}
+
+int Font::ComputeFontStyleInformation(FontHandle handle, FontStyleInformation* information) {
+    auto* font = GetNativeFont(handle);
+    auto* library = static_cast<FontLibNative*>(font->library);
+    if (!library) return SCE_FONT_ERROR_INVALID_FONT_HANDLE;
+    if (!information) return SCE_FONT_ERROR_INVALID_PARAMETER;
+    if (const auto* record = static_cast<const std::uint8_t*>(font->open_info.fontset_record)) {
+        std::memcpy(&information->familyName, record + 8, sizeof(information->familyName));
+        std::memcpy(&information->styleName, record + 16, sizeof(information->styleName));
+        information->styleFlags = record[4];
+        information->weight = static_cast<std::uint16_t>(record[5] * 100);
+        information->width = record[6];
+        information->layoutFlags = record[7];
+        return SCE_FONT_OK;
+    }
+    const SysDriver* driver = library->sys_driver;
+    auto* context = FontContext(library, font);
+    if (!driver || !driver->style_information || !context) return SCE_FONT_ERROR_FATAL;
+    const std::uint32_t modeLow = font->flags & 0x0Fu;
+    FontObj* head = nullptr;
+    std::uint32_t lockWord = 0;
+    auto* entry = AcquireFontCtxEntry(context, font->open_info.ctx_entry_index, modeLow, &head, &lockWord);
+    if (!entry) return SCE_FONT_ERROR_FATAL;
+    FontObj* match = FindSubFont(head, font->open_info.sub_font_index);
+    int rc = SCE_FONT_ERROR_FATAL;
+    if ((lockWord & OPEN_BIT) != 0 && (lockWord & COUNT_MASK) != 0 && match) {
+        match->font_handle = handle;
+        rc = driver->style_information(match, information);
+        information->weight = static_cast<std::uint16_t>(information->weight * 100);
+    }
+    ReleaseFontCtxEntryLock(entry, modeLow, lockWord);
+    return rc;
+}
+
+int Font::ComputeFontGlyphsOutlineProfile(FontHandle handle, FontOutlineProfile* profile) {
+    auto* font = GetNativeFont(handle);
+    if (!font || font->magic != HANDLE_MAGIC) {
+        if (profile) *profile = {};
+        return SCE_FONT_ERROR_INVALID_FONT_HANDLE;
+    }
+    if (!profile) return SCE_FONT_ERROR_INVALID_PARAMETER;
+    *profile = {};
+    auto* library = static_cast<FontLibNative*>(font->library);
+    auto* context = library ? FontContext(library, font) : nullptr;
+    if (!context) return SCE_FONT_ERROR_INVALID_FONT_HANDLE;
+    const std::uint32_t fontId = font->open_info.ctx_entry_index;
+    if (static_cast<std::int32_t>(fontId) < 0) return SCE_FONT_OK;
+    const SysDriver* driver = library->sys_driver;
+    if (!driver || !driver->outline_profile) return SCE_FONT_ERROR_FATAL;
+    const std::uint32_t modeLow = font->flags & 0x0Fu;
+    FontObj* head = nullptr;
+    std::uint32_t lockWord = 0;
+    auto* entry = AcquireFontCtxEntry(context, fontId, modeLow, &head, &lockWord);
+    if (!entry) return SCE_FONT_ERROR_FATAL;
+    FontObj* match = FindSubFont(head, font->open_info.sub_font_index);
+    int rc = SCE_FONT_ERROR_FATAL;
+    FontOutlineProfile faceProfile{};
+    if ((lockWord & OPEN_BIT) != 0 && (lockWord & COUNT_MASK) != 0 && match) {
+        match->font_handle = handle;
+        rc = driver->outline_profile(match, &faceProfile);
+    }
+    ReleaseFontCtxEntryLock(entry, modeLow, lockWord);
+    if (rc != SCE_FONT_OK) return rc;
+    profile->maxContours = std::max(profile->maxContours, faceProfile.maxContours);
+    profile->maxPoints = std::max(profile->maxPoints, faceProfile.maxPoints);
+    profile->maxCompositeContours = std::max(profile->maxCompositeContours, faceProfile.maxCompositeContours);
+    profile->maxCompositePoints = std::max(profile->maxCompositePoints, faceProfile.maxCompositePoints);
+    return SCE_FONT_OK;
 }

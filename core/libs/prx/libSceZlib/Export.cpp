@@ -1,0 +1,219 @@
+#include "prx/libSceZlib/include/Api.hpp"
+#include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libkernel/Time/include/TimedWait.hpp"
+#include "zlib.h"
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <limits>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
+
+namespace {
+
+static_assert(sizeof(std::uint32_t) == 4 && sizeof(std::uint64_t) == 8 && sizeof(std::int32_t) == 4);
+
+constexpr std::int32_t NOT_FOUND = static_cast<std::int32_t>(0x81120002);
+constexpr std::int32_t NOT_INITIALIZED = static_cast<std::int32_t>(0x81120032);
+constexpr std::int32_t ALREADY_INITIALIZED = static_cast<std::int32_t>(0x81120033);
+constexpr std::int32_t TIMED_OUT = static_cast<std::int32_t>(0x81120027);
+constexpr std::int32_t NO_SPACE = static_cast<std::int32_t>(0x8112001C);
+constexpr std::int32_t INVALID_ARGUMENT = static_cast<std::int32_t>(0x81120016);
+constexpr std::int32_t FATAL = static_cast<std::int32_t>(0x811200FF);
+
+struct InflateResult {
+    std::uint32_t produced;
+    std::int32_t status;
+};
+
+std::mutex serviceMutex;
+bool initialized = false;
+std::uint64_t nextId = 1;
+std::uint64_t session = 0;
+std::unordered_map<std::uint64_t, InflateResult> results;
+std::deque<std::uint64_t> completed;
+TimedWait::Condition completion;
+
+} // namespace
+
+extern "C" {
+
+std::int32_t APS5_VABI sceZlibInitialize(const void* buffer, std::uint64_t length) {
+    std::lock_guard lock(serviceMutex);
+    if (initialized) return ALREADY_INITIALIZED;
+    if ((buffer == nullptr) != (length == 0)) return INVALID_ARGUMENT;
+    if (buffer) throw std::runtime_error("sceZlibInitialize: work memory registration is not implemented");
+    initialized = true;
+    return 0;
+}
+
+std::int32_t APS5_VABI sceZlibFinalize() {
+    std::lock_guard lock(serviceMutex);
+    if (!initialized) return NOT_INITIALIZED;
+    results.clear();
+    completed.clear();
+    initialized = false;
+    ++session;
+    completion.NotifyAll();
+    return 0;
+}
+
+std::int32_t APS5_VABI sceZlibInflate(const void* source, std::uint32_t sourceLength, void* destination, std::uint32_t destinationLength, std::uint64_t* requestId) {
+    std::lock_guard lock(serviceMutex);
+    if (!initialized) return NOT_INITIALIZED;
+    if (!source || !sourceLength || !destination || !requestId || !destinationLength ||
+        destinationLength > 65536 || destinationLength % 2048 != 0) return INVALID_ARGUMENT;
+    if (reinterpret_cast<std::uintptr_t>(destination) % 2048 != 0)
+        throw std::runtime_error("sceZlibInflate: unaligned destination driver behavior is not implemented");
+    if (nextId == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("sceZlibInflate: request IDs exhausted");
+    const auto sourceAddress = reinterpret_cast<std::uintptr_t>(source);
+    if (sourceLength > std::numeric_limits<std::uintptr_t>::max() - sourceAddress) return INVALID_ARGUMENT;
+    std::array<Bytef, 16384> inputBuffer{};
+    std::array<Bytef, 65536> outputBuffer{};
+    z_stream stream{};
+    stream.next_out = outputBuffer.data();
+    stream.avail_out = destinationLength;
+    if (inflateInit(&stream) != Z_OK) throw std::runtime_error("sceZlibInflate: decoder initialization failed");
+    std::uint32_t supplied = 0;
+    bool invalidInput = false;
+    int decoded = Z_BUF_ERROR;
+    for (;;) {
+        if (stream.avail_in == 0 && supplied < sourceLength) {
+            const auto chunk = std::min<std::uint32_t>(sourceLength - supplied, inputBuffer.size());
+            const int savedErrno = errno;
+            const bool copied = GuestCopyIn_nid_no_patch(inputBuffer.data(),
+                reinterpret_cast<const void*>(sourceAddress + supplied), chunk);
+            errno = savedErrno;
+            if (!copied) {
+                invalidInput = true;
+                break;
+            }
+            stream.next_in = inputBuffer.data();
+            stream.avail_in = chunk;
+            supplied += chunk;
+        }
+        const auto previousInput = stream.total_in;
+        const auto previousOutput = stream.total_out;
+        const int flush = (supplied == sourceLength) ? Z_FINISH : Z_NO_FLUSH;
+        decoded = inflate(&stream, flush);
+        if (decoded == Z_STREAM_END) break;
+        if (decoded != Z_OK && decoded != Z_BUF_ERROR) break;
+        if (stream.avail_out == 0) break;
+        if (stream.total_in == previousInput && stream.total_out == previousOutput) break;
+    }
+    const auto produced = static_cast<std::uint32_t>(stream.total_out);
+    std::int32_t status;
+    if (decoded == Z_STREAM_END) {
+        status = 0;
+    } else if ((decoded == Z_OK || decoded == Z_BUF_ERROR) && stream.avail_out == 0) {
+        Bytef scratch = 0;
+        stream.next_out = &scratch;
+        stream.avail_out = 1;
+        status = FATAL;
+        for (;;) {
+            const auto previousProbeIn = stream.total_in;
+            const int probeDecoded = inflate(&stream, supplied == sourceLength ? Z_FINISH : Z_NO_FLUSH);
+            if (stream.avail_out == 0) { status = NO_SPACE; break; }
+            if (probeDecoded == Z_STREAM_END) { status = 0; break; }
+            if (probeDecoded != Z_OK && probeDecoded != Z_BUF_ERROR) break;
+            if (stream.avail_in == 0 && supplied < sourceLength) {
+                const auto chunk = std::min<std::uint32_t>(sourceLength - supplied, inputBuffer.size());
+                const int savedErrno = errno;
+                const bool copied = GuestCopyIn_nid_no_patch(inputBuffer.data(),
+                    reinterpret_cast<const void*>(sourceAddress + supplied), chunk);
+                errno = savedErrno;
+                if (!copied) { invalidInput = true; break; }
+                stream.next_in = inputBuffer.data();
+                stream.avail_in = chunk;
+                supplied += chunk;
+            } else if (stream.total_in == previousProbeIn) {
+                break;
+            }
+        }
+    } else {
+        status = FATAL;
+    }
+    const int ended = inflateEnd(&stream);
+    if (ended != Z_OK) throw std::runtime_error("sceZlibInflate: decoder cleanup failed");
+    if (invalidInput) return INVALID_ARGUMENT;
+    const int savedErrno = errno;
+    const bool copiedOutput = GuestCopyOut_nid_no_patch(destination, outputBuffer.data(), produced);
+    errno = savedErrno;
+    if (!copiedOutput) return INVALID_ARGUMENT;
+    const std::uint64_t id = nextId;
+    results.emplace(id, InflateResult{produced, status});
+    try {
+        completed.push_back(id);
+    } catch (...) {
+        results.erase(id);
+        throw;
+    }
+    const int savedIdErrno = errno;
+    const bool copiedId = GuestCopyOut_nid_no_patch(requestId, &id, sizeof(id));
+    errno = savedIdErrno;
+    if (!copiedId) {
+        completed.pop_back();
+        results.erase(id);
+        return INVALID_ARGUMENT;
+    }
+    ++nextId;
+    completion.NotifyOne();
+    return 0;
+}
+
+std::int32_t APS5_VABI sceZlibWaitForDone(std::uint64_t* requestId, std::uint32_t* timeout) {
+    std::unique_lock lock(serviceMutex);
+    if (!initialized) return NOT_INITIALIZED;
+    if (!requestId) return INVALID_ARGUMENT;
+    std::uint32_t timeoutMicros = 0;
+    if (timeout) {
+        const int savedErrno = errno;
+        const bool copied = GuestCopyIn_nid_no_patch(&timeoutMicros, timeout, sizeof(timeoutMicros));
+        errno = savedErrno;
+        if (!copied) return INVALID_ARGUMENT;
+    }
+    const std::uint64_t waitSession = session;
+    const auto finished = [waitSession] { return !completed.empty() || session != waitSession; };
+    if (!timeout) completion.Wait(lock, finished);
+    else if (!completion.WaitUntil(lock, TimedWait::DeadlineNanos(timeoutMicros), finished)) return TIMED_OUT;
+    if (session != waitSession) throw std::runtime_error("sceZlibWaitForDone: finalization during a wait semantics unknown");
+    const int savedErrno = errno;
+    const bool copied = GuestCopyOut_nid_no_patch(requestId, &completed.front(), sizeof(*requestId));
+    errno = savedErrno;
+    if (!copied) {
+        completion.NotifyOne();
+        return INVALID_ARGUMENT;
+    }
+    completed.pop_front();
+    return 0;
+}
+
+std::int32_t APS5_VABI sceZlibGetResult(std::uint64_t requestId, std::uint32_t* destinationLength, std::int32_t* status) {
+    std::lock_guard lock(serviceMutex);
+    if (!initialized) return NOT_INITIALIZED;
+    if (!destinationLength || !status) return INVALID_ARGUMENT;
+    const auto found = results.find(requestId);
+    if (found == results.end()) return NOT_FOUND;
+    const int savedErrno = errno;
+    const GuestArena::HostWrite guardLength(destinationLength, sizeof(found->second.produced));
+    const GuestArena::HostWrite guardStatus(status, sizeof(found->second.status));
+    if (!guardLength.Open() || !guardStatus.Open() ||
+        !GuestWritable_nid_no_patch(destinationLength, sizeof(found->second.produced)) ||
+        !GuestWritable_nid_no_patch(status, sizeof(found->second.status))) {
+        errno = savedErrno;
+        return INVALID_ARGUMENT;
+    }
+    const bool copiedLength = GuestCopyOut_nid_no_patch(destinationLength, &found->second.produced, sizeof(found->second.produced));
+    const bool copiedStatus = GuestCopyOut_nid_no_patch(status, &found->second.status, sizeof(found->second.status));
+    errno = savedErrno;
+    if (!copiedLength || !copiedStatus) return INVALID_ARGUMENT;
+    return 0;
+}
+
+}

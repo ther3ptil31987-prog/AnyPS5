@@ -2,14 +2,27 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <mutex>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
-// Resource registration feeds GPU debugging tools, none of which are attached; the game treats this code as benign.
 static constexpr int SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE = static_cast<int>(0x8A6C9018);
-static constexpr uint32_t RESOURCE_REGISTRATION_MAX_NAME_LENGTH = 0xfc;
+static constexpr int SCE_AGC_ERROR_WORKLOAD_STREAM_INVALID_ID = static_cast<int>(0x8A6C0033);
+static constexpr int SCE_AGC_ERROR_WORKLOAD_STREAM_NULL = static_cast<int>(0x8A6C0035);
+static constexpr int SCE_AGC_ERROR_WORKLOAD_STREAM_NOT_REGISTERED = static_cast<int>(0x8A6C003A);
+static constexpr uint32_t WORKLOAD_STREAM_MIN_ID = 1;
+static constexpr uint32_t WORKLOAD_STREAM_MAX_ID = 31;
+
+static std::mutex g_workloadStreamLock;
+static uint32_t g_workloadStreams = 0;
 
 extern "C" {
+
+bool AgcDriverWorkloadStreamRegistered_nid_postfix(uint32_t streamId) {
+    if (streamId < WORKLOAD_STREAM_MIN_ID || streamId > WORKLOAD_STREAM_MAX_ID) return false;
+    std::lock_guard lock(g_workloadStreamLock);
+    return (g_workloadStreams & (1u << streamId)) != 0;
+}
 
 int APS5_VABI sceAgcDriverRegisterOwner(uint32_t* owner_handle, const char* name) {
     (void)owner_handle;
@@ -28,9 +41,20 @@ int APS5_VABI sceAgcDriverRegisterResource(uint32_t* resource_handle, uint32_t o
     return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
 }
 
+int APS5_VABI sceAgcDriverRegisterMultipleResources(uint32_t* resourceHandle, uint32_t ownerHandle, const void* resources, uint32_t resourceCount) {
+    (void)resourceHandle;
+    (void)ownerHandle;
+    (void)resources;
+    (void)resourceCount;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
 int APS5_VABI sceAgcDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream) {
- (void)stream_id;
- (void)stream;
+ if (stream_id < WORKLOAD_STREAM_MIN_ID || stream_id > WORKLOAD_STREAM_MAX_ID) return SCE_AGC_ERROR_WORKLOAD_STREAM_INVALID_ID;
+ std::lock_guard lock(g_workloadStreamLock);
+ if ((g_workloadStreams & (1u << stream_id)) != 0) return SCE_AGC_ERROR_WORKLOAD_STREAM_INVALID_ID;
+ if (stream == nullptr) return SCE_AGC_ERROR_WORKLOAD_STREAM_NULL;
+ g_workloadStreams |= 1u << stream_id;
  return 0;
 }
 
@@ -61,7 +85,10 @@ int APS5_VABI sceAgcDriverUnregisterAllResourcesForOwner(uint32_t owner_handle) 
 }
 
 int APS5_VABI sceAgcDriverUnregisterWorkloadStream(uint32_t stream_id) {
-    (void)stream_id;
+    if (stream_id < WORKLOAD_STREAM_MIN_ID || stream_id > WORKLOAD_STREAM_MAX_ID) return SCE_AGC_ERROR_WORKLOAD_STREAM_INVALID_ID;
+    std::lock_guard lock(g_workloadStreamLock);
+    if ((g_workloadStreams & (1u << stream_id)) == 0) return SCE_AGC_ERROR_WORKLOAD_STREAM_NOT_REGISTERED;
+    g_workloadStreams &= ~(1u << stream_id);
     return 0;
 }
 
@@ -71,9 +98,8 @@ int APS5_VABI sceAgcDriverGetDefaultOwner(uint32_t* owner_handle) {
 }
 
 int APS5_VABI sceAgcDriverGetResourceRegistrationMaxNameLength(uint32_t* max_length) {
-    if (max_length == nullptr) APS5_INVALID_ARG_EX;
-    *max_length = RESOURCE_REGISTRATION_MAX_NAME_LENGTH;
-    return 0;
+    (void)max_length;
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
 }
 
 int APS5_VABI sceAgcDriverGetOwnerName(uint32_t owner_handle, const char** name) {
@@ -123,6 +149,18 @@ int APS5_VABI sceAgcDriverFindResourcesPublic(const void* callback, void* user_d
     (void)callback;
     (void)user_data;
     return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverRegisterOwnerForSystem() {
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverInitResourceRegistrationInterface() {
+    return SCE_AGC_ERROR_RESOURCE_REGISTRATION_UNAVAILABLE;
+}
+
+int APS5_VABI sceAgcDriverSetResourceRegistrationInfo() {
+    return 0;
 }
 
 }

@@ -1,5 +1,8 @@
+#include "prx/libSceAudioOut/include/AudioOut2.hpp"
+#include "prx/libSceAudioOut/src/AudioOut2PadMix.hpp"
 #include "SceTypes.hpp"
 
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -8,19 +11,11 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
-
-extern "C" {
-int APS5_VABI sceAudioOut2ContextResetParam(AudioOut2ContextParam*);
-int APS5_VABI sceAudioOut2ContextCreate(const AudioOut2ContextParam*, void*, std::size_t, AudioOut2ContextHandle*);
-int APS5_VABI sceAudioOut2ContextDestroy(AudioOut2ContextHandle);
-int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle, std::uint32_t);
-int APS5_VABI sceAudioOut2PortCreate(AudioOut2ContextHandle, const AudioOut2PortParam*, AudioOut2PortHandle*);
-int APS5_VABI sceAudioOut2PortDestroy(AudioOut2PortHandle);
-int APS5_VABI sceAudioOut2PortSetAttributes(AudioOut2PortHandle, const AudioOut2Attribute*, std::uint32_t);
-}
 
 static void Require(bool value) { if (!value) std::abort(); }
 
@@ -32,14 +27,12 @@ static void SetEnvironment(const char* name, const std::string& value) {
 #endif
 }
 
-template<typename TFunction>
-static bool ThrowsRuntimeError(TFunction function) {
-    try {
-        function();
-    } catch (const std::runtime_error&) {
-        return true;
-    }
-    return false;
+static void UnsetEnvironment(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
 }
 
 namespace {
@@ -47,6 +40,8 @@ namespace {
 constexpr std::uint32_t grain = 256;
 constexpr std::uint32_t frequency = 48000;
 constexpr std::uint16_t portTypeMain = 0;
+constexpr std::uint16_t portTypePadSpeaker = 0x3;
+constexpr std::uint16_t portTypePadVibration = 0x6;
 constexpr std::uint32_t attributeData = 0;
 constexpr std::uint32_t attributeVolume = 1;
 constexpr std::uint32_t formatFloat = 0;
@@ -56,6 +51,69 @@ constexpr float masterGain = 0.5f;
 constexpr float fold = 0.70710678f;
 constexpr float tolerance = 1e-5f;
 
+void TestUserAttributes() {
+    struct Output {
+        std::uint32_t before = 0x12345678u;
+        std::uint32_t value = 0xFFFFFFFFu;
+        std::uint32_t after = 0x87654321u;
+    } context, port;
+    auto* const invalidOutput = reinterpret_cast<AudioOut2UserHandle*>(0x10);
+    auto* const invalidAttribute = reinterpret_cast<std::uint32_t*>(0x10);
+    errno = 73;
+    Require(sceAudioOut2UserCreate(1, invalidOutput) == static_cast<int>(0x80260502));
+    Require(sceAudioOut2UserCreateEx(1, nullptr, invalidOutput) == static_cast<int>(0x80260502));
+    Require(errno == 73);
+    AudioOut2UserHandle first = 0;
+    AudioOut2UserHandle second = 0;
+    Require(sceAudioOut2UserCreate(1, &first) == 0 && first == 1);
+    Require(sceAudioOut2UserCreate(2, &second) == 0 && second != first);
+    Require(sceAudioOut2UserGetSupportedAttributes(first, &context.value, &port.value) == 0);
+    Require(context.value == 0 && port.value == ((1u << attributeData) | (1u << attributeVolume)));
+    Require(context.before == 0x12345678u && context.after == 0x87654321u);
+    Require(port.before == 0x12345678u && port.after == 0x87654321u);
+    context.value = port.value = 0xFFFFFFFFu;
+    errno = 73;
+    Require(sceAudioOut2UserGetSupportedAttributes(first, invalidAttribute, &port.value) == static_cast<int>(0x80268001));
+    Require(port.value == 0xFFFFFFFFu && errno == 73);
+    Require(sceAudioOut2UserGetSupportedAttributes(first, &context.value, invalidAttribute) == static_cast<int>(0x80268001));
+    Require(context.value == 0 && errno == 73);
+    const auto rejects = [&](AudioOut2UserHandle handle, bool nullContext, bool nullPort) {
+        context.value = port.value = 0xFFFFFFFFu;
+        bool threw = false;
+        try {
+            sceAudioOut2UserGetSupportedAttributes(handle, nullContext ? nullptr : &context.value, nullPort ? nullptr : &port.value);
+        } catch (const std::runtime_error& error) {
+            threw = std::string(error.what()).find("sceAudioOut2UserGetSupportedAttributes") != std::string::npos;
+        }
+        Require(threw && context.value == 0xFFFFFFFFu && port.value == 0xFFFFFFFFu);
+    };
+    context.value = port.value = 0xFFFFFFFFu;
+    Require(sceAudioOut2UserGetSupportedAttributes(first, nullptr, &port.value) == 0);
+    Require(context.value == 0xFFFFFFFFu && port.value == 3);
+    Require(sceAudioOut2UserGetSupportedAttributes(first, &context.value, nullptr) == 0 && context.value == 0);
+    context.value = port.value = 0xFFFFFFFFu;
+    Require(sceAudioOut2UserGetSupportedAttributes(first, nullptr, nullptr) == static_cast<int>(0x80268001));
+    for (const AudioOut2UserHandle handle : {AudioOut2UserHandle{0}, std::numeric_limits<AudioOut2UserHandle>::max()}) {
+        Require(sceAudioOut2UserGetSupportedAttributes(handle, &context.value, &port.value) == static_cast<int>(0x80268010));
+        Require(sceAudioOut2UserGetSupportedAttributes(handle, nullptr, nullptr) == static_cast<int>(0x80268010));
+        Require(context.value == 0xFFFFFFFFu && port.value == 0xFFFFFFFFu);
+    }
+    Require(sceAudioOut2UserDestroy(first) == 0);
+    rejects(first, false, false);
+    std::thread([&] {
+        Require(sceAudioOut2UserGetSupportedAttributes(second, &context.value, &port.value) == 0);
+    }).join();
+    Require(context.value == 0 && port.value == 3);
+    AudioOut2UserHandle next = 0;
+    Require(sceAudioOut2UserCreate(1, &next) == 0 && next != first && next != second);
+    rejects(first, false, false);
+    Require(sceAudioOut2UserGetSupportedAttributes(next, &context.value, &port.value) == 0);
+    Require(context.value == 0 && port.value == 3);
+    Require(sceAudioOut2UserDestroy(next) == 0 && sceAudioOut2UserDestroy(second) == 0);
+    Require(context.before == 0x12345678u && context.after == 0x87654321u);
+    Require(port.before == 0x12345678u && port.after == 0x87654321u);
+}
+
 struct Layout {
     std::uint32_t channels;
     std::vector<float> left;
@@ -64,7 +122,6 @@ struct Layout {
 
 const Layout mono{1, {1.0f}, {1.0f}};
 const Layout stereo{2, {1.0f, 0.0f}, {0.0f, 1.0f}};
-const Layout surround51{6, {1.0f, 0.0f, fold, 0.0f, fold, 0.0f}, {0.0f, 1.0f, fold, 0.0f, 0.0f, fold}};
 const Layout surround71{8, {1.0f, 0.0f, fold, 0.0f, fold, 0.0f, fold, 0.0f}, {0.0f, 1.0f, fold, 0.0f, 0.0f, fold, 0.0f, fold}};
 const Layout surround714{12, {1.0f, 0.0f, fold, 0.0f, fold, 0.0f, fold, 0.0f, fold, 0.0f, fold * fold, 0.0f},
     {0.0f, 1.0f, fold, 0.0f, 0.0f, fold, 0.0f, fold, 0.0f, fold, 0.0f, fold * fold}};
@@ -84,9 +141,9 @@ AudioOut2ContextHandle CreateContext() {
     return context;
 }
 
-int CreatePort(AudioOut2ContextHandle context, std::uint32_t format, AudioOut2PortHandle* port) {
+int CreatePort(AudioOut2ContextHandle context, std::uint32_t format, AudioOut2PortHandle* port, std::uint16_t type = portTypeMain) {
     AudioOut2PortParam params{};
-    params.port_type = portTypeMain;
+    params.port_type = type;
     params.data_format = format;
     params.sampling_freq = frequency;
     return sceAudioOut2PortCreate(context, &params, port);
@@ -102,20 +159,33 @@ void SetVolume(AudioOut2PortHandle port, const std::vector<float>& volume) {
     Require(sceAudioOut2PortSetAttributes(port, &attribute, 1) == 0);
 }
 
-std::vector<float> Play(std::uint32_t format, const void* data, const std::vector<float>& volume) {
-    const auto path = std::filesystem::temp_directory_path() / "anyps5_audio_out2_port_layouts.raw";
+struct PortData {
+    std::uint16_t type;
+    std::uint32_t format;
+    const void* data;
+    std::vector<float> volume;
+};
+
+template<typename TAfterCreate>
+std::vector<float> Play(const std::vector<PortData>& inputs, TAfterCreate afterCreate) {
+    const auto path = std::filesystem::temp_directory_path() / ("anyps5_audio_out2_port_layouts-" + std::to_string(std::random_device{}()) + ".raw");
     std::filesystem::remove(path);
     SetEnvironment("SDL_DISKAUDIOFILE", path.string());
 
     const auto context = CreateContext();
-    AudioOut2PortHandle port = 0;
-    Require(CreatePort(context, format, &port) == 0);
-    SetVolume(port, volume);
-    SetData(port, data);
+    afterCreate();
+    std::vector<AudioOut2PortHandle> ports;
+    for (const auto& input : inputs) {
+        AudioOut2PortHandle port = 0;
+        Require(CreatePort(context, input.format, &port, input.type) == 0);
+        SetVolume(port, input.volume);
+        SetData(port, input.data);
+        ports.push_back(port);
+    }
     Require(sceAudioOut2ContextPush(context, 1) == 0);
-    SetData(port, nullptr);
+    for (const auto port : ports) SetData(port, nullptr);
     for (std::uint32_t push = 0; push < silentGrains; push++) Require(sceAudioOut2ContextPush(context, 1) == 0);
-    Require(sceAudioOut2PortDestroy(port) == 0);
+    for (const auto port : ports) Require(sceAudioOut2PortDestroy(port) == 0);
     Require(sceAudioOut2ContextDestroy(context) == 0);
 
     std::ifstream file(path, std::ios::binary);
@@ -130,6 +200,14 @@ std::vector<float> Play(std::uint32_t format, const void* data, const std::vecto
     while (first < last && samples[first] == 0.0f) first++;
     while (last > first && samples[last - 1] == 0.0f) last--;
     return {samples + first, samples + last};
+}
+
+std::vector<float> Play(const std::vector<PortData>& inputs) {
+    return Play(inputs, [] {});
+}
+
+std::vector<float> Play(std::uint32_t format, const void* data, const std::vector<float>& volume) {
+    return Play({{portTypeMain, format, data, volume}});
 }
 
 float Sample(std::uint32_t channel, std::uint32_t frame) {
@@ -215,28 +293,113 @@ void TestDroppedLfe() {
     RequireFold(Play(Format(surround714.channels, formatFloat), data.data(), volume), surround714, expected, volume, 1.0f);
 }
 
-void TestRejectedLayouts() {
-    const auto context = CreateContext();
-    for (const std::uint32_t channels : {0u, 3u, 4u, 5u, 7u, 9u, 10u, 11u, 13u, 15u}) {
-        AudioOut2PortHandle port = 0;
-        Require(ThrowsRuntimeError([&] { CreatePort(context, Format(channels, formatFloat), &port); }));
-        Require(ThrowsRuntimeError([&] { CreatePort(context, Format(channels, formatS16), &port); }));
+void TestPadPortsWithoutPadDevice() {
+    const auto speaker = FloatGrain(mono.channels);
+    std::vector<float> vibration(static_cast<std::size_t>(grain) * stereo.channels, 0.75f);
+    const std::vector<float> unity{1.0f, 1.0f};
+    const auto played = Play({
+        {portTypePadVibration, Format(stereo.channels, formatFloat), vibration.data(), unity},
+        {portTypePadSpeaker, Format(mono.channels, formatFloat), speaker.data(), {1.0f}},
+    });
+    RequireFold(played, mono, speaker, {1.0f}, 1.0f);
+    Require(Play({{portTypePadVibration, Format(stereo.channels, formatFloat), vibration.data(), unity}}).empty());
+}
+
+void TestPadSpeakerFallbackOverride() {
+    const auto speaker = FloatGrain(mono.channels);
+    SetEnvironment(AUDIO_PAD_SPEAKER_FALLBACK_ENV, "-15");
+    const auto played = Play({{portTypePadSpeaker, Format(mono.channels, formatFloat), speaker.data(), {1.0f}}});
+    UnsetEnvironment(AUDIO_PAD_SPEAKER_FALLBACK_ENV);
+    RequireFold(played, mono, speaker, {1.0f}, 0.17782794f);
+}
+
+void TestPadSpeakerFallbackMute() {
+    const auto speaker = FloatGrain(mono.channels);
+    SetEnvironment(AUDIO_PAD_SPEAKER_FALLBACK_ENV, "mute");
+    const auto played = Play({{portTypePadSpeaker, Format(mono.channels, formatFloat), speaker.data(), {1.0f}}});
+    UnsetEnvironment(AUDIO_PAD_SPEAKER_FALLBACK_ENV);
+    Require(played.empty());
+}
+
+void TestPadSpeakerFallbackReadOnce() {
+    const auto speaker = FloatGrain(mono.channels);
+    SetEnvironment(AUDIO_PAD_SPEAKER_FALLBACK_ENV, "-15");
+    const auto played = Play({{portTypePadSpeaker, Format(mono.channels, formatFloat), speaker.data(), {1.0f}}}, [] {
+        SetEnvironment(AUDIO_PAD_SPEAKER_FALLBACK_ENV, "garbage");
+    });
+    UnsetEnvironment(AUDIO_PAD_SPEAKER_FALLBACK_ENV);
+    RequireFold(played, mono, speaker, {1.0f}, 0.17782794f);
+}
+
+void TestPadSpeakerFallbackInvalidStopsTheTitle() {
+    const auto speaker = FloatGrain(mono.channels);
+    SetEnvironment(AUDIO_PAD_SPEAKER_FALLBACK_ENV, "garbage");
+    std::string what;
+    bool thrown = false;
+    try {
+        Play({{portTypePadSpeaker, Format(mono.channels, formatFloat), speaker.data(), {1.0f}}});
+    } catch (const std::exception& error) {
+        thrown = true;
+        what = error.what();
     }
-    AudioOut2PortHandle port = 0;
-    Require(ThrowsRuntimeError([&] { CreatePort(context, Format(12, 2), &port); }));
-    Require(ThrowsRuntimeError([&] { CreatePort(context, Format(12, formatFloat) | 0x1000, &port); }));
-    Require(ThrowsRuntimeError([&] { CreatePort(context, Format(12, formatFloat) | 0x10000, &port); }));
-    Require(CreatePort(context, Format(12, formatFloat), &port) == 0);
-    Require(port != 0);
-    Require(sceAudioOut2PortDestroy(port) == 0);
+    UnsetEnvironment(AUDIO_PAD_SPEAKER_FALLBACK_ENV);
+    Require(thrown);
+    Require(what.find(AUDIO_PAD_SPEAKER_FALLBACK_ENV) != std::string::npos && what.find("garbage") != std::string::npos);
+}
+
+void TestMeasuredMainPortFormats() {
+    struct Case {
+        std::uint32_t format;
+        std::uint32_t result;
+    };
+    constexpr Case cases[] = {
+        {0x000, 0x8026800E}, {0x001, 0x8026800E}, {0x080, 0x80268001},
+        {0x100, 0}, {0x101, 0}, {0x102, 0x8026800E}, {0x17F, 0x8026800E},
+        {0x180, 0x80268001}, {0x181, 0x80268001}, {0x1FF, 0x80268001},
+        {0x200, 0}, {0x201, 0}, {0x202, 0x8026800E}, {0x27F, 0x8026800E},
+        {0x280, 0x80268001}, {0x281, 0x80268001}, {0x2FF, 0x80268001},
+        {0x300, 0x8026800E}, {0x301, 0x8026800E}, {0x380, 0x80268001},
+        {0x400, 0x8026800E}, {0x401, 0x8026800E}, {0x500, 0x8026800E},
+        {0x600, 0x8026800E}, {0x601, 0x8026800E}, {0x680, 0x80268001},
+        {0x700, 0x8026800E}, {0x701, 0x8026800E}, {0x780, 0x80268001},
+        {0x800, 0}, {0x801, 0}, {0x802, 0x8026800E}, {0x87F, 0x8026800E},
+        {0x880, 0}, {0x881, 0}, {0x882, 0x8026800E}, {0x8FF, 0x8026800E},
+        {0x900, 0x8026800E}, {0x901, 0x8026800E}, {0x980, 0x80268001},
+        {0xA00, 0x8026800E}, {0xB00, 0x8026800E}, {0xC00, 0}, {0xC01, 0},
+        {0xC02, 0x8026800E}, {0xC7F, 0x8026800E}, {0xC80, 0x80268001},
+        {0xC81, 0x80268001}, {0xD00, 0x8026800E}, {0xE00, 0x8026800E},
+        {0xF00, 0x8026800E}, {0xFFF, 0x80268001},
+        {0xFFFFF100, 0}, {0xFFFFF201, 0}, {0xFFFFF800, 0}, {0xFFFFFC01, 0},
+        {0xFFFFF600, 0x8026800E}, {0xFFFFF202, 0x8026800E}, {0xFFFFF280, 0x80268001},
+    };
+    const auto context = CreateContext();
+    for (const auto& test : cases) {
+        AudioOut2PortHandle port = 0xAAAAAAAAAAAAAAAAull;
+        Require(static_cast<std::uint32_t>(CreatePort(context, test.format, &port)) == test.result);
+        if (test.result == 0) {
+            Require(port != 0 && port != static_cast<AudioOut2PortHandle>(-1));
+            Require(sceAudioOut2PortDestroy(port) == 0);
+        } else {
+            Require(port == static_cast<AudioOut2PortHandle>(-1));
+        }
+    }
+    for (const std::uint32_t format : {0x100u, 0x201u, 0x800u, 0xC01u}) {
+        for (std::uint32_t bit = 12; bit < 32; bit++) {
+            AudioOut2PortHandle port = 0;
+            Require(CreatePort(context, format | (1u << bit), &port) == 0);
+            Require(sceAudioOut2PortDestroy(port) == 0);
+        }
+    }
     Require(sceAudioOut2ContextDestroy(context) == 0);
 }
 
 }
 
 int main() {
+    UnsetEnvironment(AUDIO_PAD_SPEAKER_FALLBACK_ENV);
+    TestUserAttributes();
     SetEnvironment("SDL_AUDIODRIVER", "disk");
-    for (const Layout* layout : {&mono, &stereo, &surround51, &surround71, &surround714}) {
+    for (const Layout* layout : {&mono, &stereo, &surround71, &surround714}) {
         TestFloatLayout(*layout);
         TestS16Layout(*layout);
     }
@@ -245,8 +408,18 @@ int main() {
         const auto volume = Volume(8);
         RequireFold(Play(Format(8, formatFloat) | 0x80, data.data(), volume), surround71, data, volume, 1.0f);
     }
+    {
+        const auto data = FloatGrain(2);
+        const auto volume = Volume(2);
+        RequireFold(Play(0xFFFFF200u, data.data(), volume), stereo, data, volume, 1.0f);
+    }
     TestHeightChannels();
     TestDroppedLfe();
-    TestRejectedLayouts();
+    TestPadPortsWithoutPadDevice();
+    TestPadSpeakerFallbackOverride();
+    TestPadSpeakerFallbackReadOnce();
+    TestPadSpeakerFallbackMute();
+    TestPadSpeakerFallbackInvalidStopsTheTitle();
+    TestMeasuredMainPortFormats();
     return 0;
 }

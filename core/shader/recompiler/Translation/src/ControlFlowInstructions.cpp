@@ -1,4 +1,3 @@
-#include "Translation/ControlFlowInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
 #include <array>
 #include <cstdint>
@@ -8,12 +7,40 @@
 
 namespace ShaderRecompiler {
 
-void TranslateControlFlowInstruction(IrBuilder& builder, const RdnaInstruction& instruction, const ControlFlowGraph& cfg) {
-    throw std::runtime_error("TranslateControlFlowInstruction not implemented");
-}
-
 void TranslationContext::sSubvectorLoop(const RdnaInstruction& inst, bool begin) {
-    throw std::runtime_error("GNM subvector loop instructions are not supported by this translator");
+    if (program.WaveSize() != 64u) {
+        throw std::runtime_error(std::string(begin ? "s_subvector_loop_begin" : "s_subvector_loop_end") + " in a wave" + std::to_string(program.WaveSize()) + " shader is not measured, only wave64 subvector loops are supported");
+    }
+    if (inst.destination.kind != RdnaOperandKind::ScalarRegister) {
+        throw std::runtime_error(std::string(begin ? "s_subvector_loop_begin" : "s_subvector_loop_end") + " with a destination that is not an SGPR is not measured");
+    }
+    const IrU32 execLo(ir.GetExecLo());
+    const IrU32 execHi(ir.GetExecHi());
+    const IrU32 counter = readRawU32(inst.destination);
+    const IrU32 zero(ir.Constant(0u));
+    IrU32 newExecLo = execLo;
+    IrU32 newExecHi = execHi;
+    IrU32 newCounter = counter;
+    if (begin) {
+        const IrU1 lowZero(ir.IEqual(execLo.Value(), zero.Value()));
+        const IrU1 execZero(ir.IEqual(ir.Emit(IrOpcode::BitwiseOr32, IrType::U32, {&execLo.Value(), &execHi.Value()}), zero.Value()));
+        const IrU32 entered(ir.Select(lowZero.Value(), execLo.Value(), execHi.Value()));
+        newCounter = IrU32(ir.Select(execZero.Value(), counter.Value(), entered.Value()));
+        newExecHi = IrU32(ir.Select(ir.LogicalOr(execZero.Value(), lowZero.Value()), execHi.Value(), zero.Value()));
+        instructionBranchCondition = execZero;
+    } else {
+        const IrU1 highSet(ir.INotEqual(execHi.Value(), zero.Value()));
+        const IrU1 counterZero(ir.IEqual(counter.Value(), zero.Value()));
+        const IrU1 stay(ir.LogicalOr(highSet.Value(), counterZero.Value()));
+        newExecLo = IrU32(ir.Select(highSet.Value(), counter.Value(), ir.Select(counterZero.Value(), execLo.Value(), zero.Value())));
+        newExecHi = IrU32(ir.Select(stay.Value(), execHi.Value(), counter.Value()));
+        newCounter = IrU32(ir.Select(stay.Value(), counter.Value(), execLo.Value()));
+        instructionBranchCondition = IrU1(ir.LogicalNot(stay.Value()));
+    }
+    writeRawU32(inst.destination, newCounter);
+    ir.SetExecLo(newExecLo.Value());
+    ir.SetExecHi(newExecHi.Value());
+    ir.SetExec(threadBit({newExecLo, newExecHi}).Value());
 }
 
 // s_*_saveexec reads its source before it writes the old exec into the destination, so
@@ -27,15 +54,24 @@ bool SaveexecWritesDestinationFirst() {
 
 void TranslationContext::sSaveexec(const RdnaInstruction& inst, IrOpcode operation, bool negateExec, bool negateSource, bool write64, bool negateResult, bool writeResult) {
     // Callers name the lane-wise operation; the exec mask words themselves combine bitwise.
+    const IrOpcode laneOperation = operation;
     if (operation == IrOpcode::LogicalAnd) operation = IrOpcode::BitwiseAnd32;
     else if (operation == IrOpcode::LogicalOr) operation = IrOpcode::BitwiseOr32;
     else if (operation == IrOpcode::LogicalXor) operation = IrOpcode::BitwiseXor32;
     const bool writeFirst = SaveexecWritesDestinationFirst() && !writeResult;
+    const bool execSource = sourceAt(inst, 0u).kind == RdnaOperandKind::ExecLo;
+    const bool pixel = program.Resources().stage == IrShaderStage::Pixel;
     if (write64) {
         const std::array<IrU32, 2> oldExec{IrU32(ir.GetExecLo()), IrU32(ir.GetExecHi())};
-        if (writeFirst) writeU32Pair(inst.destination, oldExec);
-        const std::array<IrU32, 2> source = readU32Pair(sourceAt(inst, 0u));
-        if (!writeFirst && !writeResult) writeU32Pair(inst.destination, oldExec);
+        const IrU1 oldLane(ir.GetExec());
+        const std::array<IrU32, 2> savedExec{hostExecWord(0u), hostExecWord(1u)};
+        const auto writeSaved = [&](const std::array<IrU32, 2>& words, IrU1 lane) {
+            writeU32Pair(inst.destination, words);
+            if (pixel) writeMaskLanes(inst.destination, lane, IrU1(ir.ConstantBool(true)));
+        };
+        if (writeFirst) writeSaved(savedExec, oldLane);
+        const std::array<IrU32, 2> source = execSource ? oldExec : readU32Pair(sourceAt(inst, 0u));
+        if (!writeFirst && !writeResult) writeSaved(savedExec, oldLane);
         IrValue& lowExecOperand = negateExec ? ir.BitwiseNot(oldExec[0].Value()) : oldExec[0].Value();
         IrValue& lowSourceOperand = negateSource ? ir.BitwiseNot(source[0].Value()) : source[0].Value();
         IrValue& highExecOperand = negateExec ? ir.BitwiseNot(oldExec[1].Value()) : oldExec[1].Value();
@@ -46,25 +82,44 @@ void TranslationContext::sSaveexec(const RdnaInstruction& inst, IrOpcode operati
         const IrU32 newExecHi(negateResult ? ir.BitwiseNot(highCombined) : highCombined);
         ir.SetExecLo(newExecLo.Value());
         ir.SetExecHi(newExecHi.Value());
-        if (writeResult) writeU32Pair(inst.destination, {newExecLo, newExecHi});
+        const IrU1 newLane = threadBit({newExecLo, newExecHi});
+        if (writeResult) writeSaved({hostExecWord(0u), hostExecWord(1u)}, newLane);
         const IrU1 nonZero(ir.LogicalOr(ir.INotEqual(newExecLo.Value(), ir.Constant(0u)), ir.INotEqual(newExecHi.Value(), ir.Constant(0u))));
         ir.SetScc(nonZero.Value());
-        ir.SetExec(threadBit({newExecLo, newExecHi}).Value());
+        ir.SetExec(newLane.Value());
         return;
     }
     const IrU32 oldExec(ir.GetExecLo());
-    if (writeFirst) writeRawU32(inst.destination, oldExec);
-    const IrU32 source = readU32(sourceAt(inst, 0u));
-    if (!writeFirst && !writeResult) writeRawU32(inst.destination, oldExec);
+    const IrU1 oldLane(ir.GetExec());
+    const IrU32 savedExec = hostExecWord(0u);
+    const bool lanes = program.WaveSize() == 32u && (execSource || maskLanesExact(sourceAt(inst, 0u)));
+    const auto writeSaved = [&](IrU32 word, IrU1 lane) {
+        writeRawU32(inst.destination, word);
+        if (pixel || (lanes && inst.destination.kind == RdnaOperandKind::ScalarRegister)) writeMaskLanes(inst.destination, lane, IrU1(ir.ConstantBool(true)));
+    };
+    if (writeFirst) writeSaved(savedExec, oldLane);
+    const IrU32 source = execSource ? oldExec : readU32(sourceAt(inst, 0u));
+    IrU1 sourceLane;
+    if (lanes) sourceLane = execSource ? oldLane : readMask(sourceAt(inst, 0u));
+    if (!writeFirst && !writeResult) writeSaved(savedExec, oldLane);
     IrValue& execOperand = negateExec ? ir.BitwiseNot(oldExec.Value()) : oldExec.Value();
     IrValue& sourceOperand = negateSource ? ir.BitwiseNot(source.Value()) : source.Value();
     IrValue& combined = ir.Emit(operation, IrType::U32, {&execOperand, &sourceOperand});
     const IrU32 newExec(negateResult ? ir.BitwiseNot(combined) : combined);
     ir.SetExecLo(newExec.Value());
-    if (writeResult) writeRawU32(inst.destination, newExec);
+    IrU1 newLane;
+    if (lanes) {
+        IrValue& execLane = negateExec ? ir.LogicalNot(oldLane.Value()) : oldLane.Value();
+        IrValue& sourceLaneOperand = negateSource ? ir.LogicalNot(sourceLane.Value()) : sourceLane.Value();
+        IrValue& combinedLane = ir.Emit(laneOperation, IrType::U1, {&execLane, &sourceLaneOperand});
+        newLane = IrU1(negateResult ? ir.LogicalNot(combinedLane) : combinedLane);
+    } else {
+        newLane = threadBit({newExec, IrU32(ir.GetExecHi())});
+    }
+    if (writeResult) writeSaved(hostExecWord(0u), newLane);
     const IrU1 nonZero(ir.INotEqual(newExec.Value(), ir.Constant(0u)));
     ir.SetScc(nonZero.Value());
-    ir.SetExec(threadBit({newExec, IrU32(ir.GetExecHi())}).Value());
+    ir.SetExec(newLane.Value());
 }
 
 void TranslationContext::addU32(const RdnaInstruction& inst, bool vector, bool useCarryIn) {
@@ -219,6 +274,19 @@ void TranslationContext::sGetpcB64(const RdnaInstruction& inst) {
     writeU32Pair(inst.destination, extractU64(pc));
 }
 
+void TranslationContext::sSwappcB64(const RdnaInstruction& inst) {
+    IrValue& base = ir.Emit(IrOpcode::GetShaderBase, IrType::U64, {});
+    const IrU64 link(ir.Emit(IrOpcode::IAdd64, IrType::U64, {&base, &ir.ConstantU64(static_cast<std::uint64_t>(currentProgramCounter) + 4u)}));
+    writeU32Pair(inst.destination, extractU64(link));
+}
+
+void TranslationContext::TranslateUnlinkedCall(const RdnaInstruction& inst) {
+    const std::array<IrU32, 2> target = readU32Pair(inst.source0);
+    (void)ir.Emit(IrOpcode::UnlinkedCall, IrType::Void, {&target[0].Value(), &target[1].Value(), &ir.Constant(inst.programCounter)});
+    program.Info().usesFaultBuffer = true;
+    sSwappcB64(inst);
+}
+
 void TranslationContext::sCselectB32(const RdnaInstruction& inst) {
     const IrU32 trueValue = readU32(sourceAt(inst, 0u));
     const IrU32 falseValue = readU32(sourceAt(inst, 1u));
@@ -235,6 +303,21 @@ void TranslationContext::scalarSelect64(const RdnaInstruction& inst, const RdnaO
     writeU32Pair(inst.destination, {low, high});
 }
 
+void TranslationContext::scalarSelectMask64(const RdnaInstruction& inst) {
+    if (inst.destination.kind != RdnaOperandKind::ScalarRegister) {
+        scalarSelect64(inst, sourceAt(inst, 1u));
+        return;
+    }
+    const RdnaOperand& trueSource = sourceAt(inst, 0u);
+    const RdnaOperand& falseSource = sourceAt(inst, 1u);
+    IrValue& valid = ir.LogicalAnd(readMaskValid(trueSource).Value(), readMaskValid(falseSource).Value());
+    IrValue& bit = ir.Emit(IrOpcode::SelectU1, IrType::U1, {&ir.GetScc(), &readMask(trueSource).Value(), &readMask(falseSource).Value()});
+    scalarSelect64(inst, falseSource);
+    const auto dst = static_cast<ScalarReg>(inst.destination.reg);
+    ir.SetThreadBitScalarReg(dst, bit);
+    ir.SetScalarMaskTag(dst, valid);
+}
+
 void TranslationContext::movB32(const RdnaInstruction& inst, bool applyFloatModifiers) {
     if (applyFloatModifiers) {
         IrF32 value(*readOperand(sourceAt(inst, 0u), IrType::F32));
@@ -247,8 +330,16 @@ void TranslationContext::movB32(const RdnaInstruction& inst, bool applyFloatModi
 }
 
 void TranslationContext::sMovB64(const RdnaInstruction& inst) {
-    const std::array<IrU32, 2> value = readU32Pair(sourceAt(inst, 0u));
+    const RdnaOperand& source = sourceAt(inst, 0u);
+    const std::array<IrU32, 2> value = readU32Pair(source);
+    if (program.Resources().stage != IrShaderStage::Pixel || !maskLanesExact(source)) {
+        writeU32Pair(inst.destination, value);
+        return;
+    }
+    const IrU1 lane = readMask(source);
+    const IrU1 valid = readMaskValid(source);
     writeU32Pair(inst.destination, value);
+    writeMaskLanes(inst.destination, lane, valid);
 }
 
 void TranslationContext::sWqm(const RdnaInstruction& inst, bool wide) {
@@ -269,31 +360,73 @@ void TranslationContext::sWqm(const RdnaInstruction& inst, bool wide) {
     ir.SetScc(ir.INotEqual(low.Value(), ir.Constant(0u)));
 }
 
-// M0 holds a uniform register offset. Vector registers are SSA values with fixed indices, so an indexed
-// access becomes a select over every register the program references at or past the base.
+struct RelativeWindowAccess {
+    IrValue* index = nullptr;
+    IrValue* inRange = nullptr;
+};
+
+RelativeWindowAccess relativeWindowAccess(IrBuilder& ir, const IrProgram& program, std::uint32_t reg, IrValue& offset, const char* name, std::uint32_t vectorLimit) {
+    const auto& metadata = program.Metadata();
+    if (metadata.vectorWindowSize == 0u) {
+        if (reg >= vectorLimit) throw std::runtime_error(std::string(name) + " addresses a register outside the relative-addressing span");
+        return {nullptr, &ir.ULessThan(offset, ir.Constant(vectorLimit - reg))};
+    }
+    if (metadata.vectorWindowSize == 0u || reg < metadata.vectorWindowBase) throw std::runtime_error(std::string(name) + " addresses a register outside the relative-addressing window");
+    const auto first = reg - metadata.vectorWindowBase;
+    IrValue& index = ir.Emit(IrOpcode::UMin32, IrType::U32, {&ir.IAdd(ir.Constant(first), offset), &ir.Constant(metadata.vectorWindowSize - 1u)});
+    return {&index, &ir.ULessThan(offset, ir.Constant(metadata.vectorWindowSize - first))};
+}
+
 IrU32 TranslationContext::readRelativeVector(const RdnaOperand& base, IrValue& offset, const char* name) {
     if (base.kind != RdnaOperandKind::VectorRegister) {
         throw std::runtime_error(std::string(name) + " source is not a vector register");
     }
-    IrU32 result(ir.GetVectorReg(static_cast<VectorReg>(base.reg)));
-    for (std::uint32_t reg = base.reg + 1u; reg < currentVectorLimit; ++reg) {
-        IrValue& hit = ir.IEqual(offset, ir.Constant(reg - base.reg));
-        result = IrU32(ir.Select(hit, ir.GetVectorReg(static_cast<VectorReg>(reg)), result.Value()));
+    const auto access = relativeWindowAccess(ir, program, base.reg, offset, name, currentVectorLimit);
+    relativeVectorRead = true;
+    if (access.index == nullptr) {
+        IrU32 result(ir.GetVectorReg(static_cast<VectorReg>(0)));
+        for (std::uint32_t reg = base.reg; reg < currentVectorLimit; ++reg) {
+            IrValue& hit = ir.IEqual(offset, ir.Constant(reg - base.reg));
+            result = IrU32(ir.Select(hit, ir.GetVectorReg(static_cast<VectorReg>(reg)), result.Value()));
+        }
+        return applyBitSourceModifiers(base, result);
     }
-    return applyBitSourceModifiers(base, result);
+    IrValue& loaded = ir.Emit(IrOpcode::LoadVectorWindow, IrType::U32, {access.index});
+    return applyBitSourceModifiers(base, IrU32(ir.Select(*access.inRange, loaded, ir.GetVectorReg(static_cast<VectorReg>(0)))));
 }
 
-void TranslationContext::writeRelativeVector(const RdnaOperand& base, IrValue& offset, IrU32 value, const char* name) {
+void TranslationContext::writeRelativeVector(const RdnaOperand& base, IrValue& offset, IrU32 value, const char* name, IrValue* enable) {
+    if (sharedVectorCount != 0u) throw std::runtime_error(std::string(name) + " in a program with wave-shared VGPRs is not modeled");
     const RdnaOperand& destination = base;
     if (destination.kind != RdnaOperandKind::VectorRegister) {
         throw std::runtime_error(std::string(name) + " destination is not a vector register");
     }
-    for (std::uint32_t reg = destination.reg; reg < currentVectorLimit; ++reg) {
-        RdnaOperand target = destination;
-        target.reg = reg;
-        IrValue& hit = ir.IEqual(offset, ir.Constant(reg - destination.reg));
-        writeRawU32(target, IrU32(ir.Select(hit, value.Value(), ir.GetVectorReg(static_cast<VectorReg>(reg)))));
+    const auto access = relativeWindowAccess(ir, program, destination.reg, offset, name, currentVectorLimit);
+    if (access.index == nullptr) {
+        for (std::uint32_t reg = destination.reg; reg < currentVectorLimit; ++reg) {
+            IrValue& previous = ir.GetVectorReg(static_cast<VectorReg>(reg));
+            IrValue* merged = nullptr;
+            if (destination.dpp) {
+                const DppMoveFlags flags{destination.dpp8 ? DppMoveFlags::Lanes8 | destination.dppCtrl : destination.dppCtrl, static_cast<std::uint8_t>(destination.dppRowMask), static_cast<std::uint8_t>(destination.dppBankMask), destination.dppFetchInactive, destination.dppBoundCtrl};
+                merged = &ir.Emit(IrOpcode::DppUpdateU32, IrType::U32, {&value.Value(), &previous, &ir.GetExec()}, flags);
+            } else merged = &ir.Select(ir.GetExec(), value.Value(), previous);
+            IrValue* written = &ir.IEqual(offset, ir.Constant(reg - destination.reg));
+            if (enable != nullptr) written = &ir.LogicalAnd(*written, *enable);
+            ir.SetVectorReg(static_cast<VectorReg>(reg), ir.Select(*written, *merged, previous));
+        }
+        return;
     }
+    IrValue& previous = ir.Emit(IrOpcode::LoadVectorWindow, IrType::U32, {access.index});
+    IrValue* merged = nullptr;
+    if (destination.dpp) {
+        const DppMoveFlags flags{destination.dpp8 ? DppMoveFlags::Lanes8 | destination.dppCtrl : destination.dppCtrl, static_cast<std::uint8_t>(destination.dppRowMask), static_cast<std::uint8_t>(destination.dppBankMask), destination.dppFetchInactive, destination.dppBoundCtrl};
+        merged = &ir.Emit(IrOpcode::DppUpdateU32, IrType::U32, {&value.Value(), &previous, &ir.GetExec()}, flags);
+    } else {
+        merged = &ir.Select(ir.GetExec(), value.Value(), previous);
+    }
+    IrValue* written = access.inRange;
+    if (enable != nullptr) written = &ir.LogicalAnd(*written, *enable);
+    (void)ir.Emit(IrOpcode::StoreVectorWindow, IrType::Void, {access.index, &ir.Select(*written, *merged, previous)});
 }
 
 void TranslationContext::vMovrelsB32(const RdnaInstruction& inst) {
@@ -316,8 +449,9 @@ void TranslationContext::vMovrelsdB32(const RdnaInstruction& inst, bool split, b
         return;
     }
     const IrU32 previous = readRelativeVector(plainOperand(inst.destination), destinationOffset, name);
-    writeRelativeVector(inst.destination, destinationOffset, value, name);
-    writeRelativeVector(sourceAt(inst, 0u), sourceOffset, previous, name);
+    IrValue& bothInRange = ir.LogicalAnd(*relativeWindowAccess(ir, program, sourceAt(inst, 0u).reg, sourceOffset, name, currentVectorLimit).inRange, *relativeWindowAccess(ir, program, inst.destination.reg, destinationOffset, name, currentVectorLimit).inRange);
+    writeRelativeVector(inst.destination, destinationOffset, value, name, &bothInRange);
+    writeRelativeVector(sourceAt(inst, 0u), sourceOffset, previous, name, &bothInRange);
 }
 
 void TranslationContext::vSwapB32(const RdnaInstruction& inst) {
@@ -347,6 +481,7 @@ void TranslationContext::vReadlaneB32(const RdnaInstruction& inst) {
 void TranslationContext::vWritelaneB32(const RdnaInstruction& inst) {
     const IrU32 value = readU32(sourceAt(inst, 0u));
     const IrU32 lane = readU32(sourceAt(inst, 1u));
+    if (sharedVectorRegister(inst.destination.reg)) throw std::runtime_error("v_writelane_b32 to wave-shared VGPR v" + std::to_string(inst.destination.reg) + " is not modeled");
     const IrU32 previous = readRawU32(plainOperand(inst.destination));
     const IrU32 result(ir.Emit(IrOpcode::WriteLane, IrType::U32, {&value.Value(), &lane.Value(), &previous.Value()}));
     ir.SetVectorReg(static_cast<VectorReg>(inst.destination.reg), result.Value());
@@ -360,10 +495,6 @@ void TranslationContext::vPermlane16B32(const RdnaInstruction& inst, bool x16) {
     const PermlaneFlags flags{x16, inst.destination.opSel, inst.destination.opSelHi};
     const IrU32 result(ir.Emit(IrOpcode::Permlane16U32, IrType::U32, {&value.Value(), &selectLow.Value(), &selectHigh.Value(), &ir.GetExec(), &previous.Value()}, flags));
     writeRawU32(inst.destination, result);
-}
-
-void TranslateControlFlowInstruction(TranslationContext& context, const RdnaInstruction& instruction) {
-    throw std::runtime_error("TranslateControlFlowInstruction not implemented");
 }
 
 }

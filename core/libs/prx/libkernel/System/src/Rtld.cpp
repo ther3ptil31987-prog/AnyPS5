@@ -1,3 +1,4 @@
+#include "prx/libkernel/include/Api.hpp"
 #include <cstdint>
 #include <cstddef>
 #include <array>
@@ -10,11 +11,21 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/Pthread/include/ThreadLifecycle.hpp"
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#ifdef __APPLE__
+#include <mach-o/loader.h>
+#else
 #include <link.h>
+#endif
+#endif
+
+#ifdef _WIN32
+extern "C" void ForgetUnloadedUnwindImages_nid_no_patch();
 #endif
 
 namespace {
@@ -29,15 +40,22 @@ const void* imageContaining(const void* address, bool reference, void*& handle, 
 #ifdef _WIN32
     const DWORD flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | (reference ? 0 : GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT);
     HMODULE module = nullptr;
-    if (!GetModuleHandleExW(flags, reinterpret_cast<LPCWSTR>(address), &module))
-        throw std::runtime_error(std::string(caller) + ": address outside every loaded image");
+    if (!GetModuleHandleExW(flags, reinterpret_cast<LPCWSTR>(address), &module)) return nullptr;
     if (reference) handle = module;
     return module;
+#elif defined(__APPLE__)
+    Dl_info info{};
+    if (!dladdr(address, &info) || !info.dli_fbase) return nullptr;
+    const auto* header = static_cast<const mach_header_64*>(info.dli_fbase);
+    if (reference && header->filetype != MH_EXECUTE && info.dli_fname && *info.dli_fname) {
+        handle = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+        if (!handle) throw std::runtime_error(std::string(caller) + ": cannot reference " + info.dli_fname);
+    }
+    return info.dli_fbase;
 #else
     Dl_info info{};
     link_map* image = nullptr;
-    if (!dladdr1(address, &info, reinterpret_cast<void**>(&image), RTLD_DL_LINKMAP) || !image)
-        throw std::runtime_error(std::string(caller) + ": address outside every loaded image");
+    if (!dladdr1(address, &info, reinterpret_cast<void**>(&image), RTLD_DL_LINKMAP) || !image) return nullptr;
     if (reference && image->l_name && *image->l_name) {
         handle = dlopen(image->l_name, RTLD_LAZY | RTLD_NOLOAD);
         if (!handle) throw std::runtime_error(std::string(caller) + ": cannot reference " + image->l_name);
@@ -49,6 +67,7 @@ const void* imageContaining(const void* address, bool reference, void*& handle, 
 int referenceThreadAtexitImage(const void* address, const char* caller) {
     void* handle = nullptr;
     const void* image = imageContaining(address, true, handle, caller);
+    if (!image) return -1;
     std::lock_guard lock(threadAtexitMutex);
     threadAtexitReferences.emplace(image, handle);
     return 0;
@@ -57,17 +76,19 @@ int referenceThreadAtexitImage(const void* address, const char* caller) {
 int releaseThreadAtexitImage(const void* address, const char* caller) {
     void* handle = nullptr;
     const void* image = imageContaining(address, false, handle, caller);
+    if (!image) return 0;
     {
         std::lock_guard lock(threadAtexitMutex);
         const auto found = threadAtexitReferences.find(image);
-        if (found == threadAtexitReferences.end())
-            throw std::runtime_error(std::string(caller) + ": image holds no thread atexit reference");
+        if (found == threadAtexitReferences.end()) return 0;
         handle = found->second;
         threadAtexitReferences.erase(found);
     }
     if (!handle) return 0;
 #ifdef _WIN32
-    if (!FreeLibrary(static_cast<HMODULE>(handle)))
+    const bool released = FreeLibrary(static_cast<HMODULE>(handle));
+    ForgetUnloadedUnwindImages_nid_no_patch();
+    if (!released)
 #else
     if (dlclose(handle) != 0)
 #endif

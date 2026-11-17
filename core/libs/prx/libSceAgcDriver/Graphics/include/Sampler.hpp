@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestSamplerResource.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <array>
 #include <cstdint>
 #include <map>
@@ -19,15 +20,26 @@ public:
     Sampler(const Sampler&) = delete;
     Sampler& operator=(const Sampler&) = delete;
 
+    bool ForcesDegamma() const;
+    bool DisablesDegamma() const;
     VkSampler Handle() const;
     bool RequiresFilterMinmax() const;
+    bool ReadsOpaqueBlackBorder() const;
+    bool RequiresNonSeamlessCube() const;
+    static void Validate(const Context& context, const GuestSamplerResource& descriptor);
+    static bool ShaderAppliesLodBias(const GuestSamplerResource& descriptor);
+    static bool ReadsOpaqueBlackBorder(const GuestSamplerResource& descriptor);
 
 private:
     void release() noexcept;
 
     Context context;
+    bool forcesDegamma = false;
+    bool disablesDegamma = false;
     VkSampler sampler = VK_NULL_HANDLE;
     bool requiresFilterMinmax = false;
+    bool opaqueBlackBorder = false;
+    bool requiresNonSeamlessCube = false;
 };
 
 // One VkSampler per distinct S# (its 4 words plus the shader's depth-compare use and the
@@ -41,7 +53,7 @@ public:
     explicit SamplerCache(std::size_t capacity = 1024);
     SamplerCache(const SamplerCache&) = delete;
     SamplerCache& operator=(const SamplerCache&) = delete;
-    std::shared_ptr<Sampler> Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable, bool unnormalizedProven = false);
+    std::shared_ptr<Sampler> Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable, bool unnormalizedProven = false, bool forceDegammaPaired = false, bool integerBorder = false);
     // APS5_PROFILE_DRAW counters: lookups served by an existing sampler, and samplers created.
     std::uint64_t Hits() const { return hits; }
     std::uint64_t Misses() const { return misses; }
@@ -51,7 +63,7 @@ private:
         std::shared_ptr<Sampler> sampler;
         std::uint64_t lastUse;
     };
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     std::map<std::array<std::uint32_t, 5>, Entry> entries;
     std::uint64_t clock = 0;
     std::size_t capacity;
@@ -59,7 +71,11 @@ private:
     std::uint64_t misses = 0;
 };
 
-void RequireFilterMinmax(const Context& context, VkFormat format, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
+void RequireFilterMinmax(const Context& context, VkFormat format, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
+bool ForcesDegammaOn(std::uint32_t guestFormat, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
+void RequireBorderSwizzle(std::uint32_t bcSwizzle, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
+void RequireNonSeamlessCube(bool cube, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
+void RequireDisablesDegammaOn(std::uint32_t guestFormat, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers);
 
 }
 

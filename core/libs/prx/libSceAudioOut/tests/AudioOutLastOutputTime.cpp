@@ -1,21 +1,16 @@
+#include "prx/libkernel/Time/include/Time.hpp"
+#include "prx/libSceAudioOut/include/AudioOut.hpp"
 #include "SceTypes.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 
+#include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
 #include <vector>
-
-extern "C" {
-int APS5_VABI sceAudioOutOpen(int, int, int, std::uint32_t, std::uint32_t, std::uint32_t);
-int APS5_VABI sceAudioOutClose(int);
-int APS5_VABI sceAudioOutOutput(int, const void*);
-int APS5_VABI sceAudioOutOutputs(AudioOutOutputParam*, std::uint32_t);
-int APS5_VABI sceAudioOutGetLastOutputTime(int, std::uint64_t*);
-std::uint64_t APS5_VABI sceKernelGetProcessTime();
-}
 
 static void Require(bool value, const char* message) {
     if (value) return;
@@ -122,6 +117,21 @@ void TestReopenedPort() {
     Require(sceAudioOutClose(reopened) == 0, "port must close");
 }
 
+void TestPortWithoutDeviceKeepsRealTime() {
+    const std::vector<std::int16_t> block(frames, 256);
+    const int handle = Open(portTypeVibration);
+    const std::uint64_t blockUs = 1000000ull * frames / frequency;
+    const std::uint64_t start = sceKernelGetProcessTime();
+    for (int i = 0; i < 7; i++) Require(sceAudioOutOutput(handle, block.data()) == static_cast<int>(frames), "output must accept the block");
+    Require(sceKernelGetProcessTime() - start < 3 * blockUs, "a port without a device must take blocks up to its latency without waiting");
+    for (int i = 7; i < 60; i++) Require(sceAudioOutOutput(handle, block.data()) == static_cast<int>(frames), "output must accept the block");
+    const std::uint64_t elapsed = sceKernelGetProcessTime() - start;
+    Require(elapsed + 50000 >= 60 * blockUs && elapsed < 60 * blockUs + 200000, "a port without a device must consume blocks in real time");
+    Require(sceAudioOutOutput(handle, nullptr) == static_cast<int>(frames), "waiting for the output must succeed");
+    Require(sceKernelGetProcessTime() - start + 2000 >= 60 * blockUs, "waiting on a port without a device must last until its queue has played");
+    Require(sceAudioOutClose(handle) == 0, "port must close");
+}
+
 void TestErrors() {
     const std::vector<std::int16_t> block(frames, 256);
     const int handle = Open(portTypeMain);
@@ -134,9 +144,77 @@ void TestErrors() {
     Require(sceAudioOutGetLastOutputTime(-1, &destination) == invalidPort, "a negative handle must be rejected");
     Require(sceAudioOutGetLastOutputTime(handle + 1, &destination) == invalidPort, "a port that is not open must be rejected");
     Require(sceAudioOutGetLastOutputTime(1000, &destination) == invalidPort, "an out of range handle must be rejected");
+    Require(sceAudioOutGetLastOutputTime(INT_MIN, &destination) == invalidPort, "the lowest handle must be rejected");
+    Require(sceAudioOutGetLastOutputTime(INT_MAX, &destination) == invalidPort, "the highest handle must be rejected");
     Require(sceAudioOutClose(handle) == 0, "port must close");
     Require(sceAudioOutGetLastOutputTime(handle, &destination) == invalidPort, "a closed port must be rejected");
     Require(destination == untouched, "a rejected call must not write the destination");
+}
+
+void TestIndependentPortOutputDuringWait(bool batch) {
+    const std::vector<std::int16_t> longBlock(frequency, 256);
+    const std::vector<std::int16_t> shortBlock(frames, 256);
+    const int waiting = sceAudioOutOpen(user, portTypeVibration, 0, frequency, frequency, formatS16Mono);
+    const int independent = Open(portTypeVibration);
+    Require(waiting > 0, "waiting port must open");
+    Require(sceAudioOutOutput(waiting, longBlock.data()) == static_cast<int>(frequency), "initial output failed");
+    std::atomic<bool> started = false;
+    std::thread output([&] {
+        started = true;
+        AudioOutOutputParam param{waiting, longBlock.data()};
+        const int result = batch ? sceAudioOutOutputs(&param, 1) : sceAudioOutOutput(waiting, longBlock.data());
+        Require(result == static_cast<int>(frequency), "paced output failed");
+    });
+    while (!started) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto before = std::chrono::steady_clock::now();
+    Require(sceAudioOutOutput(independent, shortBlock.data()) == static_cast<int>(frames), "independent output failed");
+    const auto elapsed = std::chrono::steady_clock::now() - before;
+    output.join();
+    Require(sceAudioOutClose(waiting) == 0 && sceAudioOutClose(independent) == 0, "ports must close");
+    std::fprintf(stderr, "Independent port output waited %lld ms\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()));
+    Require(elapsed < std::chrono::milliseconds(100), "pacing one audio port must not block output on another port");
+}
+
+void TestOverlappingOutputBatches() {
+    const std::vector<std::int16_t> block(frames, 256);
+    const int first = Open(portTypeVibration);
+    const int second = Open(portTypeVibration);
+    AudioOutOutputParam duplicate[2] = {{first, block.data()}, {first, block.data()}};
+    Require(sceAudioOutOutputs(duplicate, 2) == static_cast<int>(frames), "duplicate handles in a batch must not deadlock");
+    const auto output = [&](bool reverse) {
+        AudioOutOutputParam params[2] = {{reverse ? second : first, block.data()}, {reverse ? first : second, block.data()}};
+        for (int i = 0; i < 12; ++i) Require(sceAudioOutOutputs(params, 2) == static_cast<int>(frames), "overlapping output batch failed");
+    };
+    std::thread forward(output, false);
+    std::thread reverse(output, true);
+    forward.join();
+    reverse.join();
+    Require(sceAudioOutClose(first) == 0 && sceAudioOutClose(second) == 0, "batch ports must close");
+}
+
+void TestQueriesDuringOutput(bool batch, bool drain) {
+    const std::vector<std::int16_t> block(frequency, 256);
+    const int handle = sceAudioOutOpen(user, portTypeVibration, 0, frequency, frequency, formatS16Mono);
+    Require(handle > 0, "port must open");
+    Require(sceAudioOutOutput(handle, block.data()) == static_cast<int>(frequency), "output must accept the block");
+    const auto initialTime = LastOutputTime(handle);
+    std::atomic<bool> started = false;
+    std::thread output([&] {
+        AudioOutOutputParam param{handle, drain ? nullptr : block.data()};
+        started = true;
+        const int result = batch ? sceAudioOutOutputs(&param, 1) : sceAudioOutOutput(handle, param.ptr);
+        Require(result == static_cast<int>(frequency), "pending output must complete before close");
+    });
+    while (!started) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto before = std::chrono::steady_clock::now();
+    AudioOutPortState state{};
+    Require(sceAudioOutGetPortState(handle, &state) == 0, "pending output must allow port state queries");
+    Require(LastOutputTime(handle) == initialTime, "pending output must not change its timestamp yet");
+    Require(std::chrono::steady_clock::now() - before < std::chrono::milliseconds(300), "audio queries must not wait for output pacing or draining");
+    Require(sceAudioOutClose(handle) == 0, "close must safely wait for pending output");
+    output.join();
 }
 
 }
@@ -148,11 +226,20 @@ int main() {
     setenv("SDL_AUDIODRIVER", "dummy", 1);
 #endif
     sceKernelGetProcessTime();
+
     TestOutput(portTypeMain);
     TestOutput(portTypeVibration);
     TestPortsAreIndependent();
     TestOutputs();
     TestReopenedPort();
     TestErrors();
+    TestPortWithoutDeviceKeepsRealTime();
+    TestIndependentPortOutputDuringWait(false);
+    TestIndependentPortOutputDuringWait(true);
+    TestOverlappingOutputBatches();
+    TestQueriesDuringOutput(false, false);
+    TestQueriesDuringOutput(false, true);
+    TestQueriesDuringOutput(true, false);
+    TestQueriesDuringOutput(true, true);
     return 0;
 }

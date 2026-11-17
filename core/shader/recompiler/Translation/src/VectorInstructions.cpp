@@ -1,12 +1,8 @@
-#include "Translation/VectorInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
+#include "Recompiler.hpp"
 #include <stdexcept>
 
 namespace ShaderRecompiler {
-
-void TranslateVectorInstruction(IrBuilder& builder, const RdnaInstruction& instruction) {
-    throw std::runtime_error("TranslateVectorInstruction not implemented");
-}
 
 namespace {
 
@@ -14,10 +10,185 @@ bool roundsProductSeparately(const RdnaInstruction& inst) {
     if (inst.op == RdnaOpcode::VMadF32) {
         return true;
     }
+    if (inst.family == RdnaInstructionFamily::VOP3P) {
+        return false;
+    }
     const std::uint32_t vop2 = inst.family == RdnaInstructionFamily::VOP3 ? inst.opcodeId - 0x100u : inst.opcodeId;
     return vop2 == 0x1fu || vop2 == 0x20u || vop2 == 0x21u;
 }
 
+}
+
+bool TranslationContext::flushesInHardware(const RdnaInstruction& inst) const {
+    const std::uint32_t declaredRound = floatMode.has_value() ? floatMode->floatMode & 3u : 0u;
+    if (declaredRound != 0u || (rounding.value & 3u) != 0u || (rounding.unknown & 3u) != 0u || inst.family == RdnaInstructionFamily::VOP3P) return false;
+    switch (inst.op) {
+    case RdnaOpcode::VAddF32:
+    case RdnaOpcode::VSubF32:
+    case RdnaOpcode::VSubrevF32:
+    case RdnaOpcode::VMulF32: return true;
+    case RdnaOpcode::VFloorF32:
+    case RdnaOpcode::VCeilF32: return float32FlushDeclared;
+    case RdnaOpcode::VFmaF32:
+    case RdnaOpcode::VMacF32:
+    case RdnaOpcode::VMadmkF32:
+    case RdnaOpcode::VMadakF32: return !roundsProductSeparately(inst);
+    default: return false;
+    }
+}
+
+std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& inst) const {
+    std::uint32_t flush = 0u;
+    switch (inst.op) {
+    case RdnaOpcode::VAddF32:
+    case RdnaOpcode::VSubF32:
+    case RdnaOpcode::VSubrevF32:
+    case RdnaOpcode::VMulF32:
+    case RdnaOpcode::VMulLegacyF32:
+        if (floatMode.has_value() && (floatMode->floatMode & 3u) == 0u) {
+            const std::uint32_t denormals = (floatMode->floatMode >> 4u) & 3u;
+            if (denormals == 1u || denormals == 2u) {
+                if (!float32DenormPreserve || float32FlushToZero) {
+                    throw std::runtime_error("f32 denormal mode " + std::to_string(denormals) + " at pc " + std::to_string(inst.programCounter) + " needs DenormPreserve 32, which the device does not offer for this shader");
+                }
+                return denormals == 1u ? 2u : 1u;
+            }
+        }
+        flush = 3u;
+        break;
+    case RdnaOpcode::VMullitF32:
+        flush = 3u;
+        break;
+    case RdnaOpcode::VDivFmasF32:
+        return floatMode.has_value() && ((floatMode->floatMode >> 4u) & 2u) != 0u ? 0u : 2u;
+    case RdnaOpcode::VMinF32:
+    case RdnaOpcode::VMaxF32:
+    case RdnaOpcode::VMin3F32:
+    case RdnaOpcode::VMax3F32:
+    case RdnaOpcode::VMed3F32:
+        if (!floatMode.has_value() || ((floatMode->floatMode >> 4u) & 1u) == 0u) return 3u;
+        if (((floatMode->floatMode >> 4u) & 3u) == 1u && (!float32DenormPreserve || float32FlushToZero)) {
+            throw std::runtime_error("f32 denormal mode 1 at pc " + std::to_string(inst.programCounter) + " needs DenormPreserve 32, which the device does not offer for this shader");
+        }
+        return 0u;
+    case RdnaOpcode::VFractF32:
+    case RdnaOpcode::VFloorF32:
+    case RdnaOpcode::VCeilF32:
+    case RdnaOpcode::VFrexpMantF32:
+        if (floatMode.has_value() && ((floatMode->floatMode >> 4u) & 3u) == 2u) return 1u;
+        if (floatMode.has_value() && ((floatMode->floatMode >> 4u) & 3u) == 1u) {
+            if (inst.op == RdnaOpcode::VFrexpMantF32) return 0u;
+            if (!float32DenormPreserve || float32FlushToZero) {
+                throw std::runtime_error("f32 denormal mode 1 at pc " + std::to_string(inst.programCounter) + " needs DenormPreserve 32, which the device does not offer for this shader");
+            }
+            return 2u;
+        }
+        flush = 3u;
+        break;
+    case RdnaOpcode::VSinF32:
+    case RdnaOpcode::VCosF32:
+        flush = 3u;
+        break;
+    case RdnaOpcode::VMacF32:
+    case RdnaOpcode::VMadmkF32:
+    case RdnaOpcode::VMadakF32:
+    case RdnaOpcode::VFmaF32:
+        if (roundsProductSeparately(inst)) break;
+        if (floatMode.has_value() && (floatMode->floatMode & 3u) == 0u) {
+            const std::uint32_t denormals = (floatMode->floatMode >> 4u) & 3u;
+            if (denormals == 1u || denormals == 2u) {
+                if (!float32DenormPreserve || float32FlushToZero) {
+                    throw std::runtime_error("f32 denormal mode " + std::to_string(denormals) + " at pc " + std::to_string(inst.programCounter) + " needs DenormPreserve 32, which the device does not offer for this shader");
+                }
+                return denormals == 1u ? 2u : 1u;
+            }
+        }
+        flush = 3u;
+        break;
+    case RdnaOpcode::VCmpEqF32:
+    case RdnaOpcode::VCmpGeF32:
+    case RdnaOpcode::VCmpGtF32:
+    case RdnaOpcode::VCmpLeF32:
+    case RdnaOpcode::VCmpLgF32:
+    case RdnaOpcode::VCmpLtF32:
+    case RdnaOpcode::VCmpNeqF32:
+    case RdnaOpcode::VCmpNgeF32:
+    case RdnaOpcode::VCmpNgtF32:
+    case RdnaOpcode::VCmpNleF32:
+    case RdnaOpcode::VCmpNlgF32:
+    case RdnaOpcode::VCmpNltF32:
+    case RdnaOpcode::VCmpxEqF32:
+    case RdnaOpcode::VCmpxGeF32:
+    case RdnaOpcode::VCmpxGtF32:
+    case RdnaOpcode::VCmpxLeF32:
+    case RdnaOpcode::VCmpxLgF32:
+    case RdnaOpcode::VCmpxLtF32:
+    case RdnaOpcode::VCmpxNeqF32:
+    case RdnaOpcode::VCmpxNgeF32:
+    case RdnaOpcode::VCmpxNgtF32:
+    case RdnaOpcode::VCmpxNleF32:
+    case RdnaOpcode::VCmpxNlgF32:
+    case RdnaOpcode::VCmpxNltF32:
+    case RdnaOpcode::VCvtI32F32:
+    case RdnaOpcode::VCvtU32F32:
+    case RdnaOpcode::VCvtRpiI32F32:
+    case RdnaOpcode::VCvtFlrI32F32:
+    case RdnaOpcode::VFrexpExpI32F32:
+    case RdnaOpcode::VCvtF64F32:
+    case RdnaOpcode::VCvtPknormI16F32:
+    case RdnaOpcode::VCvtPknormU16F32:
+    case RdnaOpcode::VCvtPkU8F32:
+    case RdnaOpcode::VCvtPkrtzF16F32:
+    case RdnaOpcode::VCvtF16F32:
+        return floatMode.has_value() && ((floatMode->floatMode >> 4u) & 1u) != 0u ? 0u : 1u;
+    case RdnaOpcode::VDivScaleF32:
+    case RdnaOpcode::VDivFixupF32:
+        if (floatMode.has_value() && (floatMode->floatMode & 3u) == 0u) {
+            const std::uint32_t denormals = (floatMode->floatMode >> 4u) & 3u;
+            if (denormals == 2u) return 1u;
+            if (denormals == 1u && inst.op == RdnaOpcode::VDivFixupF32) return 0u;
+            if (denormals == 1u) {
+                if (!float32DenormPreserve || float32FlushToZero) {
+                    throw std::runtime_error("f32 denormal mode 1 at pc " + std::to_string(inst.programCounter) + " needs DenormPreserve 32, which the device does not offer for this shader");
+                }
+                return 2u;
+            }
+        }
+        flush = 1u;
+        break;
+    case RdnaOpcode::VMadMixloF16:
+    case RdnaOpcode::VMadMixhiF16:
+        if (floatMode.has_value() && (floatMode->floatMode & 3u) == 0u) {
+            const std::uint32_t denormals = (floatMode->floatMode >> 4u) & 3u;
+            if (denormals == 2u) return 1u;
+            if (denormals == 1u) {
+                if (!float32DenormPreserve || float32FlushToZero) {
+                    throw std::runtime_error("f32 denormal mode 1 at pc " + std::to_string(inst.programCounter) + " needs DenormPreserve 32, which the device does not offer for this shader");
+                }
+                return 0u;
+            }
+        }
+        flush = 1u;
+        break;
+    case RdnaOpcode::VMadLegacyF32:
+    case RdnaOpcode::VMacLegacyF32:
+        return 3u;
+    default:
+        return 0u;
+    }
+    const std::uint32_t denormals = floatMode.has_value() ? (floatMode->floatMode >> 4u) & 3u : 0u;
+    if (denormals == 1u || denormals == 2u) {
+        if (inst.op == RdnaOpcode::VMullitF32 && (denormals == 2u || (floatMode->floatMode & 3u) == 0u)) {
+            if (!float32DenormPreserve || float32FlushToZero) {
+                throw std::runtime_error("f32 denormal mode " + std::to_string(denormals) + " at pc " + std::to_string(inst.programCounter) + " needs DenormPreserve 32, which the device does not offer for this shader");
+            }
+            return denormals == 1u ? 2u : 1u;
+        }
+        throw std::runtime_error("f32 denormal mode " + std::to_string(denormals) + " at pc " + std::to_string(inst.programCounter) + " is not implemented");
+    }
+    if (!ExactF32Arithmetic()) return 0u;
+    if (denormals != 0u) return 0u;
+    return flush == 3u && float32FlushToZero && flushesInHardware(inst) ? 4u : flush;
 }
 
 bool TranslationContext::emitVector(const RdnaInstruction& inst) {
@@ -539,9 +710,9 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     case RdnaOpcode::VSatPkU8I16:
         return vSatPkU8I16(inst);
     case RdnaOpcode::VMulLegacyF32:
-        return vMulLegacyF32(inst, false);
+        return vMulLegacyF32(inst);
     case RdnaOpcode::VMacLegacyF32:
-        return vMulLegacyF32(inst, true);
+        return vFmaLegacyF32(inst, true);
     case RdnaOpcode::VMullitF32:
         return vMullitF32(inst);
     case RdnaOpcode::VCmpClassF32:
@@ -732,11 +903,13 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     case RdnaOpcode::VAshrrevI16:
         return integer16Shift(inst, IrOpcode::ShiftRightArithmetic32, true);
     case RdnaOpcode::VAddNcU16:
-    case RdnaOpcode::VAddNcI16:
         return integer16Binary(inst, IrOpcode::IAdd32, false);
+    case RdnaOpcode::VAddNcI16:
+        return integer16Binary(inst, IrOpcode::IAdd32, true);
     case RdnaOpcode::VSubNcU16:
-    case RdnaOpcode::VSubNcI16:
         return integer16Binary(inst, IrOpcode::ISub32, false);
+    case RdnaOpcode::VSubNcI16:
+        return integer16Binary(inst, IrOpcode::ISub32, true);
     case RdnaOpcode::VMed3I16:
         return vMed3I16(inst);
     case RdnaOpcode::VMin3I16:
@@ -768,7 +941,7 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     case RdnaOpcode::VPkMadU16:
         return packedInteger16Mad(inst, false);
     case RdnaOpcode::VPkMulLoU16:
-        return packedInteger16Binary(inst, IrOpcode::IMul32, false);
+        return vPkMulLoU16(inst);
     case RdnaOpcode::VPkAddI16:
         return packedInteger16Binary(inst, IrOpcode::IAdd32, true);
     case RdnaOpcode::VPkAddU16:
@@ -806,9 +979,9 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     case RdnaOpcode::VMulF16:
         return float16Binary(inst, IrOpcode::FPMul32, false);
     case RdnaOpcode::VMinF16:
-        return float16Binary(inst, IrOpcode::FPMin32, false);
+        return minMaxF16(inst, IrOpcode::FPMin32);
     case RdnaOpcode::VMaxF16:
-        return float16Binary(inst, IrOpcode::FPMax32, false);
+        return minMaxF16(inst, IrOpcode::FPMax32);
     case RdnaOpcode::VFmacF16:
         return float16Ternary(inst, IrOpcode::FPFma32, true, false);
     case RdnaOpcode::VFmamkF16:
@@ -843,11 +1016,11 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     case RdnaOpcode::VCosF16:
         return float16Unary(inst, IrOpcode::FPCos);
     case RdnaOpcode::VMin3F16:
-        return float16Ternary(inst, IrOpcode::FPMinTri32, false, false);
+        return minMaxF16(inst, IrOpcode::FPMinTri32);
     case RdnaOpcode::VMax3F16:
-        return float16Ternary(inst, IrOpcode::FPMaxTri32, false, false);
+        return minMaxF16(inst, IrOpcode::FPMaxTri32);
     case RdnaOpcode::VMed3F16:
-        return float16Ternary(inst, IrOpcode::FPMedTri32, false, false);
+        return minMaxF16(inst, IrOpcode::FPMedTri32);
     case RdnaOpcode::VDivFixupF16:
         return vDivFixupF16(inst);
     case RdnaOpcode::VFrexpMantF32:
@@ -859,37 +1032,37 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     case RdnaOpcode::VFmaF64:
         return float64Operation(inst, IrOpcode::FPFma64);
     case RdnaOpcode::VMinF64:
-        return float64Operation(inst, IrOpcode::FPMin64);
+        return minMaxF64(inst, IrOpcode::FPMin64);
     case RdnaOpcode::VMaxF64:
-        return float64Operation(inst, IrOpcode::FPMax64);
+        return minMaxF64(inst, IrOpcode::FPMax64);
     case RdnaOpcode::VLdexpF64:
-        return float64Operation(inst, IrOpcode::FPLdexp64);
+        return float64Unary(inst, IrOpcode::FPLdexp64);
     case RdnaOpcode::VTruncF64:
-        return float64Operation(inst, IrOpcode::FPTrunc64);
+        return float64Unary(inst, IrOpcode::FPTrunc64);
     case RdnaOpcode::VCeilF64:
-        return float64Operation(inst, IrOpcode::FPCeil64);
+        return float64Unary(inst, IrOpcode::FPCeil64);
     case RdnaOpcode::VRndneF64:
-        return float64Operation(inst, IrOpcode::FPRoundEven64);
+        return float64Unary(inst, IrOpcode::FPRoundEven64);
     case RdnaOpcode::VFloorF64:
-        return float64Operation(inst, IrOpcode::FPFloor64);
+        return float64Unary(inst, IrOpcode::FPFloor64);
     case RdnaOpcode::VFractF64:
-        return float64Operation(inst, IrOpcode::FPFract64);
+        return float64Unary(inst, IrOpcode::FPFract64);
     case RdnaOpcode::VRcpF64:
-        return float64Operation(inst, IrOpcode::FPRcp64);
+        return float64Unary(inst, IrOpcode::FPRcp64);
     case RdnaOpcode::VRsqF64:
-        return float64Operation(inst, IrOpcode::FPRsq64);
+        return float64Unary(inst, IrOpcode::FPRsq64);
     case RdnaOpcode::VSqrtF64:
-        return float64Operation(inst, IrOpcode::FPSqrt64);
+        return float64Unary(inst, IrOpcode::FPSqrt64);
     case RdnaOpcode::VTrigPreopF64:
         return float64Operation(inst, IrOpcode::FPTrigPreop64);
     case RdnaOpcode::VFrexpMantF64:
-        return float64Operation(inst, IrOpcode::FPFrexpMant64);
+        return float64Unary(inst, IrOpcode::FPFrexpMant64);
     case RdnaOpcode::VFrexpExpI32F64:
         return float64Operation(inst, IrOpcode::FPFrexpExp64);
     case RdnaOpcode::VCvtF32F64:
         return float64Operation(inst, IrOpcode::ConvertF32F64);
     case RdnaOpcode::VCvtF64F32:
-        return float64Operation(inst, IrOpcode::ConvertF64F32);
+        return vCvtF64F32(inst);
     case RdnaOpcode::VCvtF64I32:
         return float64Operation(inst, IrOpcode::ConvertF64S32);
     case RdnaOpcode::VCvtF64U32:
@@ -918,6 +1091,8 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
         return floatUnary(inst, IrOpcode::FPLog2);
     case RdnaOpcode::VRsqF32:
         return floatUnary(inst, IrOpcode::FPRecipSqrt32);
+    case RdnaOpcode::VRsqClampF32:
+        return floatUnaryClampInfinity(inst, IrOpcode::FPRecipSqrt32);
     case RdnaOpcode::VSqrtF32:
         return floatUnary(inst, IrOpcode::FPSqrt);
     case RdnaOpcode::VSinF32:
@@ -933,9 +1108,9 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     case RdnaOpcode::VMulF32:
         return floatBinary(inst, IrOpcode::FPMul32, false);
     case RdnaOpcode::VMinF32:
-        return floatBinary(inst, IrOpcode::FPMin32, false);
+        return ieeeMode ? ieeeMinMaxF32(inst, IrOpcode::FPMin32) : floatBinary(inst, IrOpcode::FPMin32, false);
     case RdnaOpcode::VMaxF32:
-        return floatBinary(inst, IrOpcode::FPMax32, false);
+        return ieeeMode ? ieeeMinMaxF32(inst, IrOpcode::FPMax32) : floatBinary(inst, IrOpcode::FPMax32, false);
     case RdnaOpcode::VDivScaleF32:
         return vDivScaleF32(inst);
     case RdnaOpcode::VDivFmasF32:
@@ -958,13 +1133,13 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     case RdnaOpcode::VFmaF32:
         return floatTernary(inst, roundsProductSeparately(inst) ? IrOpcode::FPMad32 : IrOpcode::FPFma32, false, true);
     case RdnaOpcode::VMadLegacyF32:
-        return vFmaLegacyF32(inst);
+        return vFmaLegacyF32(inst, false);
     case RdnaOpcode::VMin3F32:
-        return floatTernary(inst, IrOpcode::FPMinTri32, false, false);
+        return ieeeMode ? ieeeMinMaxF32(inst, IrOpcode::FPMinTri32) : floatTernary(inst, IrOpcode::FPMinTri32, false, false);
     case RdnaOpcode::VMax3F32:
-        return floatTernary(inst, IrOpcode::FPMaxTri32, false, false);
+        return ieeeMode ? ieeeMinMaxF32(inst, IrOpcode::FPMaxTri32) : floatTernary(inst, IrOpcode::FPMaxTri32, false, false);
     case RdnaOpcode::VMed3F32:
-        return floatTernary(inst, IrOpcode::FPMedTri32, false, false);
+        return ieeeMode ? ieeeMinMaxF32(inst, IrOpcode::FPMedTri32) : floatTernary(inst, IrOpcode::FPMedTri32, false, false);
     case RdnaOpcode::VDot2cF32F16:
         return vDot2cF32F16(inst);
     case RdnaOpcode::VDot2F32F16:
@@ -1036,16 +1211,10 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
         return simpleInteger(inst, IrOpcode::BitReverse32, IrType::U32, false, false, false);
     case RdnaOpcode::VFfblB32:
         return simpleInteger(inst, IrOpcode::FindILsb32, IrType::U32, false, false, false);
-    case RdnaOpcode::VLshlB32:
-        return simpleInteger(inst, IrOpcode::ShiftLeftLogical32, IrType::U32, false, true, false);
     case RdnaOpcode::VLshlrevB32:
         return simpleInteger(inst, IrOpcode::ShiftLeftLogical32, IrType::U32, true, true, false);
-    case RdnaOpcode::VLshrB32:
-        return simpleInteger(inst, IrOpcode::ShiftRightLogical32, IrType::U32, false, true, false);
     case RdnaOpcode::VLshrrevB32:
         return simpleInteger(inst, IrOpcode::ShiftRightLogical32, IrType::U32, true, true, false);
-    case RdnaOpcode::VAshrI32:
-        return simpleInteger(inst, IrOpcode::ShiftRightArithmetic32, IrType::U32, false, true, false);
     case RdnaOpcode::VAshrrevI32:
         return simpleInteger(inst, IrOpcode::ShiftRightArithmetic32, IrType::U32, true, true, false);
     case RdnaOpcode::VLshlrevB64:
@@ -1059,7 +1228,7 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     case RdnaOpcode::VSubNcI32:
         return vAddSubNcI32(inst, true);
     case RdnaOpcode::VMulLoU16:
-        return integer16Binary(inst, IrOpcode::IMul32, false);
+        return vMulLoU16(inst);
     case RdnaOpcode::VMadU16:
         return integer16Mad(inst, false, false);
     case RdnaOpcode::VMadI16:
@@ -1149,10 +1318,6 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     default:
         return false;
     }
-}
-
-void TranslateVectorInstruction(TranslationContext& context, const RdnaInstruction& instruction) {
-    throw std::runtime_error("TranslateVectorInstruction not implemented");
 }
 
 }

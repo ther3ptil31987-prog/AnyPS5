@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace Audiodec {
 
@@ -49,7 +50,8 @@ struct At9Format {
 class Decoder {
 public:
     virtual ~Decoder() = default;
-    virtual DecodeResult Decode(const std::uint8_t* data, std::size_t size, std::uint8_t* pcm, std::size_t pcmSize) = 0;
+    virtual DecodeResult Decode(const std::uint8_t* data, std::size_t size, std::vector<std::uint8_t>& pcm, std::size_t pcmSize) = 0;
+    virtual std::size_t InputBytes(const std::uint8_t* data, std::size_t size, std::size_t declared) const = 0;
     virtual void Reset() = 0;
 };
 
@@ -57,7 +59,7 @@ bool ParseMp3Header(const std::uint8_t* data, std::size_t size, Mp3Header& heade
 std::uint32_t AacSampleRate(std::uint32_t index);
 bool ValidAt9Config(const std::uint8_t (&config)[4]);
 std::unique_ptr<Decoder> CreateMp3(std::int32_t wordSize);
-std::unique_ptr<Decoder> CreateAac(std::int32_t wordSize, bool adts, std::uint32_t samplingFreqIndex, std::uint32_t channels);
+std::unique_ptr<Decoder> CreateAac(std::int32_t wordSize, bool adts, std::uint32_t samplingFreqIndex, std::uint32_t channels, bool highEfficiency);
 std::unique_ptr<Decoder> CreateAt9(std::int32_t wordSize, const std::uint8_t (&config)[4], At9Format& format);
 
 }
